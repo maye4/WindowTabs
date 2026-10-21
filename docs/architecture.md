@@ -434,6 +434,13 @@ with another scale. Native groups recompute appearance from logical values when 
 host monitor changes. Fonts and shadows are rebuilt for the new scale and disposed.
 Never scale persisted settings or an already-scaled appearance snapshot.
 
+Because the process is PerMonitorV2, window rectangles, GetCursorPos/Cursor.Position
+and the points in mouse messages are all physical pixels of the screen they are on,
+the same pixels the tab strip draws in at Dpi.value(). Hit testing therefore takes a
+message point as it arrives (plus `renderedShift`); never rescale it by a ratio to the
+system DPI. Windows reports rectangles in system-DPI pixels only to System-aware or
+unaware windows, which this process does not create.
+
 A settings page is nested auto-size `TableLayoutPanel`s, where each layout measures
 every row below it. `SettingsPage` therefore keeps its panels' layout suspended while
 it is built, and `DesktopManagerForm` lays a new page out at the host's size before it
