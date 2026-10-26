@@ -107,7 +107,11 @@ type TabStripDecorator(group:WindowGroup) as this =
                 dragInfo.tab, (if this.ts.isVertical then pt.y else pt.x)
 
     member private this.updateTsSlide() =
-        this.ts.slide <- this.tabSlide
+        // A tab previewing a drop stands in its slot; only the tab the user holds follows the pointer.
+        this.ts.slide <-
+            match this.ts.ghostTab with
+            | Some _ -> None
+            | None -> this.tabSlide
 
     member private this.updateTsPlacement() = 
         if group.bounds.value.IsNone then
@@ -124,7 +128,7 @@ type TabStripDecorator(group:WindowGroup) as this =
     member private this.placementFor (visible:Rect) (maximized:bool) =
         let decorator =  {
             windowBounds = visible
-            monitorBounds = Mon.all.map(fun m -> m.workRect)
+            monitorBounds = Monitors.all().map(fun m -> m.workRect)
             decoratorHeight = group.tabAppearance.tabHeight
             decoratorHeightOffset = group.tabAppearance.tabHeightOffset
             decoratorIndentFlipped = group.tabAppearance.tabIndentFlipped
@@ -587,13 +591,21 @@ type TabStripDecorator(group:WindowGroup) as this =
                     if part <> TabClose then
                         let dragOffset = pt.sub(this.ts.tabLocation tab)
                         let _,sprite = this.ts.tabSprites.pick(fun (location,sprite) -> if sprite.id=tab then Some(location,sprite) else None)
-                        let dragInfo = box({ tab = tab; tabOffset = dragOffset; tabSize=sprite.size; tabInfo = this.ts.tabInfo(tab); lastNormalSize = group.dragSizeOf(hwnd)})
+                        let tabInfo = this.ts.tabInfo(tab)
+                        // Copied before the tab leaves the group, which disposes the original.
+                        DragIcon.remember tabInfo.iconSmall
+                        let dragInfo = box({ tab = tab; tabOffset = dragOffset; tabSize=sprite.size; tabInfo = tabInfo; lastNormalSize = group.dragSizeOf(hwnd)})
                         // The window that leaves this strip takes the tab with it: the picture is
                         // drawn once, when the drag begins, and laid where a strip holding that
                         // window alone puts it, which is the strip the drop leaves it with.
                         // Built now, not lazily: the tab is read while the strip still holds it, and
                         // the closures only carry what was read.
                         let floatingTab = this.ts.floatingTab tab group.tabAppearance
+                        // The shape the tab was grabbed with. A window finishing a maximize moves its
+                        // strip inside the title bar, which turns the tab's corners over and shortens
+                        // it by a pixel: drawn live, the tab in the hand flips under the cursor at that
+                        // moment. It keeps its shape until it is a tab of a strip again.
+                        let grabbedInside = this.placement.showInside
                         // Drawn and laid as the strip the drop leaves draws that tab, which is not the
                         // strip the drag started in: a maximized window's strip is as wide as the
                         // screen, keeps room for the caption buttons and runs its row inside the title
@@ -602,7 +614,7 @@ type TabStripDecorator(group:WindowGroup) as this =
                             // One placement per frame: it decides the picture, the slot, and the key that
                             // says whether the picture has to be drawn again at all.
                             frame = fun (visible:Rect) ->
-                                let placement = this.placementFor visible false
+                                let placement = { this.placementFor visible false with showInside = grabbedInside }
                                 let offset = floatingTab.location placement.showInside placement.bounds.size
                                 box (placement.showInside, placement.bounds.size),
                                 floatingTab.image placement.showInside placement.bounds.size,
@@ -644,7 +656,13 @@ type TabStripDecorator(group:WindowGroup) as this =
                     else 
                         dragPtCell.set(pt)
                         dragInfoCell.set(Some(dragInfo))
+                        // Set before the tab is added: the first frame this strip draws has to show the
+                        // tab as the drag carries it, icon included, or it blinks the default one.
+                        match DragIcon.current() with
+                        | Some icon -> this.ts.ghostTab <- Some(icon, dragInfo.tab)
+                        | None -> ()
                         this.ts.addTab dragInfo.tab
+                        this.ts.previewDrop pt
                         // The destination group owns its cached icons. Drag data
                         // can outlive the source group's membership and cache.
                         group.addWindow(hwnd, false)
@@ -657,6 +675,7 @@ type TabStripDecorator(group:WindowGroup) as this =
         member this.dragMove(pt) =
             this.invokeSync <| fun() ->
                 dragPtCell.set(pt)
+                this.ts.previewDrop pt
                 this.updateTsSlide()
                 this.ts.dragScrollPoint <- Some pt
 
@@ -666,9 +685,12 @@ type TabStripDecorator(group:WindowGroup) as this =
                 match dragInfoCell.value with
                 | Some(dragInfo) ->
                     let tab = dragInfo.tab
+                    // Cleared whether or not the tab is still here: a window that closed mid-drag has
+                    // already taken it, and the preview must not outlive the drag.
+                    this.ts.ghostTab <- None
+                    dragInfoCell.set(None)
                     if this.ts.tabs.contains(tab) then
                         this.ts.removeTab(tab)
-                        dragInfoCell.set(None)
                         let (Tab(hwnd)) = tab
                         // The tab and its window leave this group while the drag is on the
                         // desktop: the drop decides where they go, the group must not follow the
@@ -687,8 +709,20 @@ type TabStripDecorator(group:WindowGroup) as this =
                 match this.ts.movedTab with
                 | Some(tab, index) ->
                     this.ts.moveTab(tab, index)
-                | None -> ()
+                | None ->
+                    // The preview put the tab in its slot by permuting the strip, so there is no
+                    // slide to report: say where it landed, or the group keeps its old window order.
+                    match dragInfoCell.value with
+                    | Some(info) ->
+                        // tryFindIndex: the tab can be gone by now, and findIndex throws rather than
+                        // returning -1, which would take the whole application down on release.
+                        match this.ts.lorder.tryFindIndex((=) info.tab) with
+                        | Some index -> this.ts.moveTab(info.tab, index)
+                        | None -> ()
+                    | None -> ()
                 if joinedByDrag && dragInfoCell.value.IsSome then group.isManual <- true
+                // The tab is a tab of this strip now, so it is drawn like one.
+                this.ts.ghostTab <- None
                 joinedByDrag <- false
                 dragInfoCell.set(None)
                 this.updateTsSlide()

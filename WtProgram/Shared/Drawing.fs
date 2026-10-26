@@ -171,8 +171,11 @@ type Rgn(hRgn:IntPtr)=
 
 [<NoComparison>]
 type Mon(hMonitor:IntPtr)=
+    /// Read once: a drag asks for the monitor rects on every pointer move, and each fetch is a
+    /// GetMonitorInfo call.
+    let info = lazy (Win32Helper.GetMonitorInfo(hMonitor))
     member this.hMonitor = hMonitor
-    member private this.info = Win32Helper.GetMonitorInfo(hMonitor)
+    member private this.info = info.Value
     member this.workRect = this.info.rcWork.Rect
     member this.displayRect = this.info.rcMonitor.Rect
     static member fromHMonitor(hMonitor:IntPtr) =
@@ -194,6 +197,20 @@ type Mon(hMonitor:IntPtr)=
     // only forced every instance through an extra GC generation.
 
 
+/// The monitors as they were last enumerated. The strip is asked where it goes on every pointer move
+/// and every answer used to enumerate the monitors and read each one's info again.
+module Monitors =
+    let mutable private cached : List2<Mon> option = None
+    let private forget (_:obj) (_:EventArgs) = cached <- None
+    do  Microsoft.Win32.SystemEvents.DisplaySettingsChanged.AddHandler forget
+    let all () =
+        match cached with
+        | Some monitors -> monitors
+        | None ->
+            let monitors = Mon.all
+            cached <- Some monitors
+            monitors
+
 module MonitorFit =
     /// A size that reaches the work area on both axes fills the monitor. That is a
     /// fullscreen window's normal rect, not an ordinary size like an Aero-snapped half.
@@ -212,6 +229,24 @@ type Img(bitmap:Bitmap) =
     new(size:Sz) = Img(new Bitmap(size.width, size.height, PixelFormat.Format32bppArgb))
     member this.bitmap = bitmap
     member this.clone() = Img(bitmap.Clone() :?> Bitmap)
+    /// A copy under a black mask of this opacity. A tab drawn this way stays solid instead of letting
+    /// the background through, so it reads as shaded even when that background is its own colour.
+    member this.underMask (opacity:float32) : Img =
+        let copy : Img = new Img(this.size : Sz)
+        use g : System.Drawing.Graphics = copy.graphics
+        use attributes = new System.Drawing.Imaging.ImageAttributes()
+        let matrix = new System.Drawing.Imaging.ColorMatrix()
+        // Colour scaled toward black, alpha untouched: the tab stays as solid, and as see-through,
+        // as it was drawn, so its rounded corners do not square off into the background.
+        let lit = 1.0f - opacity
+        matrix.Matrix00 <- lit
+        matrix.Matrix11 <- lit
+        matrix.Matrix22 <- lit
+        attributes.SetColorMatrix(matrix)
+        let target : System.Drawing.Rectangle = Rectangle(0, 0, this.size.width, this.size.height)
+        g.DrawImage(this.bitmap, target, 0, 0, this.size.width, this.size.height, GraphicsUnit.Pixel, attributes)
+        copy
+
     member this.size = this.bitmap.Size.Sz
     member this.width = this.size.width
     member this.height = this.size.height

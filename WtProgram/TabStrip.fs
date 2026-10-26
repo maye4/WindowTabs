@@ -30,6 +30,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let taskbar = _os.getTaskbar()
     let tabMovedEvent = Event<_>()
     let contentBoundsCell = Cell.create(Rect())
+    /// The tab another group's drag is previewing here, with the icon the drag carries: the real tab
+    /// is still under the pointer until the mouse is released.
+    let ghostTabCell = Cell.create(None:(Icon * Tab) option)
     let appearanceCell = Cell.create(None)
     let foregroundCell = Cell.create(None:Tab option)
     let prevForegroundCell = Cell.create(None)
@@ -182,15 +185,27 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         {
             tabs = Map2(this.tabs.items.map <| fun tab ->
                 let ti = this.tabInfo(tab)
+                let ghost =
+                    match ghostTabCell.value with
+                    | Some(_, dragging) -> dragging = tab
+                    | None -> false
                 let tabInfo = {
                     tint = tabTint.value.tryFind(tab)
                     colorStyle = colorStyleCell.value
                     numberBadge = if numberBadgesCell.value then lorderCell.value.list |> List.tryFindIndex ((=) tab) |> Option.filter(fun i -> i<numberBadgeKeysCell.value.Length) |> Option.map(fun i -> string numberBadgeKeysCell.value.[i]) else None
                     bgColor = tabBgColor.value.tryFind(tab)
                     TabDisplayInfo.text = ti.text
-                    icon = ti.iconSmall
+                    // The window joined this group a moment ago and its icon is still coming; the drag
+                    // brought its own, so the tab is drawn with the icon the user grabbed.
+                    icon =
+                        if ghost then
+                            match ghostTabCell.value with
+                            | Some(icon, _) -> icon
+                            | None -> ti.iconSmall
+                        else ti.iconSmall
                     textFont = if ti.isRenamed then renamedFont else normalFont
                     textBrush = SystemBrushes.MenuText
+                    ghost = ghost
                 }
                 tab,tabInfo
             )
@@ -733,6 +748,36 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member internal this.hasTabInfo(tab) = tabInfoCell.value.contains(tab)
             
     member this.tabLocation = this.ts.tabLocation
+
+    /// The tab this strip is showing as the place a drag would land, with the icon to draw it with.
+    member this.ghostTab
+        with get() : (Icon * Tab) option = ghostTabCell.value
+        and set(value:(Icon * Tab) option) =
+            // The icon is lent by the drag, which disposes it when the drag ends: this strip only
+            // draws with it.
+            if ghostTabCell.value <> value then ghostTabCell.set value
+
+    /// The slot a drag would put its tab in: how many of the tabs this strip shows sit left of the
+    /// pointer. The previewing tab is not counted, since it is already in the row.
+    member private this.dropIndex (pt:Pt) =
+        this.tabSprites.list
+        |> List.filter(fun (location:Pt, sprite:TabSprite<Tab>) ->
+            match ghostTabCell.value with
+            | Some(_, ghost) when sprite.id = ghost -> false
+            | _ ->
+                // A vertical strip stacks its tabs by y: their x is the same for all of them.
+                if this.isVertical then location.y + sprite.size.height / 2 <= pt.y
+                else location.x + sprite.size.width / 2 <= pt.x)
+        |> List.length
+
+    /// Put the previewing tab in the slot the pointer names, so it stands where the drop will leave
+    /// it instead of sliding under the pointer: the tab the user holds is the one that moves.
+    member this.previewDrop (pt:Pt) =
+        match ghostTabCell.value with
+        | Some(_, ghost) ->
+            let order = lorderCell.value.move((=) ghost, this.dropIndex pt)
+            if lorderCell.value <> order then lorderCell.set order
+        | None -> ()
     
     /// The tab a floating drag carries: where a strip that holds only this tab puts it, and how that
     /// strip draws it. That strip is the floating window's own, and not the one the drag started in —

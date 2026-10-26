@@ -1,6 +1,31 @@
 namespace Bemo
 open System
+open System.Drawing
 open System.Windows.Forms
+
+/// The icon a drag carries for the strip it is about to land in. A tab's icon is disposed with the
+/// tab as it leaves its group — before the strip it lands in ever asks for it — so the drag copies it
+/// when it starts and hands that copy over. One drag runs at a time, so one slot is enough.
+module DragIcon =
+    /// Never the held value itself: that is None, and therefore null, until a drag starts.
+    let private gate = obj()
+    let mutable private held : Icon option = None
+    /// Copy the tab's icon now, while it is still the strip's to give.
+    let remember (icon:Icon) =
+        // Written on the strip's thread, read by whichever strip the pointer reaches.
+        lock gate (fun() ->
+            held |> Option.iter(fun previous -> previous.Dispose())
+            held <- Some(new Icon(icon, icon.Width, icon.Height)))
+    /// The copy, for a strip that wants to draw the tab with it. It stays the drag's to dispose, so a
+    /// strip the pointer leaves and comes back to finds it again.
+    let current () = lock gate (fun() -> held)
+    /// Let go of the copy once no strip can be drawing with it, as when a drag is abandoned. The drop
+    /// does not call this: the strips it was handed to clear their previews on a posted message, so
+    /// the copy outlives the drop and the next drag's remember replaces it.
+    let release () =
+        lock gate (fun() ->
+            held |> Option.iter(fun previous -> previous.Dispose())
+            held <- None)
 
 type IDragState =
     abstract member mouseMove : Pt -> unit
@@ -12,38 +37,24 @@ type DragDetectingStateInfo = {
     }
 
 type DragDetectingState(info:DragDetectingStateInfo) =
-    let dragStartDistance = 5.0
+    /// Pointer travel that turns a press into a drag. Kept small so a drag begins as soon as the
+    /// pointer does, but above the pixel or two a hand moves while pressing.
+    let dragStartDistance = 3.0
     interface IDragState with
         member this.mouseMove(ptScreen) =
             if ptScreen.distance(info.initialPt) > dragStartDistance then
                 info.onBegin()
         member this.dispose() = ()
 
-type DragCapturedStateInfo = {
-    target : IDragDropTarget
-    targetHwnd : IntPtr
-    targetWindow : Window
-    onDragOut : Pt -> unit
-    }
-
-type DragCapturedState(info:DragCapturedStateInfo) =
-    let dragOutDistance = 20
-    interface IDragState with
-        member this.mouseMove(ptScreen) =
-            let dragBounds = info.targetWindow.bounds.inflate(dragOutDistance, dragOutDistance)
-            if dragBounds.containsPoint(ptScreen) then
-                info.target.dragMove(info.targetWindow.ptToClient(ptScreen))
-            else
-                info.target.dragExit()
-                info.onDragOut(ptScreen)
-        member this.dispose() = ()
-
 /// The tab a floating drag carries over the window it moves. The strip renders it, so the window
 /// wears the tab the user grabbed, and it is placed where the strip the drop leaves the window
 /// with draws that tab, so letting go does not move it.
-type FloatingTab(os:OS, sprite:DragTabSprite) =
+type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     let window = AnimationWindow(os)
     do  window.setAlpha(byte 0xFF)
+    /// The grabbed point inside the picture as drawn now. The picture is redrawn for the frame it
+    /// hangs over, so the point moves with it, and the tab keeps the cursor on the same spot.
+    let mutable anchor = Pt()
     /// The frame geometry the picture was drawn for. The strip the drop leaves draws its row a corner
     /// shape and a pixel apart from the strip the drag started in, so the picture is redrawn when that
     /// geometry changes — not on every pointer move.
@@ -52,15 +63,54 @@ type FloatingTab(os:OS, sprite:DragTabSprite) =
         let key, image, location = sprite.frame visible
         if not(obj.Equals(drawnFor, key)) then
             window.setImage(image)
+            // Once, on the first picture: the anchor is where the user took hold of the tab, and a
+            // redraw for a frame a pixel apart must not move the tab out from under the cursor.
+            if isNull drawnFor then anchor <- grabOffset image.size
             drawnFor <- key
         location
-    member this.follow(visible:Rect) =
-        window.setLocation(place visible)
+    /// Follow the pointer, not the strip's row: the tab is held where it was grabbed, so a window
+    /// changing frame underneath it cannot move it out from under the cursor.
+    member this.follow(ptScreen:Pt) (visible:Rect) =
+        place visible |> ignore
+        window.setLocation(ptScreen.sub(anchor))
+        window.setIsVisible(true)
+    /// The grabbed point inside the picture, for a strip taking the tab over to hold it by.
+    member this.anchorOffset = anchor
+    /// Hold the tab at a screen point, keeping the picture it already has: over a strip the window
+    /// belongs to the group, so only the tab the user is holding follows the pointer.
+    member this.holdAt(topLeft:Pt) =
+        window.setLocation(topLeft)
         window.setIsVisible(true)
     member this.hide() = window.setIsVisible(false)
     member this.hwnd = window.hwnd
     interface IDisposable with
         member this.Dispose() = window.Dispose()
+
+type DragCapturedStateInfo = {
+    target : IDragDropTarget
+    targetHwnd : IntPtr
+    targetWindow : Window
+    /// The tab the user is holding. The strip shows where it would land, and this keeps the tab
+    /// itself under the pointer, so it does not escape the mouse the moment the group forms.
+    tab : FloatingTab option
+    tabOffset : Pt
+    onDragOut : Pt -> unit
+    }
+
+type DragCapturedState(info:DragCapturedStateInfo) =
+    /// How far past the strip a tab has to be before it leaves the group and the window starts to
+    /// float. This was 20, which the hand read as "nothing happens" before the drag began.
+    let dragOutDistance = 6
+    interface IDragState with
+        member this.mouseMove(ptScreen) =
+            let dragBounds = info.targetWindow.bounds.inflate(dragOutDistance, dragOutDistance)
+            if dragBounds.containsPoint(ptScreen) then
+                info.target.dragMove(info.targetWindow.ptToClient(ptScreen))
+                info.tab |> Option.iter(fun tab -> tab.holdAt(ptScreen.sub(info.tabOffset)))
+            else
+                info.target.dragExit()
+                info.onDragOut(ptScreen)
+        member this.dispose() = ()
 
 type DragFloatingStateInfo = {
     targets: Map2<IntPtr, IDragDropTarget>
@@ -77,7 +127,7 @@ type DragFloatingState(info:DragFloatingStateInfo) =
     let os = OS()
     member this.follow(ptScreen) =
         info.window.followDrag(ptScreen) info.normalSize
-        info.tab |> Option.iter(fun tab -> tab.follow info.window.visibleBounds)
+        info.tab |> Option.iter(fun tab -> tab.follow ptScreen info.window.visibleBounds)
     interface IDragState with
         member this.mouseMove(ptScreen) =
             // The dragged window stays shown all the way to a target strip: hiding it when
@@ -88,7 +138,9 @@ type DragFloatingState(info:DragFloatingStateInfo) =
             match info.targets.tryFind(targetHwnd) with
             | Some _ -> info.onDragIn(targetHwnd, ptScreen)
             | None -> this.follow(ptScreen)
-        member this.dispose() = info.tab |> Option.iter(fun tab -> tab.hide())
+        // The tab is not hidden here: entering a strip hands it over to the captured state, which
+        // keeps holding it under the pointer until the drag ends.
+        member this.dispose() = ()
 
 type DragActionInfo = {
     targets : Map2<IntPtr, IDragDropTarget>
@@ -187,10 +239,19 @@ type DragAction(info:DragActionInfo) =
         let targetWindow = os.windowFromHwnd(targetHwnd)
         let ptTarget = targetWindow.ptToClient(ptScreen)
         if target.dragEnter info.data ptTarget then
+            let tabOffset =
+                match floatingTabCell.value with
+                | Some tab -> tab.anchorOffset
+                | None ->
+                    match info.data with
+                    | :? TabDragInfo as dragInfo -> dragInfo.tabOffset
+                    | _ -> Pt()
             this.setNextState <| DragCapturedState({
                 target = target
                 targetHwnd = targetHwnd
                 targetWindow = targetWindow
+                tab = floatingTabCell.value
+                tabOffset = tabOffset
                 onDragOut = fun(ptScreen) -> 
                     let targetHwnd = os.windowAtPt(ptScreen).hwnd
                     match info.targets.tryFind(targetHwnd) with
@@ -214,7 +275,11 @@ type DragAction(info:DragActionInfo) =
                 // Rendered now: the strip gives the tab up as soon as the drag leaves it, and
                 // with it the tab info the picture is drawn from. A picture that will not draw
                 // costs the drag its tab, not the drag.
-                try floatingTabCell.set(Some(new FloatingTab(os, info.tab))) with _ -> ()
+                let grabOffset =
+                    match info.data with
+                    | :? TabDragInfo as dragInfo -> fun (size:Sz) -> dragInfo.offsetIn size
+                    | _ -> fun (_:Sz) -> Pt()
+                try floatingTabCell.set(Some(new FloatingTab(os, info.tab, grabOffset))) with _ -> ()
                 info.targets.values.iter <| fun target -> target.dragBegin()
                 info.notifications.items.iter <| fun n -> n.dragBegin()
                 info.onBegin()

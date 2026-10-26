@@ -214,6 +214,8 @@ type TabDisplayInfo = {
     textFont: Font
     textBrush: Brush
     icon: Icon
+    /// A tab a drag is previewing here: drawn half transparent, because the real one is still held.
+    ghost: bool
     }
     
 type TabSprite<'id> = {
@@ -505,75 +507,83 @@ type TabSprite<'id> = {
     member this.tabTextBrush =
         new SolidBrush(this.textColor)
 
+    member private this.draw =
+        let img = Img(this.size)
+        use g = img.graphics
+        use path = this.fillPath
+        match this.style with
+        | JoinedTabs ->
+            use background = new SolidBrush(this.fillColor)
+            g.FillPath(background, path)
+        | FolderTabs | PillTabs ->
+            use bar = new SolidBrush(if this.isRaised then this.appearance.tabNormalBgColor else this.fillColor)
+            g.FillPath(bar, path)
+            if this.isRaised then
+                use raised = this.raisedShape -0.5f
+                use fill = new SolidBrush(this.fillColor)
+                g.FillPath(fill, raised)
+                if this.needsOutline then
+                    use outline = this.raisedShape 0.5f
+                    use pen = new Pen(this.appearance.tabBorderColor, 1.0f)
+                    g.DrawPath(pen, outline)
+        // No outline on any tab, the way a browser draws them: the active
+        // tab is told apart by its fill, and a hairline divides adjacent
+        // plain tabs. An outline round the active tab made it read as a box
+        // sitting on the title bar rather than one tab among several.
+        // Exterior shadows are rendered by TabShadowWindow, outside the
+        // strip bounds so the tabs remain flush with the original window.
+        match this.stripeColor with
+        | Some color ->
+            let state = g.Save()
+            g.SetClip(path)
+            use stripe = new SolidBrush(color)
+            match this.dock with
+            | TabDockLeft | TabDockRight ->
+                let thickness = min this.size.width (Dpi.scale 3)
+                let inset = Dpi.scale 2
+                let opensLeft = (this.dock=TabDockRight) <> (this.direction=TabUp)
+                let x = if opensLeft then this.size.width-inset-thickness else inset
+                let length = max thickness (min (Dpi.scale 20) (this.size.height-Dpi.scale 12))
+                let y = (this.size.height-length)/2
+                use mark = new GraphicsPath()
+                mark.AddArc(x,y,thickness,thickness,180.0f,180.0f)
+                mark.AddArc(x,y+length-thickness,thickness,thickness,0.0f,180.0f)
+                mark.CloseFigure()
+                g.FillPath(stripe,mark)
+            | TabDockTop | TabDockBottom ->
+                let thickness = min this.size.height (Dpi.scale 3)
+                let y = if this.direction=TabUp then this.size.height-thickness else 0
+                g.FillRectangle(stripe,0,y,this.size.width,thickness)
+            g.Restore(state)
+        | _ -> ()
+        if this.showLeftSeparator then
+            let inset = float32 this.size.height * 0.28f
+            let x = 0.0f
+            use pen = new Pen(this.appearance.tabBorderColor, 1.0f)
+            do g.DrawLine(pen, x, inset, x, float32 this.size.height - inset)
+        if this.onlyIcon.not then
+            //the text can't be drawn as a separate bitmap because clearcase fonts
+            //can't be drawn by gdi+ to a transparent background, need to draw directly on the tab background
+            let text = this.displayInfo.text
+            let font = this.displayInfo.textFont
+            use brush = this.tabTextBrush
+            use format = new StringFormat()
+            do format.LineAlignment <- StringAlignment.Center
+            do format.Alignment <- StringAlignment.Near
+            do format.Trimming <- StringTrimming.EllipsisCharacter
+            do format.FormatFlags <- format.FormatFlags ||| StringFormatFlags.NoWrap
+            let bounds = Rect(this.textLocation, this.textSize)
+            do g.DrawString(text, font, brush, bounds.Rectangle.RectangleF, format)
+        img
     interface ISprite with
         member this.image =
-            let img = Img(this.size)
-            use g = img.graphics
-            use path = this.fillPath
-            match this.style with
-            | JoinedTabs ->
-                use background = new SolidBrush(this.fillColor)
-                g.FillPath(background, path)
-            | FolderTabs | PillTabs ->
-                use bar = new SolidBrush(if this.isRaised then this.appearance.tabNormalBgColor else this.fillColor)
-                g.FillPath(bar, path)
-                if this.isRaised then
-                    use raised = this.raisedShape -0.5f
-                    use fill = new SolidBrush(this.fillColor)
-                    g.FillPath(fill, raised)
-                    if this.needsOutline then
-                        use outline = this.raisedShape 0.5f
-                        use pen = new Pen(this.appearance.tabBorderColor, 1.0f)
-                        g.DrawPath(pen, outline)
-            // No outline on any tab, the way a browser draws them: the active
-            // tab is told apart by its fill, and a hairline divides adjacent
-            // plain tabs. An outline round the active tab made it read as a box
-            // sitting on the title bar rather than one tab among several.
-            // Exterior shadows are rendered by TabShadowWindow, outside the
-            // strip bounds so the tabs remain flush with the original window.
-            match this.stripeColor with
-            | Some color ->
-                let state = g.Save()
-                g.SetClip(path)
-                use stripe = new SolidBrush(color)
-                match this.dock with
-                | TabDockLeft | TabDockRight ->
-                    let thickness = min this.size.width (Dpi.scale 3)
-                    let inset = Dpi.scale 2
-                    let opensLeft = (this.dock=TabDockRight) <> (this.direction=TabUp)
-                    let x = if opensLeft then this.size.width-inset-thickness else inset
-                    let length = max thickness (min (Dpi.scale 20) (this.size.height-Dpi.scale 12))
-                    let y = (this.size.height-length)/2
-                    use mark = new GraphicsPath()
-                    mark.AddArc(x,y,thickness,thickness,180.0f,180.0f)
-                    mark.AddArc(x,y+length-thickness,thickness,thickness,0.0f,180.0f)
-                    mark.CloseFigure()
-                    g.FillPath(stripe,mark)
-                | TabDockTop | TabDockBottom ->
-                    let thickness = min this.size.height (Dpi.scale 3)
-                    let y = if this.direction=TabUp then this.size.height-thickness else 0
-                    g.FillRectangle(stripe,0,y,this.size.width,thickness)
-                g.Restore(state)
-            | _ -> ()
-            if this.showLeftSeparator then
-                let inset = float32 this.size.height * 0.28f
-                let x = 0.0f
-                use pen = new Pen(this.appearance.tabBorderColor, 1.0f)
-                do g.DrawLine(pen, x, inset, x, float32 this.size.height - inset)
-            if this.onlyIcon.not then
-                //the text can't be drawn as a separate bitmap because clearcase fonts
-                //can't be drawn by gdi+ to a transparent background, need to draw directly on the tab background
-                let text = this.displayInfo.text
-                let font = this.displayInfo.textFont
-                use brush = this.tabTextBrush
-                use format = new StringFormat()
-                do format.LineAlignment <- StringAlignment.Center
-                do format.Alignment <- StringAlignment.Near
-                do format.Trimming <- StringTrimming.EllipsisCharacter
-                do format.FormatFlags <- format.FormatFlags ||| StringFormatFlags.NoWrap
-                let bounds = Rect(this.textLocation, this.textSize)
-                do g.DrawString(text, font, brush, bounds.Rectangle.RectangleF, format)
-            img
+            let img = this.draw
+            // A preview of the tab, not the tab: the drag is still holding the real one.
+            if this.displayInfo.ghost then
+                let masked = img.underMask 0.5f
+                img.bitmap.Dispose()
+                masked
+            else img
         member this.children = 
             List2([
                 (match this.displayInfo.numberBadge with

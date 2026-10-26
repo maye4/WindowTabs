@@ -70,6 +70,53 @@ type ShellEvent =
 type IWindow =
     abstract member hwnd : IntPtr
 
+/// Steps a window between two sizes over a handful of frames instead of jumping. A drag out of a
+/// maximized or fullscreen window lands in the window's own, smaller frame, and that one transition
+/// reads as the window settling into the pointer rather than as a cut. Moving between frames of the
+/// same size is not a step: the drag follows the pointer directly.
+module DragTween =
+    let private frame = 16
+    let private steps = 8
+    let private running = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, System.Windows.Forms.Timer>()
+    let private goals = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, Rect>()
+    /// Ease out: fast at first, settling at the end, the way a window being dropped into place looks.
+    let private ease (t:float) = 1.0 - (1.0 - t) * (1.0 - t)
+    /// Move the window to this rect. Returns true while a step is in progress, in which case the
+    /// caller must leave the window alone until it ends: the step ends on the newest rect asked for.
+    let step (hwnd:IntPtr) (bounds:unit -> Rect) (move:Rect -> unit) (rect:Rect) =
+        match running.TryGetValue hwnd with
+        | true, _ ->
+            goals.[hwnd] <- rect
+            true
+        | _ ->
+            let from = bounds()
+            if from.size = rect.size then false
+            else
+                let interpolate (goal:Rect) (t:float) =
+                    let lerp a b = a + int (float (b - a) * t)
+                    Rect(Pt(lerp from.x goal.x, lerp from.y goal.y),
+                         Sz(lerp from.width goal.width, lerp from.height goal.height))
+                let mutable current = 1
+                let timer = new System.Windows.Forms.Timer(Interval=frame)
+                goals.[hwnd] <- rect
+                running.[hwnd] <- timer
+                // The first step lands before this returns: waiting a timer frame to begin moving is
+                // what a drag feels as lag at the grab.
+                move (interpolate rect (ease (1.0 / float steps)))
+                timer.Tick.Add(fun _ ->
+                    current <- current + 1
+                    let goal = match goals.TryGetValue hwnd with | true, r -> r | _ -> rect
+                    if current >= steps then
+                        timer.Stop()
+                        timer.Dispose()
+                        running.TryRemove hwnd |> ignore
+                        goals.TryRemove hwnd |> ignore
+                        move goal
+                    else
+                        move (interpolate goal (ease (float current / float steps))))
+                timer.Start()
+                true
+
 type OS()= 
     let Cell = CellScope()
 
@@ -395,6 +442,17 @@ and
         wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
         WinUserApi.SetWindowPlacement(hwnd, ref wpStruct) |> ignore
 
+    /// TEMPORARY measurement: SetWindowPlacement reporting whether Windows accepted the request.
+    member this.setPlacementReporting wp =
+        let mutable wpStruct = WINDOWPLACEMENT()
+        wpStruct.length <- Marshal.SizeOf(wpStruct)
+        wpStruct.flags <- wp.flags
+        wpStruct.showCmd <- wp.showCmd
+        wpStruct.ptMinPosition <- wp.ptMinPosition.POINT
+        wpStruct.ptMaxPosition <- wp.ptMaxPosition.POINT
+        wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
+        WinUserApi.SetWindowPlacement(hwnd, ref wpStruct)
+
     member this.setForeground(force) =
         if force then
             let foregroundWindow = WinUserApi.GetForegroundWindow()
@@ -584,6 +642,10 @@ and
             bounds.height,
             true) |> ignore
 
+    /// TEMPORARY measurement: MoveWindow reporting whether Windows accepted the request.
+    member this.moveReporting (bounds:Rect) =
+        WinUserApi.MoveWindow(hwnd, bounds.x, bounds.y, bounds.width, bounds.height, true)
+
     member this.setText text = WinUserApi.SetWindowText(hwnd, text) |> ignore
     
     member this.className = Win32Helper.GetClassName(hwnd)
@@ -675,6 +737,16 @@ and
         let visible = Pt(ptScreen.x - size.width/2, ptScreen.y + this.dragAnchorY)
         Rect(visible.add(this.dragFrameOffset), size)
 
+    /// A window that covers its whole monitor, taskbar included, is running fullscreen of its own
+    /// accord — a video player, or a browser in its own fullscreen. That is not the same state as
+    /// maximized, and nothing else here restores it.
+    member this.isFullScreen =
+        match Mon.fromHwnd hwnd with
+        | Some mon ->
+            let bounds = this.bounds
+            bounds.size.width >= mon.displayRect.width && bounds.size.height >= mon.displayRect.height
+        | None -> false
+
     /// A tab dragged out of its group shows its window under the pointer, at its real size,
     /// centered horizontally under the cursor and a little below it. Moving rather than
     /// placing keeps the normal rect as it was and leaves a maximized window restored. Never
@@ -684,8 +756,40 @@ and
         // size, but taking the foreground from the app the user is working in is not part of a drag.
         if this.isMinimized then this.showNoActivate()
         if this.isMaximized then WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
-        this.move(this.dragFollowRect ptScreen (this.dragSize ptScreen normalSize))
-        this.showNoActivate()
+        let rect = this.dragFollowRect ptScreen (this.dragSize ptScreen normalSize)
+        let full = this.isFullScreen
+        // A change of size - out of a maximized or fullscreen frame into the window's own - steps
+        // there over a few frames instead of jumping. A move that keeps the size follows directly,
+        // and one that changes nothing at all is skipped: it would only make the app lay itself out.
+        if not full then
+            if not (DragTween.step hwnd (fun () -> this.bounds) (fun rect -> this.move rect) rect) then
+                if this.bounds <> rect then this.move(rect)
+        // TEMPORARY: a fullscreen window owns that state; measure exactly what it accepts, in order.
+        if full then
+            let place() =
+                let p = this.placement
+                sprintf "showCmd=%d normal=%A" p.showCmd p.rcNormalPosition
+            let line =
+                try
+                    let rect0 = this.bounds
+                    let place0 = place()
+                    let setOk = this.setPlacementReporting({
+                                    this.placement with
+                                        showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
+                                        rcNormalPosition = rect })
+                    let rect1 = this.bounds
+                    let place1 = place()
+                    let moveOk = this.moveReporting(rect)
+                    let rect2 = this.bounds
+                    let place2 = place()
+                    sprintf "%s rect0=%A | place0=%s | setWP=%b rect1=%A place1=%s | move=%b rect2=%A place2=%s | asked=%A"
+                        (DateTime.Now.ToString("HH:mm:ss.fff")) rect0 place0 setOk rect1 place1 moveOk rect2 place2 rect
+                with error -> sprintf "%s THREW %s" (DateTime.Now.ToString("HH:mm:ss.fff")) error.Message
+            try
+                IO.File.AppendAllText(IO.Path.Combine(IO.Path.GetTempPath(), "windowtabs-drag.log"), line + "\n")
+            with _ -> ()
+        // Showing a window that is already shown costs a ShowWindow per pointer move.
+        if not this.isVisible then this.showNoActivate()
 
     override this.Equals(yobj) =
         match yobj with
