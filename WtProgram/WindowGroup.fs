@@ -165,6 +165,39 @@ type GroupMenuChoices = {
     alignments: (TabDirection * Bemo.TabAlignment) list
     autoHideMode: string option }
 
+/// Each window's last size the user chose for it while it was alone and normal, so a tab
+/// dragged out of a group gets that back instead of the group's shared frame. Kept at
+/// module level keyed by HWND: a window joining a group is already placed at that group's
+/// frame before the group it came from lets it go, so only the window's own HWND carries
+/// its size across, and only its own sizing replaces it.
+module LastNormalSize =
+    let private sizes = Collections.Concurrent.ConcurrentDictionary<IntPtr,Sz>()
+    /// The size to keep for a released window: a maximized window keeps the size from before
+    /// it maximized in rcNormalPosition, a fullscreen window has no size of its own to give.
+    let sizeOf (window:Window) =
+        if window.isMaximized then None
+        else
+            Mon.fromHwnd window.hwnd
+            |> Option.bind(fun mon ->
+                let size = window.placement.rcNormalPosition.size
+                if MonitorFit.fillsWorkArea mon.workRect size then None else Some size)
+    /// The user sized this window itself while it was alone: this replaces what a drag-out
+    /// restores, and is the only thing that may replace a captured size.
+    let remember hwnd size = sizes.[hwnd] <- size
+    /// A window alone and normal for the first time. An existing size stays: a window joining
+    /// another group is resized to that group's frame before its old group stops treating it
+    /// as alone, so the group frame must never overwrite the size the user chose.
+    let captureIfAbsent hwnd size = sizes.TryAdd(hwnd,size) |> ignore
+    let ofHwnd hwnd = match sizes.TryGetValue(hwnd) with true,size -> Some size | _ -> None
+    let forget hwnd = sizes.TryRemove(hwnd) |> ignore
+    /// The size the user was offered when the drag started. A drop places the window at it, but
+    /// the app or the group alignment can still resize it, and that grown frame is not the
+    /// user's choice: it must not be read back and become the next drag's size.
+    let dragOffered = ref None
+    let offer (size:Sz) = dragOffered := Some size
+    let offered() = dragOffered.Value
+    let clearOffer() = dragOffered := None
+
 type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:TabAppearanceInfo) as this =
     let Cell = CellScope(true)
     let inputOwnership = Collections.Generic.Dictionary<IntPtr,bool>()
@@ -200,6 +233,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     let windowsCell = Cell.create(Set2())
     let _ts = ref None 
     let inMoveSize = Cell.create(false)
+    let mutable soloSizeBeforeMove : (IntPtr * Sz) option = None
     let foregroundCell = Cell.create(_os.foreground.hwnd)
     let prevForegroundCell = ref None
     let mutable lastActiveTab : IntPtr option = None
@@ -701,9 +735,48 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     Mon.fromHwnd(window.hwnd).map(fun mon -> mon.workRect.move(-1,-1))
                 else None
             let bounds = monitorBounds.def(window.bounds)
+            let wp = window.placement
             let visible = monitorBounds.def(window.visibleBounds)
-            placement.set(Some(bounds, window.placement, visible))
+            placement.set(Some(bounds, wp, visible))
+            // The size the user last chose for this window itself, captured once: only a solo
+            // window's frame is that choice, and a later capture would sometimes be the shared
+            // frame of a group the window is already joining. rcNormalPosition is captured
+            // rather than bounds so the value round-trips exactly through setPlacement. A frame
+            // other than the one a drop offered means the app grew it after the drop, which is
+            // not a choice either.
+            if this.windowCount = 1
+               && (LastNormalSize.offered() |> Option.forall ((=) window.placement.rcNormalPosition.size)) then
+                LastNormalSize.sizeOf window
+                |> Option.iter(fun size -> LastNormalSize.captureIfAbsent window.hwnd size)
             if enableSuperBar then this.prepareMinimizeAnchor window.hwnd
+
+    /// The size to restore if this tab is dropped outside a group, read as the drag starts:
+    /// a solo group still shows the window at the size the user chose for it, before another
+    /// group resizes it to its shared frame. Captured here because the drop can come after
+    /// the tab left this group, when its placement is someone else's. Only a first sight of a
+    /// solo window that is already its own size may add one; a drag is not a resize, so a
+    /// size already remembered is never replaced here.
+    member this.dragSizeOf(hwnd) =
+        if this.windowCount = 1 && (LastNormalSize.ofHwnd hwnd).IsNone then
+            LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd)
+            |> Option.iter(fun size -> LastNormalSize.captureIfAbsent hwnd size)
+        // Nothing is offered here: a press that never becomes a drag would leave the offer behind and
+        // gate the capture of an unrelated window. The offer the placement guard compares against is
+        // the one the drop itself makes.
+        LastNormalSize.ofHwnd hwnd
+
+    /// Only a size change across the same solo native move/size loop replaces the choice.
+    /// A late end event or a title-bar move must not promote a group/drop frame to it.
+    member private this.captureSoloSize(before) =
+        if this.windowCount = 1 then
+            match before, zorderCell.value.tryHead with
+            | Some(hwnd,oldSize), Some top when hwnd=top ->
+                LastNormalSize.sizeOf (this.os.windowFromHwnd top)
+                |> Option.iter(fun size ->
+                    if size<>oldSize then
+                        LastNormalSize.remember top size
+                        LastNormalSize.offer size)
+            | _ -> ()
 
     member this.prepareMinimizeAnchor hwnd =
         if FollowerPlacement.queue.isWindowIdle(placementOwner,hwnd) && this.os.windowFromHwnd(hwnd).needsMinimizeAnchor then
@@ -768,11 +841,18 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         
 
     member this.onEnterMoveSize() =
+        if not inMoveSize.value then
+            soloSizeBeforeMove <-
+                if this.windowCount = 1 then
+                    let hwnd = zorderCell.value.head
+                    LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd) |> Option.map(fun size -> hwnd,size)
+                else None
         inMoveSize.set(true)
         this.hideChildWindows()
         this.updateIsVisible()
 
     member this.onExitMoveSize() =
+        soloSizeBeforeMove <- None
         inMoveSize.set(false)
         this.saveTopWindowPlacement()
         this.adjustChildWindows()
@@ -855,7 +935,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
 
         | WinEvent.EVENT_SYSTEM_MOVESIZEEND ->
             if this.isTop(hwnd) then 
+                let before = soloSizeBeforeMove
                 this.onExitMoveSize()
+                this.captureSoloSize(before)
 
         //this is here to detect transitions between maximized and
         //restored (both directions). MOVESIZE does not get triggered in this case
@@ -896,6 +978,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                 this.updateIsVisible()
             this.ts.refreshShadow()
         | WinEvent.EVENT_OBJECT_HIDE | WinEvent.EVENT_OBJECT_DESTROY ->
+            // A destroyed window's handle gets reused, and the new window would inherit its size.
+            if not(WinUserApi.IsWindow hwnd) then LastNormalSize.forget hwnd
             this.reclaimLeftTab(hwnd)
             if lastActiveTab=Some hwnd then this.followClosedTab(this.os.foreground.hwnd)
         | WinEvent.EVENT_OBJECT_CLOAKED | WinEvent.EVENT_OBJECT_UNCLOAKED ->
@@ -971,6 +1055,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             if inMoveSize.value then
                 this.onExitMoveSize()
             let window = this.os.windowFromHwnd(hwnd)
+            // A window leaving alone is merged into another group or ungrouped, not closed:
+            // keep the size the user chose for it before the next group places it.
+            if this.windowCount = 1
+               && (LastNormalSize.offered() |> Option.forall ((=) window.placement.rcNormalPosition.size)) then
+                LastNormalSize.sizeOf window
+                |> Option.iter(fun size -> LastNormalSize.captureIfAbsent hwnd size)
             this.ts.removeTab(Tab(hwnd))
             tabColors <- tabColors.Remove hwnd
             this.setWindows(this.windows.remove hwnd)
@@ -980,6 +1070,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             pendingMinimizeStates.Remove(hwnd) |> ignore
             requestedMinimizeStates.Remove(hwnd) |> ignore
             iconCache.remove(hwnd)
+            // A closed window's HWND may be reused by another window, whose own size it would
+            // then inherit. A live one keeps its entry for the group it goes to next.
+            if not(WinUserApi.IsWindow hwnd) then LastNormalSize.forget hwnd
             // The successor, not the current foreground: Windows may still show the tab it
             // activated itself while our selection is on its way.
             let successor =

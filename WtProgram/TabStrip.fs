@@ -16,6 +16,14 @@ type ITabStripMonitor =
     abstract member tabMoved : Tab * int -> unit
     abstract member windowMsg : Win32Message -> unit
 
+/// What a floating drag carries: where the strip the drop leaves puts the tab, how that strip draws
+/// it, and the release that lets go of what the drag had to keep for the picture.
+type FloatingTabSprite = {
+    location : bool -> Sz -> Pt
+    image : bool -> Sz -> Img
+    release : unit -> unit
+    }
+
 type TabStrip(monitor:ITabStripMonitor) as this =
     let Cell = CellScope(false, true)
     let _os = OS()
@@ -726,22 +734,44 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             
     member this.tabLocation = this.ts.tabLocation
     
-    /// The window capture is full size; release it here rather than waiting for the GC.
-    member this.dragImage (tab:Tab) : Img= 
-        if this.isVertical then this.ts.renderTab(tab) else this.horizontalDragImage(tab)
-
-    member private this.horizontalDragImage (tab:Tab) : Img=
-        use bmpTab = this.tsBase(TabUp).renderTab(tab).bitmap
-        use bmpHwnd = this.tabInfo(tab).preview().bitmap
-        let bmpOverlay = Img(Sz(bmpHwnd.Width, bmpHwnd.Height + bmpTab.Height - this.contentOffset))
-        try
-            use gCapture = bmpOverlay.graphics
-            gCapture.DrawImage(bmpTab, Point.Empty)
-            gCapture.DrawImage(bmpHwnd, new Point(0, this.size.height - this.contentOffset))
-            bmpOverlay
-        with _ ->
-            bmpOverlay.bitmap.Dispose()
-            reraise()
+    /// The tab a floating drag carries: where a strip that holds only this tab puts it, and how that
+    /// strip draws it. That strip is the floating window's own, and not the one the drag started in —
+    /// a maximized window's strip is as wide as the screen, keeps room for the caption buttons and
+    /// draws its row inside the title bar, which runs the other way round. Laid out and drawn for the
+    /// strip it left, a centred tab landed at the far right of the screen with the corners flipped.
+    member this.floatingTab (tab:Tab) (appearance:TabAppearanceInfo) : FloatingTabSprite =
+        let strip = this.tsBase this.direction
+        // Read once, here, while the strip still holds the tab: the drag gives it up as soon as it
+        // leaves, and with it the display info both the slot and the picture are read from. The icon
+        // goes with the group's window, which is disposed when the tab leaves, while the picture is
+        // still to be drawn for the window that floats — so the drag keeps a copy of its own.
+        let display = strip.tabs.find(tab)
+        let icon = display.icon.Clone() :?> Icon
+        let solo =
+            { strip with
+                appearance = appearance
+                tabs = Map2(List2([tab, { display with icon = icon }]))
+                lorder = List2([tab])
+                zorder = List2([tab])
+                slide = None
+                held = None
+                hover = None
+                captured = None
+                scrollOffset = 0 }
+        let at showInside size =
+            let direction = if showInside then TabDown else TabUp
+            { solo with
+                size = size
+                direction = direction
+                // Alignment is a per-direction setting: carried into the other direction unchanged, the
+                // tab is laid out by the alignment of the strip it left and moves sideways on release.
+                alignment = this.getAlignment direction
+                centerShift =
+                    if showInside then float(appearance.tabIndentFlipped - appearance.tabIndentNormal) / 2.0
+                    else 0.0 }
+        { location = (fun showInside size -> (at showInside size).tabLocation tab)
+          image = (fun showInside size -> (at showInside size).renderTab tab)
+          release = (fun () -> icon.Dispose()) }
 
     member this.setTabBgColor((tab, color)) =
         if tabBgColor.value.tryFind(tab) <> color then

@@ -9,7 +9,7 @@ type TabStripDecorator(group:WindowGroup) as this =
     let os = OS()
     let Cell = CellScope(false, true)
     let isDraggingCell = Cell.create(false)
-    let dragInfoCell = Cell.create(None)
+    let dragInfoCell = Cell.create(None:Option<TabDragInfo>)
     /// A tab from another group was dragged in and is still here: dropped, it makes this group one made by hand.
     let mutable joinedByDrag = false
     let dragPtCell = Cell.create(Pt.empty)
@@ -119,9 +119,11 @@ type TabStripDecorator(group:WindowGroup) as this =
     member private this.invokeAsync f = group.invokeAsync f
     member private this.invokeSync f = group.invokeSync f
 
-    member this.placement =
+    /// Where this strip goes over a window whose visible frame is this, so a floating drag can ask
+    /// the same question about the window it is carrying.
+    member private this.placementFor (visible:Rect) (maximized:bool) =
         let decorator =  {
-            windowBounds = group.bounds.value.def(Rect())
+            windowBounds = visible
             monitorBounds = Mon.all.map(fun m -> m.workRect)
             decoratorHeight = group.tabAppearance.tabHeight
             decoratorHeightOffset = group.tabAppearance.tabHeightOffset
@@ -131,9 +133,11 @@ type TabStripDecorator(group:WindowGroup) as this =
         if this.ts.isVertical then
             let width = Dpi.scale (if this.ts.isIconOnly then 48 else this.ts.columnWidth)
             decorator.sidePlacement(this.ts.dock,width,contentHeight=this.ts.columnContentHeight,
-                                    alignment=this.ts.getAlignment TabUp,maximized=group.isMaximized.value)
+                                    alignment=this.ts.getAlignment TabUp,maximized=maximized)
         else
             { showInside=decorator.shouldShowInside; bounds=decorator.bounds }
+
+    member this.placement = this.placementFor (group.bounds.value.def(Rect())) group.isMaximized.value
 
     member this.beginRename(hwnd) =
         let tab = Tab(hwnd)
@@ -582,10 +586,29 @@ type TabStripDecorator(group:WindowGroup) as this =
                     group.tabActivate(tab, false)
                     if part <> TabClose then
                         let dragOffset = pt.sub(this.ts.tabLocation tab)
-                        let dragImage = fun() -> this.ts.dragImage(tab)
                         let _,sprite = this.ts.tabSprites.pick(fun (location,sprite) -> if sprite.id=tab then Some(location,sprite) else None)
-                        let dragInfo = box({ tab = tab; tabOffset = dragOffset; tabSize=sprite.size; tabInfo = this.ts.tabInfo(tab)})
-                        Services.dragDrop.beginDrag(this.ts.hwnd, dragImage, dragOffset, ptScreen, dragInfo)
+                        let dragInfo = box({ tab = tab; tabOffset = dragOffset; tabSize=sprite.size; tabInfo = this.ts.tabInfo(tab); lastNormalSize = group.dragSizeOf(hwnd)})
+                        // The window that leaves this strip takes the tab with it: the picture is
+                        // drawn once, when the drag begins, and laid where a strip holding that
+                        // window alone puts it, which is the strip the drop leaves it with.
+                        // Built now, not lazily: the tab is read while the strip still holds it, and
+                        // the closures only carry what was read.
+                        let floatingTab = this.ts.floatingTab tab group.tabAppearance
+                        // Drawn and laid as the strip the drop leaves draws that tab, which is not the
+                        // strip the drag started in: a maximized window's strip is as wide as the
+                        // screen, keeps room for the caption buttons and runs its row inside the title
+                        // bar, while the window being carried is its own, smaller size.
+                        Services.dragDrop.beginDrag(this.ts.hwnd, ptScreen, dragInfo, {
+                            // One placement per frame: it decides the picture, the slot, and the key that
+                            // says whether the picture has to be drawn again at all.
+                            frame = fun (visible:Rect) ->
+                                let placement = this.placementFor visible false
+                                let offset = floatingTab.location placement.showInside placement.bounds.size
+                                box (placement.showInside, placement.bounds.size),
+                                floatingTab.image placement.showInside placement.bounds.size,
+                                Pt(placement.bounds.x + offset.x, placement.bounds.y + offset.y)
+                            release = floatingTab.release
+                            })
                 | MouseMiddle ->
                     group.tabActivate(tab, false)
             | _ -> ()
@@ -645,11 +668,13 @@ type TabStripDecorator(group:WindowGroup) as this =
                     let tab = dragInfo.tab
                     if this.ts.tabs.contains(tab) then
                         this.ts.removeTab(tab)
-                        dragInfoCell.set(None)       
+                        dragInfoCell.set(None)
                         let (Tab(hwnd)) = tab
-                        let window = os.windowFromHwnd(hwnd)
+                        // The tab and its window leave this group while the drag is on the
+                        // desktop: the drop decides where they go, the group must not follow the
+                        // window that now floats under the pointer, and the tab travels with
+                        // that window instead of staying drawn here.
                         group.removeWindow(hwnd)
-                        window.hideOffScreen(None)
                         joinedByDrag <- false
                 | None -> ()
                 this.updateTsSlide()

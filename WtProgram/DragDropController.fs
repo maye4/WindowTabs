@@ -1,4 +1,4 @@
-﻿namespace Bemo
+namespace Bemo
 open System
 open System.Windows.Forms
 
@@ -38,35 +38,66 @@ type DragCapturedState(info:DragCapturedStateInfo) =
                 info.onDragOut(ptScreen)
         member this.dispose() = ()
 
+/// The tab a floating drag carries over the window it moves. The strip renders it, so the window
+/// wears the tab the user grabbed, and it is placed where the strip the drop leaves the window
+/// with draws that tab, so letting go does not move it.
+type FloatingTab(os:OS, sprite:DragTabSprite) =
+    let window = AnimationWindow(os)
+    do  window.setAlpha(byte 0xFF)
+    /// The frame geometry the picture was drawn for. The strip the drop leaves draws its row a corner
+    /// shape and a pixel apart from the strip the drag started in, so the picture is redrawn when that
+    /// geometry changes — not on every pointer move.
+    let mutable drawnFor : obj = null
+    let place (visible:Rect) =
+        let key, image, location = sprite.frame visible
+        if not(obj.Equals(drawnFor, key)) then
+            window.setImage(image)
+            drawnFor <- key
+        location
+    member this.follow(visible:Rect) =
+        window.setLocation(place visible)
+        window.setIsVisible(true)
+    member this.hide() = window.setIsVisible(false)
+    member this.hwnd = window.hwnd
+    interface IDisposable with
+        member this.Dispose() = window.Dispose()
+
 type DragFloatingStateInfo = {
-    imageOffset : Pt
     targets: Map2<IntPtr, IDragDropTarget>
-    animationWindow: AnimationWindow
+    /// The tab dragged out of a group leaves its window showing under the pointer, at its real
+    /// size, until it is dropped or dragged back in.
+    window : Window
+    normalSize : Sz option
+    /// The tab that left the strip, drawn over the window for as long as it floats.
+    tab : FloatingTab option
     onDragIn: (IntPtr * Pt) -> unit
     }
 
 type DragFloatingState(info:DragFloatingStateInfo) =
     let os = OS()
-    let animationWindow = info.animationWindow
+    member this.follow(ptScreen) =
+        info.window.followDrag(ptScreen) info.normalSize
+        info.tab |> Option.iter(fun tab -> tab.follow info.window.visibleBounds)
     interface IDragState with
         member this.mouseMove(ptScreen) =
+            // The dragged window stays shown all the way to a target strip: hiding it when
+            // the pointer came near the strip took the tab's own chrome away mid-drag. The
+            // strip's dragEnter still merges the tab, and the window follows the pointer
+            // again if that is refused.
             let targetHwnd = os.windowAtPt(ptScreen).hwnd
-            if info.targets.tryFind(targetHwnd).IsSome then
-                animationWindow.setIsVisible(false)
-                info.onDragIn(targetHwnd, ptScreen)
-            else
-                animationWindow.setLocation(ptScreen.sub(info.imageOffset))
-                animationWindow.setIsVisible(true)
-        member this.dispose() = animationWindow.setIsVisible(false)
+            match info.targets.tryFind(targetHwnd) with
+            | Some _ -> info.onDragIn(targetHwnd, ptScreen)
+            | None -> this.follow(ptScreen)
+        member this.dispose() = info.tab |> Option.iter(fun tab -> tab.hide())
 
 type DragActionInfo = {
     targets : Map2<IntPtr, IDragDropTarget>
     notifications: Set2<IDragDropNotification>
     initialHwnd : IntPtr
-    image : unit -> Img
-    imageOffset : Pt
     initialPt : Pt
     data: obj
+    /// The tab the drag takes off the strip, so the floating window keeps its chrome.
+    tab : DragTabSprite
     onCancel : unit -> unit
     onBegin : unit -> unit
     onDrop : Pt -> unit
@@ -75,13 +106,15 @@ type DragActionInfo = {
 
 type DragAction(info:DragActionInfo) =
     let os = OS()
-    let dragScale = 0.5
     let Cell = CellScope(true, false)
     let ptScreenCell = Cell.create(info.initialPt)
     let dragStateCell = Cell.create(None:Option<IDragState>)
     let captureWindowCell = Cell.create(None:Option<IWindow>)
+    // A tab dragged out of a group shows its window under the pointer instead of a
+    // shrunk drag image: the same window is moved back into a group, never parked.
+    let dragWindowCell = Cell.create(None:Option<Window * Sz option>)
+    let floatingTabCell = Cell.create(None:Option<FloatingTab>)
     let timer = new Timer()
-    let animationWindowCell = Cell.create(None:Option<AnimationWindow>)
 
     member this.setNextState(newState:obj) =
         let newState = unbox<IDragState>(newState)
@@ -95,7 +128,10 @@ type DragAction(info:DragActionInfo) =
         (captureWindowCell.value.Value :?>IDisposable).Dispose()
         timer.Dispose()
         dragStateCell.value.Value.dispose()
-        animationWindowCell.value.iter <| fun window -> window.Dispose()
+        floatingTabCell.value.iter(fun tab -> (tab :> IDisposable).Dispose())
+        // The sprite is built on mouse-down, before this drag proves to be one: a click that never
+        // moves would otherwise keep the tab's copied icon for the life of the process.
+        info.tab.release()
         match dragStateCell.value.Value with
         | :? DragDetectingState ->
             info.onCancel()
@@ -106,6 +142,8 @@ type DragAction(info:DragActionInfo) =
         | :? DragFloatingState ->
             info.targets.values.iter <| fun target -> target.dragEnd()
             info.notifications.items.iter <| fun n -> n.dragEnd()
+            // The drop places the same window made visible under the pointer; it is the
+            // user's window now, so nothing hides it afterwards.
             info.onDrop(ptScreen)
             info.onEnd()
         | _ -> ()
@@ -125,14 +163,24 @@ type DragAction(info:DragActionInfo) =
         | _ -> ()
         msg.def()
 
-    member this.dragFloat() =
-        this.setNextState <| DragFloatingState({
+    /// A tab strip is dragged on its group's thread, which also owns the tab's window, so the
+    /// calls stay on that thread: going through an invoker would queue the moves behind the
+    /// captures this mouse hook holds. The source strip's handle names the dragged window.
+    member private this.draggedWindow =
+        dragWindowCell.value |> Option.map(fst) |> Option.defaultValue (os.windowFromHwnd(info.initialHwnd))
+
+    member this.dragFloat(ptScreen) =
+        let state = DragFloatingState({
             targets = info.targets
-            imageOffset = info.imageOffset.mulf(dragScale, dragScale)
-            animationWindow = animationWindowCell.value.Value
+            window = this.draggedWindow
+            normalSize = dragWindowCell.value |> Option.map snd |> Option.flatten
+            tab = floatingTabCell.value
             onDragIn = fun (targetHwnd, ptScreen) ->
                 this.dragEnter(targetHwnd, ptScreen, false)
         })
+        this.setNextState state
+        // The transition itself must show both pieces, even if the mouse stops here.
+        state.follow(ptScreen)
 
     member this.dragEnter(targetHwnd, ptScreen, isInitial) =
         let target = info.targets.find(targetHwnd)
@@ -146,26 +194,27 @@ type DragAction(info:DragActionInfo) =
                 onDragOut = fun(ptScreen) -> 
                     let targetHwnd = os.windowAtPt(ptScreen).hwnd
                     match info.targets.tryFind(targetHwnd) with
-                    | Some(target) -> this.dragEnter(targetHwnd, ptScreen, false)
-                    | None -> this.dragFloat()
+                    | Some _ -> this.dragEnter(targetHwnd, ptScreen, false)
+                    | None -> this.dragFloat(ptScreen)
             })
         else 
             if isInitial then target.dragExit()
-            this.dragFloat()
+            this.dragFloat(ptScreen)
 
     member this.dragDetect() =
         this.setNextState <| DragDetectingState({
             initialPt = info.initialPt
             onBegin = fun() ->  
-                animationWindowCell.value <-
-                    let animationWindow = AnimationWindow(os)
-                    animationWindow.setAlpha(byte(0xAA))
-                    try
-                        //this may fail if the image coming back is too small
-                        use full = info.image().bitmap
-                        animationWindow.setImage(full.img.scale(dragScale))
-                    with _ -> ()
-                    Some(animationWindow)
+                dragWindowCell.value <-
+                    match info.data with
+                    | :? TabDragInfo as dragInfo ->
+                        let (Tab hwnd) = dragInfo.tab
+                        Some(os.windowFromHwnd(hwnd), dragInfo.lastNormalSize)
+                    | _ -> None
+                // Rendered now: the strip gives the tab up as soon as the drag leaves it, and
+                // with it the tab info the picture is drawn from. A picture that will not draw
+                // costs the drag its tab, not the drag.
+                try floatingTabCell.set(Some(new FloatingTab(os, info.tab))) with _ -> ()
                 info.targets.values.iter <| fun target -> target.dragBegin()
                 info.notifications.items.iter <| fun n -> n.dragBegin()
                 info.onBegin()
@@ -198,16 +247,15 @@ type DragDropController(parent:IDragDropParent) =
             targetsCell.map(fun targets -> targets.add hwnd target)
         member x.unregisterTarget(hwnd) = withLock <| fun() ->
             targetsCell.map(fun targets -> targets.remove hwnd)
-        member x.beginDrag((initialHwnd, image, imageOffset, initialPt, data)) = withLock <| fun() ->
+        member x.beginDrag((initialHwnd, initialPt, data, tab)) = withLock <| fun() ->
             if dragActionCell.value.IsNone then 
                 let dragAction = DragAction({
                     targets = targetsCell.value
                     notifications = notificationsCell.value
                     initialHwnd = initialHwnd
-                    image = image
-                    imageOffset = imageOffset
                     initialPt = initialPt
                     data = data
+                    tab = tab
                     onCancel = fun() -> 
                         dragActionCell.set(None)
                     onBegin = fun() -> 
@@ -219,6 +267,13 @@ type DragDropController(parent:IDragDropParent) =
                         dragActionCell.set(None)
                 })
                 dragActionCell.set(Some(dragAction))
-                dragAction.start()
+                try dragAction.start()
+                with error ->
+                    dragActionCell.set(None)
+                    tab.release()
+                    reraise()
+            else
+                // No second drag begins, so nothing would ever release what this one brought.
+                tab.release()
             ()
 

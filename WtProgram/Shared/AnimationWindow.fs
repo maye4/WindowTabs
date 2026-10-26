@@ -17,11 +17,18 @@ type AnimationWindow(os:OS) =
             WindowsExtendedStyles.WS_EX_TRANSPARENT 
         os.createWindow (fun msg -> msg.def()) styles stylesExe
         
+    /// The image whose pixels the window is showing. A new picture has to be uploaded even while the
+    /// window stays visible, or one swapped mid-drag is never drawn.
+    let mutable uploaded : obj = null
     do  scope.listen <| fun() ->
             let window = os.windowFromHwnd(window.hwnd)
             match isWindowVisible.value, isVisible.value with
             | true, true -> 
-                window.updateLocation(location.value)
+                match image.value with
+                | Some(current) when not(obj.ReferenceEquals(current, uploaded)) ->
+                    window.update(current, location.value, alpha.value)
+                    uploaded <- current
+                | _ -> window.updateLocation(location.value)
             | true, false -> 
                 window.hide()
                 isWindowVisible.set(false)
@@ -29,6 +36,7 @@ type AnimationWindow(os:OS) =
                 match image.value with
                 | Some(image) ->
                     window.update(image, location.value, alpha.value)
+                    uploaded <- image
                     isWindowVisible.set(true)
                 | None -> ()
             | false, false -> ()

@@ -194,6 +194,18 @@ type Mon(hMonitor:IntPtr)=
     // only forced every instance through an extra GC generation.
 
 
+module MonitorFit =
+    /// A size that reaches the work area on both axes fills the monitor. That is a
+    /// fullscreen window's normal rect, not an ordinary size like an Aero-snapped half.
+    let fillsWorkArea (work:Rect) (size:Sz) =
+        size.width >= work.width && size.height >= work.height
+    /// Stand-in for a normal size that was never seen: half of the work area.
+    let mediumNormalSize (work:Rect) =
+        Sz(work.width/2, work.height/2)
+    /// A remembered size, cut to the work area if it was taken on a larger monitor before.
+    let draggableNormalSize (work:Rect) (size:Sz) =
+        if fillsWorkArea work size then mediumNormalSize work else size.intersect work.size
+
 [<NoEquality>]
 [<NoComparison>]
 type Img(bitmap:Bitmap) = 

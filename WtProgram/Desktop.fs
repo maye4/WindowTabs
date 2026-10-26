@@ -1,4 +1,4 @@
-﻿namespace Bemo
+namespace Bemo
 open System
 open System.Drawing
 open System.Threading
@@ -187,10 +187,6 @@ type Desktop(notify:IDesktopNotification, settings:ISettings, dispatcher:IDispat
 
     member private this.createGroup(enableSuperBar) = this.createGroupInfo(enableSuperBar).cast<IGroup>()
 
-    member private this.windowOffset = 
-        let tabAppearance = Services.program.tabAppearanceInfo.scaled
-        Pt(-tabAppearance.tabIndentNormal, tabAppearance.tabHeight - (tabAppearance.tabHeightOffset + 1))
-          
     member this.findGroupContainingHwnd hwnd : IGroup option =  
         this.cast<IDesktop>().groups.tryFind(fun g -> g.windows.contains((=)hwnd))
 
@@ -250,24 +246,45 @@ type Desktop(notify:IDesktopNotification, settings:ISettings, dispatcher:IDispat
             let dragInfo = unbox<TabDragInfo>(data)
             let (Tab(hwnd)) = dragInfo.tab
             let window = os.windowFromHwnd(hwnd)
-            // Tabs sit on the visible frame, so step back over the invisible resize border too.
-            // A maximized or minimized window's frame says nothing about its restored one.
-            let frameOffset =
-                if window.isMaximized || window.isMinimized then Pt()
-                else window.visibleBounds.location.sub(window.bounds.location)
-            let windowPt = pt.sub(dragInfo.tabOffset).add(this.windowOffset).sub(frameOffset)
-            let monitor = Mon.fromPoint windowPt
+            // A tab dragged out of a group carries the size the user last chose for the
+            // window itself. The placement's normal rect is the group's shared frame or a
+            // fullscreen rect by now, so a remembered size wins; without one, keep the
+            // inherited rect unless it fills the monitor, which drops at a medium size.
+            // The tab can leave its group before the drop, so the size read at drag start is
+            // the one that counts; failing that, the size captured when the group released it.
+            let remembered = dragInfo.lastNormalSize |> Option.orElse(LastNormalSize.ofHwnd hwnd)
+            let monitor = Mon.fromPoint pt
+            let size =
+                match remembered, monitor with
+                | Some remembered, Some mon -> MonitorFit.draggableNormalSize mon.workRect remembered
+                | Some remembered, None -> remembered
+                | None, Some mon ->
+                    let inherited = window.placement.rcNormalPosition.size
+                    if MonitorFit.fillsWorkArea mon.workRect inherited then MonitorFit.mediumNormalSize mon.workRect
+                    else inherited
+                | None, None -> window.placement.rcNormalPosition.size
+            // Drop where the floating drag already holds the window: centered under the
+            // pointer, a little below it. tabOffset is the grab point inside the small tab
+            // sprite, not the window's center, so using it would jump the window sideways on
+            // release. The work-area correction stays, as it does for a placement, but the
+            // group's windowOffset does not: its tabHeight term is already in the shared drag
+            // anchor, and adding it again was the jump down on release.
+            let windowPt = (window.dragFollowRect pt size).location
             let workspaceOffset = monitor.map(fun mon -> mon.workRect.location.sub(mon.displayRect.location)).def(Pt())
             let windowPt = windowPt.sub(workspaceOffset)
+            // The drop places the window here, even if the app or the group then resizes it.
+            LastNormalSize.clearOffer()
+            LastNormalSize.offer size
             window.setPlacement({
                 window.placement with
                     showCmd = ShowWindowCommands.SW_SHOWNORMAL
                     rcNormalPosition = Rect(
                         windowPt,
-                        window.placement.rcNormalPosition.size)
-            })  
+                        size)
+            })
             notify.dragDrop(hwnd)
             
         member x.dragEnd() = invoker.asyncInvoke <| fun() ->
+            LastNormalSize.clearOffer()
             isDraggingCell.set(false)
             notify.dragEnd()

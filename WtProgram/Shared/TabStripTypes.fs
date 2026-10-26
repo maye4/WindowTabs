@@ -17,6 +17,10 @@ and TabDragInfo = {
     tabOffset: Pt
     tabSize: Sz
     tabInfo: TabInfo
+    /// The dragged window's last size the user chose for it, remembered while it was solo
+    /// and normal. A drag-out restores it: by then the placement's normal rect holds the
+    /// group's shared frame or a fullscreen rect, never this window's own choice.
+    lastNormalSize: Sz option
     } with
     /// Keep the grabbed point proportional when entering a differently sized tab or DPI.
     member this.offsetIn(size:Sz) =

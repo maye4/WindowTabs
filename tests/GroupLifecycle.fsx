@@ -49,7 +49,7 @@ let main() =
           "Automatic groups merged across virtual desktops, programs, or with an unknown desktop"
     check (pickFrom [unknownGroup] 5=None) "Two unresolved windows were assumed to share a desktop"
     Application.EnableVisualStyles()
-    let directory = Path.Combine(__SOURCE_DIRECTORY__, "Debug", "groups-" + Guid.NewGuid().ToString("N"))
+    let directory = Path.Combine(Path.GetTempPath(), "WindowTabs-groups-" + Guid.NewGuid().ToString("N"))
     Directory.CreateDirectory(directory) |> ignore
     let previousDirectory = Environment.CurrentDirectory
     Environment.CurrentDirectory <- directory
@@ -125,6 +125,9 @@ let main() =
         use snapOwner = new Form(ShowInTaskbar=false)
         use snapSource = new Form(ShowInTaskbar=false)
         use snapFollower = new Form(ShowInTaskbar=false)
+        // These checks exercise native placement in fixed pixels, not WinForms'
+        // automatic resize on mixed-DPI monitors (covered by DpiLayout).
+        snapSource.DpiChanged.Add(fun e -> e.Cancel <- true)
         let sourceWindow = OS().windowFromHwnd(snapSource.Handle)
         let followerWindow = OS().windowFromHwnd(snapFollower.Handle)
         let snapOwnerWindow = OS().windowFromHwnd(snapOwner.Handle)
@@ -229,8 +232,10 @@ let main() =
                 sourceWindow.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
                 let frame = Rect(Pt(screen.WorkingArea.Left+100,screen.WorkingArea.Top+100),Sz(640,480))
                 sourceWindow.move(frame)
+                check (sourceWindow.bounds=frame) "Minimize fixture did not reach its target frame"
                 sourceWindow.prepareMinimizeAnchor(fun () -> true)
-                check (sourceWindow.bounds=frame) "Preparing the minimize destination moved the window"
+                check (sourceWindow.bounds=frame)
+                      (sprintf "Preparing the minimize destination moved the window: expected=%A actual=%A" frame sourceWindow.bounds)
                 let anchor = sourceWindow.placement.ptMinPosition
                 let x = screen.Bounds.Left+(screen.Bounds.Width-SystemInformation.MinimizedWindowSize.Width)/2
                 check (anchor.x=x-(screen.WorkingArea.Left-screen.Bounds.Left)) (sprintf "Minimize destination is not centred: anchor=%A expectedX=%d frame=%A screen=%A owner=%A needs=%b" anchor x sourceWindow.bounds screen.Bounds sourceWindow.parent.hwnd sourceWindow.needsMinimizeAnchor)
@@ -577,7 +582,10 @@ let main() =
             check ([a;b;d] |> List.forall(fun hwnd -> below hwnd (owner hwnd))) "A preview is above the window it owns"
             check (FilterService().isValidOwner(OS().windowFromHwnd d)) "The filter drops windows a combined group owns"
             match WindowCloaking.TryGetDesktopId(proxy.Head) with
-            | true, desktop -> check (VirtualDesktop.desktopId d = Some desktop) "A combined group's window is not on its taskbar window's desktop"
+            | true, desktop ->
+                let actualDesktop = VirtualDesktop.desktopId d
+                check (actualDesktop = Some desktop)
+                      (sprintf "A combined group's window is not on its taskbar window's desktop: proxy=%A actual=%A" desktop actualDesktop)
             | _ -> ()
             // Moving a maximized owned window restores its followers without activation,
             // which can raise one above it before the move-end notification arrives.
@@ -606,7 +614,8 @@ let main() =
                     [a;b;d] |> List.forall (fun hwnd -> OS().windowFromHwnd(hwnd).isMaximized))
                 check ([b;d] |> List.forall(fun hwnd -> keyboardSource.zorder<OS().windowFromHwnd(hwnd).zorder)) "Maximizing several owned followers covered the originating tab"
                 check (nativeOrder combined=tabsBeforeMove && onGroup combined (fun group -> group.topWindow=a)) "Returning from half-screen to maximized changed the active tab or tab positions"
-                check (WinUserApi.GetActiveWindow()=a) "Returning from half-screen to maximized activated a follower"
+                check (WinUserApi.GetActiveWindow()=a)
+                      (sprintf "Returning from half-screen to maximized activated a follower: active=%A expected=%A foreground=%A followers=%A" (WinUserApi.GetActiveWindow()) a (WinUserApi.GetForegroundWindow()) [b;d])
                 pumpUntil "Returning from half-screen to maximized left the strip hidden or behind its owner" (fun () ->
                     onGroup combined (fun group ->
                         let strip = OS().windowFromHwnd(group.hwnd)
@@ -900,13 +909,13 @@ let main() =
                     group.ts.setPlacement({bounds=Rect(Pt(-20000,-20000),size);showInside=false})
                     let tab = Tab b
                     let _,sprite = group.ts.tabSprites.pick(fun (location,sprite) -> if sprite.id=tab then Some(location,sprite) else None)
-                    let data = {tab=tab;tabSize=sprite.size;tabOffset=Pt(sprite.size.width/2,sprite.size.height/2);tabInfo=group.ts.tabInfo tab}
+                    let data = {tab=tab;tabSize=sprite.size;tabOffset=Pt(sprite.size.width/2,sprite.size.height/2);tabInfo=group.ts.tabInfo tab;lastNormalSize=None}
                     let proportional = {data with tabSize=Sz(200,32);tabOffset=Pt(100,16)}
                     check (proportional.offsetIn(Sz(300,48))=Pt(150,24)) "Cross-DPI drag lost its grabbed point"
                     check (proportional.offsetIn(Sz(120,64))=Pt(60,32)) "Cross-orientation drag lost its grabbed point"
-                    let target = dragTargetFor group.ts.hwnd
-                    check (target.dragEnter (box data) (group.ts.tabLocation(tab).add(data.tabOffset))) "Source rejected a drag"
-                    target.dragExit()
+                    let source = dragTargetFor group.ts.hwnd
+                    check (source.dragEnter (box data) (group.ts.tabLocation(tab).add(data.tabOffset))) "Source rejected a drag"
+                    source.dragExit()
                     data)
                 pumpUntil "Drag source retained moved window" (fun () -> nativeOrder dragSource=[a] && publicOrder dragSource=[a])
                 onGroup dragTarget (fun group ->
@@ -925,7 +934,66 @@ let main() =
                     onGroup info (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
                     (info :> IGroup).destroy()
                 pumpUntil "Drag groups did not exit" (fun () -> dragSource.isExited && dragTarget.isExited)
-            printfn "PASS: real HWND grouping, duplicate add, reorder, cross-STA transfer, six cross-orientation drags, destroyed-window removal, ungrouping, taskbar recovery and taskbar icon rebuilds."
+            // A tab dragged out of its group takes its window with it and shows the tab over it:
+            // the window never loses the chrome its strip drew, and releasing it on the desktop
+            // leaves it exactly where the drag held it.
+            do
+                use draggedForm = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                           Bounds=Drawing.Rectangle(140,140,640,480))
+                let draggedHwnd = draggedForm.Handle
+                let draggedWindow = OS().windowFromHwnd draggedHwnd
+                let floatingGroup = desktopApi.createGroup(false) :?> GroupInfo
+                (floatingGroup :> IGroup).addWindow(draggedHwnd,false)
+                pumpUntil "Floating-drag fixture did not acquire its window" (fun () -> nativeOrder floatingGroup = [draggedHwnd])
+                let stripSize = OS().windowFromHwnd(onGroup floatingGroup (fun group -> group.ts.hwnd)).bounds.size
+                let appearance = onGroup floatingGroup (fun group -> group.tabAppearance)
+                let tab = Tab draggedHwnd
+                let data = onGroup floatingGroup (fun group ->
+                    let _,sprite = group.ts.tabSprites.pick(fun (location,sprite) -> if sprite.id=tab then Some(location,sprite) else None)
+                    {tab=tab;tabSize=sprite.size;tabOffset=Pt(sprite.size.width/2,sprite.size.height/2)
+                     tabInfo=group.ts.tabInfo tab;lastNormalSize=group.dragSizeOf draggedHwnd})
+                // The picture and place the drag carries are drawn while the tab is still the strip's.
+                let floatingSprite = onGroup floatingGroup (fun group -> group.ts.floatingTab tab appearance)
+                let tabImage = floatingSprite.image false stripSize
+                let tabOffset = floatingSprite.location false stripSize
+                let grabbed = onGroup floatingGroup (fun group -> group.ts.tabLocation(tab).add(data.tabOffset))
+                let dragSource = onGroup floatingGroup (fun group -> dragTargetFor group.ts.hwnd)
+                dragSource.dragBegin()
+                dragSource.dragEnter (box data) grabbed |> ignore
+                dragSource.dragExit()
+                pumpUntil "A tab dragged out of its group stayed in its strip" (fun () ->
+                    not(publicOrder floatingGroup |> List.contains draggedHwnd) &&
+                    onGroup floatingGroup (fun group -> not(group.ts.tabs.contains tab)))
+                let pointer = Pt(700,500)
+                draggedWindow.followDrag pointer data.lastNormalSize
+                check (draggedWindow.isVisible && draggedWindow.bounds.size=Sz(640,480))
+                      "A tab dragged out of its group did not show its window at its own size"
+                check (draggedWindow.visibleBounds.y = pointer.y + Dpi.scale 12)
+                      "A dragged window does not sit a tab's middle below the pointer"
+                // The tab rides on the window: its bottom row covers the window's top edge.
+                let tabPlace = Pt(draggedWindow.visibleBounds.x + appearance.tabIndentNormal + tabOffset.x,
+                                  draggedWindow.visibleBounds.y - appearance.tabHeight + appearance.tabHeightOffset + tabOffset.y)
+                check (tabImage.size = data.tabSize)
+                      (sprintf "The tab a drag carries is drawn at %A instead of the strip's %A" tabImage.size data.tabSize)
+                check (tabPlace.y < draggedWindow.visibleBounds.y)
+                      "The tab a drag carries is not above the window's top edge"
+                // Released on the desktop, the window stays where the pointer held it. The drop
+                // is posted on the main thread, so a marker posted after it says it has run.
+                let held = draggedWindow.bounds
+                let mutable dropped = false
+                (desktop :> IDragDropParent).dragDrop(pointer, box data)
+                InvokerService.invoker.asyncInvoke(fun() -> dropped <- true)
+                pumpUntil "The desktop drop did not run" (fun () -> dropped)
+                check (draggedWindow.bounds = held) "Letting go on the desktop moved the window off the pointer"
+                check (draggedWindow.visibleBounds.y = pointer.y + Dpi.scale 12)
+                      "The drop did not keep the pointer a tab's middle above the window's top"
+                dragSource.dragEnd()
+                (desktop :> IDragDropParent).dragEnd()
+                check (OS().windowFromHwnd(draggedHwnd).bounds = held) "The window moved after the drop finished"
+                floatingSprite.release()
+                (floatingGroup :> IGroup).destroy()
+                pumpUntil "Floating-drag fixture group did not exit" (fun () -> floatingGroup.isExited)
+            printfn "PASS: real HWND grouping, duplicate add, reorder, cross-STA transfer, six cross-orientation drags, a floating drag out to the desktop, destroyed-window removal, ungrouping, taskbar recovery and taskbar icon rebuilds."
         finally
             let rest = desktopApi.groups.list |> List.map(fun g -> g :?> GroupInfo)
             for info in List.distinct([source;target;combined] @ rest) do

@@ -1,4 +1,4 @@
-﻿namespace Bemo
+namespace Bemo
 open System
 open System.Drawing
 open System.IO
@@ -644,6 +644,48 @@ and
                     if size.IsSome then size.Value else this.placement.rcNormalPosition.size
                 )
         }) 
+
+    /// How far below the pointer a dragged window's top edge sits: the middle of the default tab,
+    /// so a pointer grabbed mid-tab is released on the same spot. The drag and the drop both use
+    /// this one value, never extra offsets, so letting go cannot move the window. It is a fixed
+    /// 12 logical pixels rather than half the tab height, which is a setting: at a taller tab the
+    /// pointer sits a little above the tab's middle, and both the drag and the drop agree on it.
+    member this.dragAnchorY = Dpi.scale 12
+
+    /// The window's outer frame extends past what the user sees by its resize border, so a
+    /// visible point needs this added to become a placement position.
+    member this.dragFrameOffset =
+        let visible = this.visibleBounds
+        visible.location.sub(this.bounds.location)
+
+    /// The size the window shows at while it follows the pointer: the very size the drop gives it,
+    /// so letting go cannot resize it. That is the window's own size, never the frame it shares with
+    /// a group: floated at that shared frame, a window dragged out of a multi-window group shrank on
+    /// release, and since both are centred under the pointer its left edge moved too.
+    member this.dragSize(ptScreen:Pt) (normalSize:Sz option) =
+        let normal = normalSize |> Option.defaultValue this.placement.rcNormalPosition.size
+        match Mon.fromPoint ptScreen with
+        | Some mon -> MonitorFit.draggableNormalSize mon.workRect normal
+        | None -> normal
+
+    /// The rect a floating tab drag puts the window in at this pointer position: what the
+    /// user sees centered under the cursor and a little below it. The drop uses the same
+    /// anchor, so letting go where the pointer is does not move the window.
+    member this.dragFollowRect(ptScreen:Pt) (size:Sz) =
+        let visible = Pt(ptScreen.x - size.width/2, ptScreen.y + this.dragAnchorY)
+        Rect(visible.add(this.dragFrameOffset), size)
+
+    /// A tab dragged out of its group shows its window under the pointer, at its real size,
+    /// centered horizontally under the cursor and a little below it. Moving rather than
+    /// placing keeps the normal rect as it was and leaves a maximized window restored. Never
+    /// activates the window.
+    member this.followDrag(ptScreen:Pt) (normalSize:Sz option) =
+        // Restored the way the tray restores a window: a maximized one has to come back to its own
+        // size, but taking the foreground from the app the user is working in is not part of a drag.
+        if this.isMinimized then this.showNoActivate()
+        if this.isMaximized then WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
+        this.move(this.dragFollowRect ptScreen (this.dragSize ptScreen normalSize))
+        this.showNoActivate()
 
     override this.Equals(yobj) =
         match yobj with
