@@ -80,6 +80,12 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
         window.setIsVisible(true)
     /// The grabbed point inside the picture, for a strip taking the tab over to hold it by.
     member this.anchorOffset = anchor
+    /// Draw the picture for this frame, and put the tab where the hand is holding it. Used for the
+    /// first frame of a drag: the picture has to exist, but the tab belongs under the cursor, not at
+    /// the row position of the window it was taken from.
+    member this.takeHold(ptScreen:Pt) (visible:Rect) =
+        place visible |> ignore
+        this.holdAt(ptScreen.sub(anchor))
     /// Hold the tab at a screen point, keeping the picture it already has: over a strip the window
     /// belongs to the group, so only the tab the user is holding follows the pointer.
     member this.holdAt(topLeft:Pt) =
@@ -284,6 +290,9 @@ type DragAction(info:DragActionInfo) =
                     | Some _ -> this.dragEnter(targetHwnd, ptScreen, false)
                     | None -> this.dragFloat(ptScreen)
             })
+            // The captured state holds the tab by the pointer; doing it now keeps the hand and the
+            // picture in agreement from this frame on, instead of at the next mouse move.
+            floatingTabCell.value |> Option.iter(fun tab -> tab.holdAt(ptScreen.sub(tabOffset)))
         else 
             if isInitial then target.dragExit()
             this.dragFloat(ptScreen)
@@ -306,10 +315,11 @@ type DragAction(info:DragActionInfo) =
                     | :? TabDragInfo as dragInfo -> fun (size:Sz) -> dragInfo.offsetIn size
                     | _ -> fun (_:Sz) -> Pt()
                 try floatingTabCell.set(Some(new FloatingTab(os, info.tab, grabOffset))) with _ -> ()
-                // Drawn and anchored before any strip is asked to take the tab: an unprimed overlay
-                // holds a tab with no picture by a point that is not the one the hand grabbed.
+                // Drawn and anchored before any strip is asked to take the tab, and placed under the
+                // hand: an unprimed overlay holds a tab with no picture, and priming it by the row of
+                // the window it came from sends the tab to the top edge first.
                 match dragWindowCell.value, floatingTabCell.value with
-                | Some(window, _), Some tab -> tab.follow info.initialPt window.visibleBounds
+                | Some(window, _), Some tab -> tab.takeHold info.initialPt window.visibleBounds
                 | _ -> ()
                 info.targets.values.iter <| fun target -> target.dragBegin()
                 info.notifications.items.iter <| fun n -> n.dragBegin()
