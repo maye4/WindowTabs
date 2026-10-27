@@ -453,17 +453,6 @@ and
         wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
         WinUserApi.SetWindowPlacement(hwnd, ref wpStruct) |> ignore
 
-    /// TEMPORARY measurement: SetWindowPlacement reporting whether Windows accepted the request.
-    member this.setPlacementReporting wp =
-        let mutable wpStruct = WINDOWPLACEMENT()
-        wpStruct.length <- Marshal.SizeOf(wpStruct)
-        wpStruct.flags <- wp.flags
-        wpStruct.showCmd <- wp.showCmd
-        wpStruct.ptMinPosition <- wp.ptMinPosition.POINT
-        wpStruct.ptMaxPosition <- wp.ptMaxPosition.POINT
-        wpStruct.rcNormalPosition <- wp.rcNormalPosition.RECT
-        WinUserApi.SetWindowPlacement(hwnd, ref wpStruct)
-
     member this.setForeground(force) =
         if force then
             let foregroundWindow = WinUserApi.GetForegroundWindow()
@@ -653,10 +642,6 @@ and
             bounds.height,
             true) |> ignore
 
-    /// TEMPORARY measurement: MoveWindow reporting whether Windows accepted the request.
-    member this.moveReporting (bounds:Rect) =
-        WinUserApi.MoveWindow(hwnd, bounds.x, bounds.y, bounds.width, bounds.height, true)
-
     member this.setText text = WinUserApi.SetWindowText(hwnd, text) |> ignore
     
     member this.className = Win32Helper.GetClassName(hwnd)
@@ -768,37 +753,18 @@ and
         if this.isMinimized then this.showNoActivate()
         if this.isMaximized then WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
         let rect = this.dragFollowRect ptScreen (this.dragSize ptScreen normalSize)
-        let full = this.isFullScreen
-        // A change of size - out of a maximized or fullscreen frame into the window's own - steps
-        // there over a few frames instead of jumping. A move that keeps the size follows directly,
-        // and one that changes nothing at all is skipped: it would only make the app lay itself out.
-        if not full then
+        // A change of size - out of a maximized frame into the window's own - steps there over a few
+        // frames instead of jumping. A move that keeps the size follows directly, and one that changes
+        // nothing at all is skipped: it would only make the app lay itself out.
+        //
+        // A window in its own fullscreen is the exception: it refuses every move in
+        // WM_WINDOWPOSCHANGING, and easing a refusal only costs frames. The attempt goes through once,
+        // plainly, so the window is where the drop expects it if the app ever does accept it.
+        if this.isFullScreen then
+            if this.bounds <> rect then this.move(rect)
+        else
             if not (DragTween.step hwnd (fun () -> this.bounds) (fun rect -> this.move rect) rect) then
                 if this.bounds <> rect then this.move(rect)
-        // TEMPORARY: a fullscreen window owns that state; measure exactly what it accepts, in order.
-        if full then
-            let place() =
-                let p = this.placement
-                sprintf "showCmd=%d normal=%A" p.showCmd p.rcNormalPosition
-            let line =
-                try
-                    let rect0 = this.bounds
-                    let place0 = place()
-                    let setOk = this.setPlacementReporting({
-                                    this.placement with
-                                        showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
-                                        rcNormalPosition = rect })
-                    let rect1 = this.bounds
-                    let place1 = place()
-                    let moveOk = this.moveReporting(rect)
-                    let rect2 = this.bounds
-                    let place2 = place()
-                    sprintf "%s rect0=%A | place0=%s | setWP=%b rect1=%A place1=%s | move=%b rect2=%A place2=%s | asked=%A"
-                        (DateTime.Now.ToString("HH:mm:ss.fff")) rect0 place0 setOk rect1 place1 moveOk rect2 place2 rect
-                with error -> sprintf "%s THREW %s" (DateTime.Now.ToString("HH:mm:ss.fff")) error.Message
-            try
-                IO.File.AppendAllText(IO.Path.Combine(IO.Path.GetTempPath(), "windowtabs-drag.log"), line + "\n")
-            with _ -> ()
         // Showing a window that is already shown costs a ShowWindow per pointer move.
         if not this.isVisible then this.showNoActivate()
 
