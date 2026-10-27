@@ -715,7 +715,9 @@ type TabStripSprite<'id> when 'id : equality = {
             | _ -> false
         isActive.not && isHovered.not
 
-    member private this.tabSpriteOf (tab:'id) : TabSprite<'id> =
+    /// Build one tab's sprite from lookups taken once for a whole pass: `slot` is its place in the
+    /// drawn order, `index` its place in the plain one, or -1 when it has none.
+    member private this.tabSpriteWith (slot:'id -> int) (index:'id -> int) (tab:'id) : TabSprite<'id> =
         {
             TabSprite.id = tab
             isTop =
@@ -724,26 +726,20 @@ type TabStripSprite<'id> when 'id : equality = {
                 | None -> false 
             displayInfo = this.tabs.find(tab)
             appearance = if this.isVertical then { this.appearance with tabStyle=PillTabs; tabHeight=this.rowHeight } else this.appearance
-            size = this.tabSizeOf tab
+            size = this.tabSizeOfWith slot tab
             onlyIcon = this.isCompact
             dock = this.dock
             direction = this.direction
             showLeftSeparator =
                 // Never before the first tab, never across a gap, and never where either side is
                 // already set apart by its own fill.
-                match this.indexOf tab with
-                | Some(index) when index > 0 ->
+                let index = index tab
+                if index > 0 then
                     not this.isVertical && not this.isSpaced && this.isPlain(tab) && this.isPlain(this.lorder.at(index - 1))
-                | _ -> false
+                else false
             // Spaced tabs stand apart, so each is rounded at both ends like the whole strip.
-            roundLeft =
-                match this.indexOf tab with
-                | Some(index) -> this.isSpaced || index = 0
-                | None -> false
-            roundRight =
-                match this.indexOf tab with
-                | Some(index) -> this.isSpaced || index = this.lorder.length - 1
-                | None -> false
+            roundLeft = this.isSpaced || index tab = 0
+            roundRight = this.isSpaced || index tab = this.lorder.length - 1
             hover = 
                 match this.hover with
                 | Some(id, part) when id = tab -> Some(part)
@@ -753,6 +749,12 @@ type TabStripSprite<'id> when 'id : equality = {
                 | Some(id, part) when id = tab -> Some(part)
                 | _ -> None
         }
+
+    member private this.slotOf (tab:'id) = this.adjustedLorder.findIndex((=)tab)
+
+    member private this.indexOf' (tab:'id) = match this.indexOf tab with Some index -> index | None -> -1
+
+    member private this.tabSpriteOf (tab:'id) = this.tabSpriteWith this.slotOf this.indexOf' tab
 
     member private this.tabSprite (tab:'id) = this.tabSpriteOf tab :> ISprite
 
@@ -866,35 +868,39 @@ type TabStripSprite<'id> when 'id : equality = {
     /// A tab's left and right edges in whole pixels. Each is cut down from its fractional
     /// position on its own, so a tab runs exactly to where the next one starts: one width
     /// for every tab left a column uncovered wherever two edges rounded a pixel further apart.
-    member private this.tabSpan tab =
+    member private this.tabSpanWith (slot:'id -> int) tab =
         match this.slide with
         | Some(slideTab, x) when tab = slideTab->
             let bounds = (0, this.size.width - int(this.tabLength))
             let x = between bounds x
             x, x + int(this.tabLength)
         | _ ->
-            let x = this.tabOffset (this.adjustedLorder.findIndex((=)tab)) + this.alignmentOffset
+            let x = this.tabOffset (slot tab) + this.alignmentOffset
             int(x), int(x + this.tabLength)
 
-    member this.tabLocation tab =
+    member private this.tabSpan tab = this.tabSpanWith this.slotOf tab
+
+    member private this.tabLocationWith (slot:'id -> int) tab =
         if this.isVertical then
             let y =
                 match this.slide with
                 | Some(id,y) when id=tab -> between (0,max 0 (this.size.height-this.rowHeight)) y
-                | _ -> this.adjustedLorder.findIndex((=)tab)*this.rowStep + Dpi.scale 4 - this.scrollOffset
+                | _ -> slot tab*this.rowStep + Dpi.scale 4 - this.scrollOffset
             Pt(Dpi.scale 4,y)
         else
-            let x,_ = this.tabSpan tab
+            let x,_ = this.tabSpanWith slot tab
             Pt(x, 1)
+
+    member this.tabLocation tab = this.tabLocationWith this.slotOf tab
 
     // Tabs start one pixel into the strip. Above a window they then run to the strip's
     // bottom row, which overlaps the window's top edge by tabHeightOffset, so they cover
     // its border line. Inside the title bar the strip starts a pixel above the window and
     // that first row is already the window's edge.
-    member private this.tabSizeOf tab =
+    member private this.tabSizeOfWith (slot:'id -> int) tab =
         if this.isVertical then Sz(max 1 (this.size.width-Dpi.scale (if this.scrollMaximum>0 then 18 else 8)),this.rowHeight)
         else
-            let left,right = this.tabSpan tab
+            let left,right = this.tabSpanWith slot tab
             Sz(right - left, this.size.height - (if this.direction = TabUp then 1 else 2))
 
     member this.movedTab =
@@ -918,24 +924,36 @@ type TabStripSprite<'id> when 'id : equality = {
         | None -> this.lorder
 
     
+    /// Where each tab sits in an order, worked out once for a whole pass. The adjusted order rebuilds
+    /// a list on every read and the plain one is scanned for every tab, so asking per tab made a pass
+    /// cost n times the work, several times over in a frame.
+    member private this.slotsOf (order:List2<'id>) =
+        let found = System.Collections.Generic.Dictionary<'id,int>(HashIdentity.Structural)
+        order.list |> List.iteri(fun index tab -> if not(found.ContainsKey tab) then found.[tab] <- index)
+        fun tab -> match found.TryGetValue tab with | true, index -> index | _ -> -1
+
     /// Every tab with its location, the top one first.
-    member this.tabSprites = this.zorder.map <| fun (tab:'id) -> this.tabLocation tab, this.tabSpriteOf tab
+    member this.tabSprites =
+        let slot = this.slotsOf this.adjustedLorder
+        let index = this.slotsOf this.lorder
+        this.zorder.map <| fun (tab:'id) -> this.tabLocationWith slot tab, this.tabSpriteWith slot index tab
 
     /// Folder style: feet run the active tab into the bar on each side where a tab adjoins it.
     /// Tabs set apart by a gap have no bar between them to run into.
     member private this.feet =
         match this.appearance.tabStyle, this.zorder.tryHead with
         | FolderTabs, Some(top) when this.tabOverlap >= 0.0 && not this.isVertical ->
-            let tab = this.tabSpriteOf top
-            let location = this.tabLocation top
-            let index = this.adjustedLorder.findIndex((=)top)
+            let slot = this.slotsOf this.adjustedLorder
+            let tab = this.tabSpriteWith slot (this.slotsOf this.lorder) top
+            let location = this.tabLocationWith slot top
+            let index = slot top
             let radius = tab.footRadius
             let y = if this.direction = TabUp then location.y + tab.size.height - radius else location.y
             let foot onLeft = { TabFootSprite.color = tab.fillColor; radius = radius; onLeft = onLeft; direction = this.direction } :> ISprite
             // A hovered neighbour is raised too and fills its slot, so the two tabs simply meet.
             let plainAt offset =
                 let at = index + offset
-                at >= 0 && at < this.count && not (this.tabSpriteOf (this.adjustedLorder.at at)).isRaised
+                at >= 0 && at < this.count && not (this.tabSpriteWith slot (this.slotsOf this.lorder) (this.adjustedLorder.at at)).isRaised
             [ if plainAt -1 then yield Pt(location.x - radius, y), foot true
               if plainAt 1 then yield Pt(location.x + tab.size.width, y), foot false ]
         | _ -> []
