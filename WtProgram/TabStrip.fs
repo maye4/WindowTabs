@@ -753,9 +753,21 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.ghostTab
         with get() : (Icon * Tab) option = ghostTabCell.value
         and set(value:(Icon * Tab) option) =
-            // The icon is lent by the drag, which disposes it when the drag ends: this strip only
-            // draws with it.
-            if ghostTabCell.value <> value then ghostTabCell.set value
+            let previous = ghostTabCell.value
+            // Identity, not equality: the icon is an owned GDI handle, so "the same preview" means the
+            // same handle on the same tab, never two tuples that merely compare equal.
+            let unchanged =
+                match previous, value with
+                | Some(wasIcon, wasTab), Some(icon, tab) -> wasTab = tab && obj.ReferenceEquals(wasIcon, icon)
+                | None, None -> true
+                | _ -> false
+            if not unchanged then
+                ghostTabCell.set value
+                // The preview draws with a copy this strip made and this strip releases, because the
+                // drag that lent the icon ends on a posted message and the next drag replaces it.
+                match previous with
+                | Some(icon, _) -> icon.Dispose()
+                | None -> ()
 
     /// The slot a drag would put its tab in: how many of the tabs this strip shows sit left of the
     /// pointer. The previewing tab is not counted, since it is already in the row.
@@ -897,6 +909,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
     member _.destroying = destroyingEvent.Publish
     member this.destroy() = 
+        // A strip can be destroyed while a drag is previewing in it: that copy belongs to the strip,
+        // and once the strip is gone nothing else can reach it.
+        this.ghostTab <- None
         dragScrollTimer.Dispose()
         destroyingEvent.Trigger()
         revealTimer.Dispose()

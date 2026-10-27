@@ -19,9 +19,9 @@ module DragIcon =
     /// The copy, for a strip that wants to draw the tab with it. It stays the drag's to dispose, so a
     /// strip the pointer leaves and comes back to finds it again.
     let current () = lock gate (fun() -> held)
-    /// Let go of the copy once no strip can be drawing with it, as when a drag is abandoned. The drop
-    /// does not call this: the strips it was handed to clear their previews on a posted message, so
-    /// the copy outlives the drop and the next drag's remember replaces it.
+    /// Let go of the copy once no strip can be drawing with it. Called at the end of every capture,
+    /// after the targets have been told the drag is over: each strip that previewed holds a copy of its
+    /// own, so nothing reads this one after that point.
     let release () =
         lock gate (fun() ->
             held |> Option.iter(fun previous -> previous.Dispose())
@@ -46,9 +46,10 @@ type DragDetectingState(info:DragDetectingStateInfo) =
                 info.onBegin()
         member this.dispose() = ()
 
-/// The tab a floating drag carries over the window it moves. The strip renders it, so the window
-/// wears the tab the user grabbed, and it is placed where the strip the drop leaves the window
-/// with draws that tab, so letting go does not move it.
+/// The tab a drag carries, in its own layered window over the one it moves. The strip draws the
+/// picture, and the tab is placed where a strip holding the window's current frame puts it, so it sits
+/// on the window's edge and a window changing frame moves the picture with it. While floating, its
+/// shape is always a floating window's: outside the frame, corners up.
 type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     let window = AnimationWindow(os)
     do  window.setAlpha(byte 0xFF)
@@ -59,20 +60,23 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// shape and a pixel apart from the strip the drag started in, so the picture is redrawn when that
     /// geometry changes — not on every pointer move.
     let mutable drawnFor : obj = null
+    /// The size the anchor was measured for.
+    let mutable anchorSize = Sz()
     let place (visible:Rect) =
         let key, image, location = sprite.frame visible
         if not(obj.Equals(drawnFor, key)) then
             window.setImage(image)
-            // Once, on the first picture: the anchor is where the user took hold of the tab, and a
-            // redraw for a frame a pixel apart must not move the tab out from under the cursor.
-            if isNull drawnFor then anchor <- grabOffset image.size
+            // The grab point scales with the picture: a redraw of the same size leaves it alone, while
+            // a strip that draws the tab wider or narrower moves the point with it.
+            if isNull drawnFor || anchorSize <> image.size then anchor <- grabOffset image.size
+            anchorSize <- image.size
             drawnFor <- key
         location
-    /// Follow the pointer, not the strip's row: the tab is held where it was grabbed, so a window
-    /// changing frame underneath it cannot move it out from under the cursor.
+    /// Wear the window it moves: the tab is drawn at the row position the strip gives a window of this
+    /// frame, so it always sits flush on the window's edge. Holding it by the grabbed point instead left
+    /// a gap or an overlap between the two, by wherever the hand happened to close on the tab.
     member this.follow(ptScreen:Pt) (visible:Rect) =
-        place visible |> ignore
-        window.setLocation(ptScreen.sub(anchor))
+        window.setLocation(place visible)
         window.setIsVisible(true)
     /// The grabbed point inside the picture, for a strip taking the tab over to hold it by.
     member this.anchorOffset = anchor
@@ -81,7 +85,6 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     member this.holdAt(topLeft:Pt) =
         window.setLocation(topLeft)
         window.setIsVisible(true)
-    member this.hide() = window.setIsVisible(false)
     member this.hwnd = window.hwnd
     interface IDisposable with
         member this.Dispose() = window.Dispose()
@@ -167,6 +170,9 @@ type DragAction(info:DragActionInfo) =
     let dragWindowCell = Cell.create(None:Option<Window * Sz option>)
     let floatingTabCell = Cell.create(None:Option<FloatingTab>)
     let timer = new Timer()
+    /// The end of the drag happens once, however many of the timer, the mouse-leave and the
+    /// button-up arrive: the rest find the capture gone and the icon copies already released.
+    let mutable ended = false
 
     member this.setNextState(newState:obj) =
         let newState = unbox<IDragState>(newState)
@@ -175,30 +181,48 @@ type DragAction(info:DragActionInfo) =
 
     member this.captureWindow : Window = os.windowFromHwnd(captureWindowCell.value.Value.hwnd)
 
+    /// The window a tab drag carries, when the drag is one.
+    member private this.draggedHwnd =
+        match info.data with
+        | :? TabDragInfo as dragInfo -> let (Tab hwnd) = dragInfo.tab in hwnd
+        | _ -> IntPtr.Zero
+
     member this.captureEnded(ptScreen) =
-        this.captureWindow.releaseCapture()
-        (captureWindowCell.value.Value :?>IDisposable).Dispose()
-        timer.Dispose()
-        dragStateCell.value.Value.dispose()
-        floatingTabCell.value.iter(fun tab -> (tab :> IDisposable).Dispose())
-        // The sprite is built on mouse-down, before this drag proves to be one: a click that never
-        // moves would otherwise keep the tab's copied icon for the life of the process.
-        info.tab.release()
-        match dragStateCell.value.Value with
-        | :? DragDetectingState ->
-            info.onCancel()
-        | :? DragCapturedState ->
-            info.targets.values.iter <| fun target -> target.dragEnd()
-            info.notifications.items.iter <| fun n -> n.dragEnd()
-            info.onEnd()
-        | :? DragFloatingState ->
-            info.targets.values.iter <| fun target -> target.dragEnd()
-            info.notifications.items.iter <| fun n -> n.dragEnd()
-            // The drop places the same window made visible under the pointer; it is the
-            // user's window now, so nothing hides it afterwards.
-            info.onDrop(ptScreen)
-            info.onEnd()
-        | _ -> ()
+        if not ended then
+            ended <- true
+            this.captureWindow.releaseCapture()
+            let captureWindow = captureWindowCell.value
+            captureWindowCell.set None
+            captureWindow |> Option.iter(fun window -> (window :?> IDisposable).Dispose())
+            timer.Dispose()
+            let state = dragStateCell.value
+            dragStateCell.set None
+            state |> Option.iter(fun s -> s.dispose())
+            // The drop places the window from here: a size change still easing would move it again.
+            DragTween.cancel this.draggedHwnd
+            floatingTabCell.value.iter(fun tab -> (tab :> IDisposable).Dispose())
+            floatingTabCell.set None
+            // The sprite is built on mouse-down, before this drag proves to be one: a click that never
+            // moves would otherwise keep the tab's copied icon for the life of the process.
+            info.tab.release()
+            match state with
+            | Some(:? DragDetectingState) ->
+                info.onCancel()
+            | Some(:? DragCapturedState) ->
+                info.targets.values.iter <| fun target -> target.dragEnd()
+                info.notifications.items.iter <| fun n -> n.dragEnd()
+                info.onEnd()
+            | Some(:? DragFloatingState) ->
+                info.targets.values.iter <| fun target -> target.dragEnd()
+                info.notifications.items.iter <| fun n -> n.dragEnd()
+                // The drop places the same window made visible under the pointer; it is the
+                // user's window now, so nothing hides it afterwards.
+                info.onDrop(ptScreen)
+                info.onEnd()
+            | _ -> ()
+            // After the previews were told to clear: every strip that took one holds its own copy,
+            // and the drag's copy has no reader left.
+            DragIcon.release()
 
     member this.wndProc (msg:Win32Message) =
         let ptScreen() =             
@@ -239,6 +263,8 @@ type DragAction(info:DragActionInfo) =
         let targetWindow = os.windowFromHwnd(targetHwnd)
         let ptTarget = targetWindow.ptToClient(ptScreen)
         if target.dragEnter info.data ptTarget then
+            // The strip places this window as a group member now; the drag's own easing stops.
+            DragTween.cancel this.draggedHwnd
             let tabOffset =
                 match floatingTabCell.value with
                 | Some tab -> tab.anchorOffset
@@ -280,6 +306,11 @@ type DragAction(info:DragActionInfo) =
                     | :? TabDragInfo as dragInfo -> fun (size:Sz) -> dragInfo.offsetIn size
                     | _ -> fun (_:Sz) -> Pt()
                 try floatingTabCell.set(Some(new FloatingTab(os, info.tab, grabOffset))) with _ -> ()
+                // Drawn and anchored before any strip is asked to take the tab: an unprimed overlay
+                // holds a tab with no picture by a point that is not the one the hand grabbed.
+                match dragWindowCell.value, floatingTabCell.value with
+                | Some(window, _), Some tab -> tab.follow info.initialPt window.visibleBounds
+                | _ -> ()
                 info.targets.values.iter <| fun target -> target.dragBegin()
                 info.notifications.items.iter <| fun n -> n.dragBegin()
                 info.onBegin()

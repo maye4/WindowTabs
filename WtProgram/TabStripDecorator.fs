@@ -601,11 +601,10 @@ type TabStripDecorator(group:WindowGroup) as this =
                         // Built now, not lazily: the tab is read while the strip still holds it, and
                         // the closures only carry what was read.
                         let floatingTab = this.ts.floatingTab tab group.tabAppearance
-                        // The shape the tab was grabbed with. A window finishing a maximize moves its
-                        // strip inside the title bar, which turns the tab's corners over and shortens
-                        // it by a pixel: drawn live, the tab in the hand flips under the cursor at that
-                        // moment. It keeps its shape until it is a tab of a strip again.
-                        let grabbedInside = this.placement.showInside
+                        // The tab in the hand is always drawn as a floating window's tab: outside the
+                        // frame, corners up. The source's own shape is the wrong thing to keep — a
+                        // fullscreen or maximized window wears its row inside the title bar, and holding
+                        // that shape turns the tab over for the whole drag. Only the size is read live.
                         // Drawn and laid as the strip the drop leaves draws that tab, which is not the
                         // strip the drag started in: a maximized window's strip is as wide as the
                         // screen, keeps room for the caption buttons and runs its row inside the title
@@ -614,7 +613,7 @@ type TabStripDecorator(group:WindowGroup) as this =
                             // One placement per frame: it decides the picture, the slot, and the key that
                             // says whether the picture has to be drawn again at all.
                             frame = fun (visible:Rect) ->
-                                let placement = { this.placementFor visible false with showInside = grabbedInside }
+                                let placement = { this.placementFor visible false with showInside = false }
                                 let offset = floatingTab.location placement.showInside placement.bounds.size
                                 box (placement.showInside, placement.bounds.size),
                                 floatingTab.image placement.showInside placement.bounds.size,
@@ -659,7 +658,7 @@ type TabStripDecorator(group:WindowGroup) as this =
                         // Set before the tab is added: the first frame this strip draws has to show the
                         // tab as the drag carries it, icon included, or it blinks the default one.
                         match DragIcon.current() with
-                        | Some icon -> this.ts.ghostTab <- Some(icon, dragInfo.tab)
+                        | Some source -> this.ts.ghostTab <- Some(new Icon(source, source.Width, source.Height), dragInfo.tab)
                         | None -> ()
                         this.ts.addTab dragInfo.tab
                         this.ts.previewDrop pt

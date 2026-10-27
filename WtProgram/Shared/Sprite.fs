@@ -27,6 +27,14 @@ module Sprite =
                 image.bitmap.Dispose()
                 reraise()
 
+        /// This sprite as a whole — its image and everything drawn on top — under a black mask of
+        /// this opacity. Masking the image alone leaves the children at full brightness.
+        member this.renderMasked (opacity:float32) : Img =
+            let image = this.render
+            let masked = image.underMask opacity
+            image.bitmap.Dispose()
+            masked
+
         member this.tryHit(pt:Pt, path:List2<ISprite>) =
             let path = path.prepend(this)
             let hitPath = this.children.tryPick <| fun (location, child) ->

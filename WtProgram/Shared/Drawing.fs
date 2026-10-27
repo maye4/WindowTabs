@@ -200,16 +200,24 @@ type Mon(hMonitor:IntPtr)=
 /// The monitors as they were last enumerated. The strip is asked where it goes on every pointer move
 /// and every answer used to enumerate the monitors and read each one's info again.
 module Monitors =
+    let private gate = obj()
     let mutable private cached : List2<Mon> option = None
-    let private forget (_:obj) (_:EventArgs) = cached <- None
+    let private forget (_:obj) (_:EventArgs) = lock gate (fun() -> cached <- None)
     do  Microsoft.Win32.SystemEvents.DisplaySettingsChanged.AddHandler forget
+    // A per-monitor DPI change arrives as a display preference change, not as a resolution change:
+    // without this the cached work areas keep the previous scale.
+    do  Microsoft.Win32.SystemEvents.UserPreferenceChanged.AddHandler(fun _ args ->
+            if args.Category = Microsoft.Win32.UserPreferenceCategory.Desktop then forget null null)
     let all () =
-        match cached with
-        | Some monitors -> monitors
-        | None ->
-            let monitors = Mon.all
-            cached <- Some monitors
-            monitors
+        // Locked: the handler can drop the cache between reading it and filling it, which would
+        // then keep the monitors as they were before the display changed.
+        lock gate (fun() ->
+            match cached with
+            | Some monitors -> monitors
+            | None ->
+                let monitors = Mon.all
+                cached <- Some monitors
+                monitors)
 
 module MonitorFit =
     /// A size that reaches the work area on both axes fills the monitor. That is a

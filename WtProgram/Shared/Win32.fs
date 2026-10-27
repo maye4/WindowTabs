@@ -116,6 +116,17 @@ module DragTween =
                         move (interpolate goal (ease (float current / float steps))))
                 timer.Start()
                 true
+    /// Stop easing this window. A strip that took the tab, or a drop that placed the window, owns
+    /// its frame now: a step landing after that fights the placement made for it, moving the window
+    /// again some time after the transition the user already watched settle.
+    let cancel (hwnd:IntPtr) =
+        if hwnd <> IntPtr.Zero then
+            match running.TryRemove hwnd with
+            | true, timer ->
+                timer.Stop()
+                timer.Dispose()
+                goals.TryRemove hwnd |> ignore
+            | _ -> ()
 
 type OS()= 
     let Cell = CellScope()

@@ -100,6 +100,28 @@ module TabMetrics =
         let fit = if height>0 && full.Height>height then float32 height/float32 full.Height else 1.0f
         new Font(SystemFonts.MenuFont.FontFamily,max 1.0f (points*fit),style)
 
+/// A tab the drag is previewing, drawn as one shaded picture: the tab's body and the parts drawn on
+/// it composited first, so the icon and close button go under the mask with the body instead of
+/// standing bright on a dark tab. The parts are handed in rather than read back off the tab, whose
+/// children now hold this sprite — rendering the tab to shade it would draw the shade by drawing the
+/// tab.
+type GhostTabSprite(body:unit -> Img, parts:List2<Pt * ISprite>) =
+    interface ISpriteHitTest with member _.containsPoint _ = false
+    interface ISprite with
+        member this.image =
+            let image = body()
+            try
+                use gr = image.graphics
+                let draw (location:Pt, part:ISprite) =
+                    use bitmap = part.render.bitmap
+                    gr.DrawImageUnscaled(bitmap, location.Point)
+                parts.reverse.iter draw
+                image.underMask 0.5f
+            finally
+                // Masked or not, this composition is a throwaway: the caller owns only what returns.
+                image.bitmap.Dispose()
+        member this.children = List2()
+
 type IconSprite = {
     icon: Icon
     size: Sz
@@ -575,16 +597,8 @@ type TabSprite<'id> = {
             let bounds = Rect(this.textLocation, this.textSize)
             do g.DrawString(text, font, brush, bounds.Rectangle.RectangleF, format)
         img
-    interface ISprite with
-        member this.image =
-            let img = this.draw
-            // A preview of the tab, not the tab: the drag is still holding the real one.
-            if this.displayInfo.ghost then
-                let masked = img.underMask 0.5f
-                img.bitmap.Dispose()
-                masked
-            else img
-        member this.children = 
+    /// The tab's parts as the row would draw them over an unmasked body.
+    member this.tabParts =
             List2([
                 (match this.displayInfo.numberBadge with
                  | Some label when not this.isTop ->
@@ -596,6 +610,18 @@ type TabSprite<'id> = {
                  | _ -> Some(this.iconLocation,this.iconSprite))
                 (if this.showCloseButton then Some(this.closeButtonLocation, this.closeButtonSprite) else None)
                 ]).choose(id)
+
+
+    interface ISprite with
+        member this.image =
+            // A previewed tab is drawn by its shade alone: its own body under the shade would show
+            // through every pixel the shade leaves partly transparent.
+            if this.displayInfo.ghost then new Img(this.size : Sz) else this.draw
+        member this.children =
+            // And the shade is the whole tab, its parts composited inside it.
+            if this.displayInfo.ghost then
+                List2([Pt(), GhostTabSprite((fun () -> this.draw), this.tabParts) :> ISprite])
+            else this.tabParts
 
 /// The concave foot where an active folder tab meets the bar beside it. It is drawn over
 /// the neighbouring tab, so it never takes the pointer from that tab.
