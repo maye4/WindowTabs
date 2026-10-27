@@ -80,7 +80,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let mutable alignmentOverrides = Set.empty
     let capturedCell = Bemo.Cell<Option<Tab*TabPart>>(Cell, None, (=))
     let hoverCell = Bemo.Cell<Option<Tab*TabPart>>(Cell, None, (=))
-    let slideCell = Cell.create(None)
+    // With equality: this is assigned on every pointer move while a drag previews here, and each
+    // assignment without it repainted the whole row, uploaded the image and rebuilt the shadow.
+    let slideCell = Bemo.Cell<(Tab * int) option>(Cell, None, (=))
     let heldLayoutCell = Bemo.Cell<(float * float) option>(Cell, None, (=))
     let ptCell = Cell.create(None)
     let tabInfoCell = Cell.create(Map2():Map2<Tab,TabInfo>)
@@ -787,8 +789,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.previewDrop (pt:Pt) =
         match ghostTabCell.value with
         | Some(_, ghost) ->
-            let order = lorderCell.value.move((=) ghost, this.dropIndex pt)
-            if lorderCell.value <> order then lorderCell.set order
+            let current = lorderCell.value
+            let index = this.dropIndex pt
+            // Only move the tab when the slot it names differs from the one it already sits in: the old
+            // guard compared List2 wrappers, which never compare equal, so every pointer move rebuilt
+            // the order and repainted the row for an unchanged result.
+            match current.tryFindIndex((=) ghost) with
+            | Some at when at = index -> ()
+            | _ -> lorderCell.set(current.move((=) ghost, index))
         | None -> ()
     
     /// The tab a floating drag carries: where a strip that holds only this tab puts it, and how that
