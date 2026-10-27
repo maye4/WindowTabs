@@ -204,8 +204,6 @@ type DragAction(info:DragActionInfo) =
             let state = dragStateCell.value
             dragStateCell.set None
             state |> Option.iter(fun s -> s.dispose())
-            // The drop places the window from here: a size change still easing would move it again.
-            DragTween.cancel this.draggedHwnd
             floatingTabCell.value.iter(fun tab -> (tab :> IDisposable).Dispose())
             floatingTabCell.set None
             // The sprite is built on mouse-down, before this drag proves to be one: a click that never
@@ -269,8 +267,6 @@ type DragAction(info:DragActionInfo) =
         let targetWindow = os.windowFromHwnd(targetHwnd)
         let ptTarget = targetWindow.ptToClient(ptScreen)
         if target.dragEnter info.data ptTarget then
-            // The strip places this window as a group member now; the drag's own easing stops.
-            DragTween.cancel this.draggedHwnd
             let tabOffset =
                 match floatingTabCell.value with
                 | Some tab -> tab.anchorOffset

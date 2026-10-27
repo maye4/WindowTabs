@@ -70,64 +70,6 @@ type ShellEvent =
 type IWindow =
     abstract member hwnd : IntPtr
 
-/// Steps a window between two sizes over a handful of frames instead of jumping. A drag out of a
-/// maximized or fullscreen window lands in the window's own, smaller frame, and that one transition
-/// reads as the window settling into the pointer rather than as a cut. Moving between frames of the
-/// same size is not a step: the drag follows the pointer directly.
-module DragTween =
-    let private frame = 16
-    let private steps = 8
-    let private running = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, System.Windows.Forms.Timer>()
-    let private goals = System.Collections.Concurrent.ConcurrentDictionary<IntPtr, Rect>()
-    /// Ease out: fast at first, settling at the end, the way a window being dropped into place looks.
-    let private ease (t:float) = 1.0 - (1.0 - t) * (1.0 - t)
-    /// Move the window to this rect. Returns true while a step is in progress, in which case the
-    /// caller must leave the window alone until it ends: the step ends on the newest rect asked for.
-    let step (hwnd:IntPtr) (bounds:unit -> Rect) (move:Rect -> unit) (rect:Rect) =
-        match running.TryGetValue hwnd with
-        | true, _ ->
-            goals.[hwnd] <- rect
-            true
-        | _ ->
-            let from = bounds()
-            if from.size = rect.size then false
-            else
-                let interpolate (goal:Rect) (t:float) =
-                    let lerp a b = a + int (float (b - a) * t)
-                    Rect(Pt(lerp from.x goal.x, lerp from.y goal.y),
-                         Sz(lerp from.width goal.width, lerp from.height goal.height))
-                let mutable current = 1
-                let timer = new System.Windows.Forms.Timer(Interval=frame)
-                goals.[hwnd] <- rect
-                running.[hwnd] <- timer
-                // The first step lands before this returns: waiting a timer frame to begin moving is
-                // what a drag feels as lag at the grab.
-                move (interpolate rect (ease (1.0 / float steps)))
-                timer.Tick.Add(fun _ ->
-                    current <- current + 1
-                    let goal = match goals.TryGetValue hwnd with | true, r -> r | _ -> rect
-                    if current >= steps then
-                        timer.Stop()
-                        timer.Dispose()
-                        running.TryRemove hwnd |> ignore
-                        goals.TryRemove hwnd |> ignore
-                        move goal
-                    else
-                        move (interpolate goal (ease (float current / float steps))))
-                timer.Start()
-                true
-    /// Stop easing this window. A strip that took the tab, or a drop that placed the window, owns
-    /// its frame now: a step landing after that fights the placement made for it, moving the window
-    /// again some time after the transition the user already watched settle.
-    let cancel (hwnd:IntPtr) =
-        if hwnd <> IntPtr.Zero then
-            match running.TryRemove hwnd with
-            | true, timer ->
-                timer.Stop()
-                timer.Dispose()
-                goals.TryRemove hwnd |> ignore
-            | _ -> ()
-
 type OS()= 
     let Cell = CellScope()
 
@@ -751,20 +693,40 @@ and
         // Restored the way the tray restores a window: a maximized one has to come back to its own
         // size, but taking the foreground from the app the user is working in is not part of a drag.
         if this.isMinimized then this.showNoActivate()
-        if this.isMaximized then WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
-        let rect = this.dragFollowRect ptScreen (this.dragSize ptScreen normalSize)
-        // A change of size - out of a maximized frame into the window's own - steps there over a few
-        // frames instead of jumping. A move that keeps the size follows directly, and one that changes
-        // nothing at all is skipped: it would only make the app lay itself out.
+        // A maximized window refuses to be moved, so it is restored before the move below. Restoring it
+        // the ordinary way puts the window's remembered size on screen for a frame first, and everything
+        // around that smaller frame is background: measured 3866x2186 to 3236x1991 in one step, which
+        // was the size the drag was already heading for, so the drag flashed. The frame the user is
+        // looking at is taken first, and the restore lands on that instead.
+        let maximizedFrame = if this.isMaximized then Some(this.bounds) else None
+        // Read before the placement below is changed: un-maximizing overwrites rcNormalPosition, and this
+        // is the size the drag falls back to when nothing remembered one for the window.
+        let normalRect = this.placement.rcNormalPosition
+        // Un-maximize onto the frame that is already on screen, rather than onto the window's remembered
+        // normal rect: the drop sets the placement it wants anyway, so the rect used here is only a way
+        // to stop being maximized without changing what the user is looking at.
         //
-        // A window in its own fullscreen is the exception: it refuses every move in
-        // WM_WINDOWPOSCHANGING, and easing a refusal only costs frames. The attempt goes through once,
-        // plainly, so the window is where the drop expects it if the app ever does accept it.
-        if this.isFullScreen then
-            if this.bounds <> rect then this.move(rect)
-        else
-            if not (DragTween.step hwnd (fun () -> this.bounds) (fun rect -> this.move rect) rect) then
-                if this.bounds <> rect then this.move(rect)
+        // rcNormalPosition is in workspace coordinates while bounds are on the screen: a window on a
+        // monitor whose work area starts below or right of its display area is restored to the same
+        // place the drop converts for, not shifted by the taskbar.
+        maximizedFrame
+        |> Option.iter(fun frame ->
+            let workspaceOffset =
+                match Mon.fromHwnd hwnd with
+                | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
+                | None -> Pt()
+            let wp = this.placement
+            this.setPlacement { wp with showCmd = int ShowWindowCommands.SW_SHOWNOACTIVATE
+                                        flags = 0
+                                        rcNormalPosition = Rect(frame.location.sub(workspaceOffset), frame.size) })
+        let rect = this.dragFollowRect ptScreen (this.dragSize ptScreen (normalSize |> Option.orElse (Some normalRect.size)))
+        // One move, however far it is. A change of size used to be stepped over several frames, but
+        // repainting a large window costs about 20 ms a frame, so the steps were few, uneven and
+        // visibly separate: the window appeared to jump two or three times. The move itself is the
+        // same cost paid once, and reads as the window arriving rather than stuttering there.
+        //
+        // A move that changes nothing at all is skipped: it would only make the app lay itself out.
+        if this.bounds <> rect then this.move(rect)
         // Showing a window that is already shown costs a ShowWindow per pointer move.
         if not this.isVisible then this.showNoActivate()
 
