@@ -227,6 +227,104 @@ type CloseButtonSprite = {
             bitmap
         member this.children = List2()
 
+/// A tab's body is a pure function of its own record: the same sprite draws the same pixels. A strip
+/// redraws every tab on every frame, and on a large strip that drawing is the frame's whole cost, so
+/// the finished body is kept and handed out as a copy - `ISprite.image` promises the caller an image
+/// it owns and disposes, so the kept one is never given away.
+module TabImageCache =
+    let private gate = obj()
+    /// Bounded by the pixels it holds rather than by a count of bodies, since a tab at 192 dpi takes
+    /// four times the memory of the same tab at 96. Evicted oldest-first a quarter at a time and never
+    /// emptied: a strip whose tabs take turns being hovered asks for the same bodies again and again,
+    /// so clearing on overflow threw away exactly the ones about to be asked for and every frame after
+    /// paid for a full redraw.
+    let private budget = 24 * 1024 * 1024
+    let private kept = System.Collections.Generic.Dictionary<obj,Img>(HashIdentity.Structural)
+    /// When each held body was last asked for, so eviction drops the least recently used rather than
+    /// the oldest inserted. A strip asks for the same few bodies on every frame; evicting by insertion
+    /// order threw those away first and kept the ones drawn once. Just a stamp per key: an ordered
+    /// queue of uses grew with every frame and pinned every key it had ever seen.
+    let private used = System.Collections.Generic.Dictionary<obj,int64>(HashIdentity.Structural)
+    let mutable private tick = 0L
+    let mutable private held = 0
+
+    /// What the drawing depends on besides the sprite itself: its own record, the DPI its lengths are
+    /// measured in, and high contrast, which decides its colours.
+    let key (sprite:obj) = box (sprite, Dpi.value(), SystemInformation.HighContrast)
+
+    let private bytes (image:Img) = image.width * image.height * 4
+
+    let private touch (key:obj) =
+        tick <- tick + 1L
+        used.[key] <- tick
+
+    let private drop (key:obj) =
+        match kept.TryGetValue key with
+        | true, dropped ->
+            held <- held - bytes dropped
+            dropped.bitmap.Dispose()
+            kept.Remove key |> ignore
+            used.Remove key |> ignore
+        | _ -> ()
+
+    /// Make room for `size` bytes, least recently used first. A quarter of the budget at a time: freeing
+    /// everything would throw away the bodies the next frame asks for again. The scan is over the bodies
+    /// actually held, which the budget already bounds, and only runs when the cache is full.
+    let private evict (size:int) =
+        let mutable freed = 0
+        while held + size > budget && freed < budget/4 && kept.Count > 0 do
+            let mutable victim = null
+            let mutable oldest = Int64.MaxValue
+            for entry in kept do
+                match used.TryGetValue entry.Key with
+                | true, stamp when stamp < oldest ->
+                    oldest <- stamp
+                    victim <- entry.Key
+                | _ -> ()
+            if isNull victim then
+                // Nothing stamped: fall back to whatever the dictionary offers, so the loop can end.
+                for entry in kept do
+                    if isNull victim then victim <- entry.Key
+            if isNull victim then freed <- budget/4
+            else
+                match kept.TryGetValue victim with
+                | true, image ->
+                    freed <- freed + bytes image
+                    drop victim
+                | _ -> ()
+
+    /// Store a body drawn outside the lock, making room when needed. Another strip may have drawn the
+    /// same one meanwhile: the one already held is kept, and this drawing is handed back to the caller
+    /// as its copy, so nothing is drawn for nothing.
+    let private store (key:obj) (drawn:Img) =
+        match kept.TryGetValue key with
+        | true, _ -> drawn
+        | _ ->
+            evict (bytes drawn)
+            // The copy is taken before the cache publishes the original: if this throws, the caller
+            // still owns `drawn` and disposes it, and nothing disposed is left behind in the cache.
+            let copy = drawn.clone()
+            kept.[key] <- drawn
+            held <- held + bytes drawn
+            touch key
+            copy
+
+    /// The body for this key, owned by the caller: a copy of the one held, or the freshly drawn one,
+    /// which is kept so the next frame copies instead of drawing. Drawing happens outside the lock:
+    /// every strip in the process shares this cache, and holding it would put them all in single file.
+    let adopt (key:obj) (draw:unit -> Img) : Img =
+        match lock gate (fun () ->
+                match kept.TryGetValue key with
+                | true, image ->
+                    touch key
+                    Some(image.clone())
+                | _ -> None) with
+        | Some image -> image
+        | None ->
+            let drawn = draw()
+            try lock gate (fun () -> store key drawn)
+            with ex -> drawn.bitmap.Dispose(); raise ex
+
 type TabDisplayInfo = {
     tint: Color option
     colorStyle: string
@@ -529,6 +627,10 @@ type TabSprite<'id> = {
     member this.tabTextBrush =
         new SolidBrush(this.textColor)
 
+    /// The body, drawn once for a sprite that does not change and copied out on every frame after.
+    member private this.body =
+        TabImageCache.adopt (TabImageCache.key (box this)) (fun () -> this.draw)
+
     member private this.draw =
         let img = Img(this.size)
         use g = img.graphics
@@ -616,11 +718,11 @@ type TabSprite<'id> = {
         member this.image =
             // A previewed tab is drawn by its shade alone: its own body under the shade would show
             // through every pixel the shade leaves partly transparent.
-            if this.displayInfo.ghost then new Img(this.size : Sz) else this.draw
+            if this.displayInfo.ghost then new Img(this.size : Sz) else this.body
         member this.children =
             // And the shade is the whole tab, its parts composited inside it.
             if this.displayInfo.ghost then
-                List2([Pt(), GhostTabSprite((fun () -> this.draw), this.tabParts) :> ISprite])
+                List2([Pt(), GhostTabSprite((fun () -> this.body), this.tabParts) :> ISprite])
             else this.tabParts
 
 /// The concave foot where an active folder tab meets the bar beside it. It is drawn over
