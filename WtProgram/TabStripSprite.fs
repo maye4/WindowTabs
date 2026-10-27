@@ -267,12 +267,14 @@ module TabImageCache =
             used.Remove key |> ignore
         | _ -> ()
 
-    /// Make room for `size` bytes, least recently used first. A quarter of the budget at a time: freeing
-    /// everything would throw away the bodies the next frame asks for again. The scan is over the bodies
-    /// actually held, which the budget already bounds, and only runs when the cache is full.
+    /// Make room for `size` bytes, least recently used first. Prefer freeing about a quarter so a
+    /// busy strip does not lose every hot body at once; if the new body still will not fit, keep
+    /// going until it does (or the cache is empty) so `held` cannot stay permanently over budget.
+    /// The scan is over the bodies actually held and only runs when the cache is full.
     let private evict (size:int) =
         let mutable freed = 0
-        while held + size > budget && freed < budget/4 && kept.Count > 0 do
+        let soft = budget / 4
+        while held + size > budget && kept.Count > 0 && (freed < soft || held + size > budget) do
             let mutable victim = null
             let mutable oldest = Int64.MaxValue
             for entry in kept do
@@ -285,7 +287,9 @@ module TabImageCache =
                 // Nothing stamped: fall back to whatever the dictionary offers, so the loop can end.
                 for entry in kept do
                     if isNull victim then victim <- entry.Key
-            if isNull victim then freed <- budget/4
+            if isNull victim then
+                // Cannot free anything further; stop rather than spin.
+                freed <- soft + (held + size)
             else
                 match kept.TryGetValue victim with
                 | true, image ->
@@ -301,12 +305,13 @@ module TabImageCache =
         | true, _ -> drawn
         | _ ->
             evict (bytes drawn)
-            // The copy is taken before the cache publishes the original: if this throws, the caller
-            // still owns `drawn` and disposes it, and nothing disposed is left behind in the cache.
+            // Clone and bookkeeping finish before publish: if anything here throws, `drawn` is not
+            // in `kept` yet, so `adopt` can Dispose it safely. Publishing last avoids a disposed
+            // bitmap sitting in the cache when held/touch fails after `kept.[key] <- drawn`.
             let copy = drawn.clone()
-            kept.[key] <- drawn
             held <- held + bytes drawn
             touch key
+            kept.[key] <- drawn
             copy
 
     /// The body for this key, owned by the caller: a copy of the one held, or the freshly drawn one,
@@ -323,7 +328,13 @@ module TabImageCache =
         | None ->
             let drawn = draw()
             try lock gate (fun () -> store key drawn)
-            with ex -> drawn.bitmap.Dispose(); raise ex
+            with ex ->
+                // Only dispose when this drawing was not published into the cache.
+                lock gate (fun () ->
+                    match kept.TryGetValue key with
+                    | true, img when obj.ReferenceEquals(img, drawn) -> ()
+                    | _ -> drawn.bitmap.Dispose())
+                raise ex
 
 type TabDisplayInfo = {
     tint: Color option
