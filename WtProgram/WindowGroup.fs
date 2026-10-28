@@ -234,6 +234,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     let _ts = ref None 
     let inMoveSize = Cell.create(false)
     let mutable soloSizeBeforeMove : (IntPtr * Sz) option = None
+    /// The frame the dragged window had when its move began: the followers are hidden on the first
+    /// movement, not on the mouse press, so a click that never becomes a drag blinks nothing. The
+    /// pointer has to have moved as well, because a title-bar double-click changes the window's
+    /// rectangle too, and that is not a drag.
+    let mutable moveStartedFrom : Rect option = None
+    let mutable moveStartedAt : Pt option = None
     let foregroundCell = Cell.create(_os.foreground.hwnd)
     let prevForegroundCell = ref None
     let mutable lastActiveTab : IntPtr option = None
@@ -857,12 +863,27 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd) |> Option.map(fun size -> hwnd,size)
                 else None
         inMoveSize.set(true)
+        // Armed once per move: a second start (a scale change restarts the loop) must not re-arm, or
+        // the next event would cancel the tail's pending placements for nothing.
+        if moveStartedFrom.IsNone then
+            // The frame the group last placed its top window at is the one before this move, which is
+            // what the first movement has to be compared with when the start event was missed.
+            let recorded =
+                placement.value
+                |> Option.map(fun (bounds,_,_) -> bounds)
+                |> Option.filter(fun bounds -> not bounds.size.isEmptyArea)
+            moveStartedFrom <- Some(defaultArg recorded (this.os.windowFromHwnd(this.topWindow).bounds))
+            moveStartedAt <- Some(Pt(Cursor.Position.X, Cursor.Position.Y))
+        // Without drag-full-window the loop paints only at its end, so nothing moves before the end
+        // and the followers are hidden now instead.
+        if not SystemInformation.DragFullWindows then this.hideChildWindows()
         DragTrace.write(sprintf "START top=%d dpi=%d members=%d" (this.topWindow.ToInt64()) (Dpi.forWindow this.topWindow) this.windowCount)
-        this.hideChildWindows()
         this.updateIsVisible()
 
     member this.onExitMoveSize() =
         soloSizeBeforeMove <- None
+        moveStartedFrom <- None
+        moveStartedAt <- None
         inMoveSize.set(false)
         // A drag that crosses a monitor changes the dragged window's DPI, and Windows can end its
         // move loop there and start another: the end reported here is not the end. Aligning the
@@ -972,6 +993,20 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         //event when they loose focus, we don't want to automatically give them focus in this case
         //so make sure that the window HAD focus before reapplying it
         | WinEvent.EVENT_OBJECT_LOCATIONCHANGE ->
+            // The mouse press announced the move; the window has not moved yet. The followers go off
+            // the screen at the first frame the window actually moves, which is what a drag is.
+            if this.isTop(hwnd) && inMoveSize.value then
+                let moved = this.os.windowFromHwnd(hwnd).bounds
+                let pointerMoved =
+                    match moveStartedAt with
+                    | Some start -> abs(Cursor.Position.X - start.x) > 2 || abs(Cursor.Position.Y - start.y) > 2
+                    | None -> false
+                match moveStartedFrom with
+                | Some start when moved <> start && pointerMoved ->
+                    moveStartedFrom <- None
+                    moveStartedAt <- None
+                    this.hideChildWindows()
+                | _ -> ()
             // A move can end without its end being reported — a scale change restarts the loop, and a
             // window destroyed mid-drag takes its hooks with it — and while the group still believes
             // it is dragging, every follower stays off the screen and the very handler that could
