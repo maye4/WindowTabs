@@ -853,16 +853,30 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd) |> Option.map(fun size -> hwnd,size)
                 else None
         inMoveSize.set(true)
+        DragTrace.write(sprintf "START top=%d dpi=%d members=%d" (this.topWindow.ToInt64()) (Dpi.forWindow this.topWindow) this.windowCount)
         this.hideChildWindows()
         this.updateIsVisible()
 
     member this.onExitMoveSize() =
         soloSizeBeforeMove <- None
         inMoveSize.set(false)
-        this.saveTopWindowPlacement()
-        this.adjustChildWindows()
-        this.makeTopWindowForeground()
-        this.updateIsVisible()
+        // A drag that crosses a monitor changes the dragged window's DPI, and Windows can end its
+        // move loop there and start another: the end reported here is not the end. Aligning the
+        // followers at that moment put them back on the screen for the rest of the drag, which is
+        // the window that appeared after a move from one monitor to the other. They stay off the
+        // screen, and this group still owns the move, until the loop is really over.
+        let top = this.topWindow
+        let stillMoving = WinUserApi.IsWindow top && this.os.windowFromHwnd(top).isInMoveSize
+        DragTrace.write(sprintf "END top=%d stillMoving=%b dpi=%d" (top.ToInt64()) stillMoving (Dpi.forWindow top))
+        if stillMoving then
+            inMoveSize.set(true)
+            this.hideChildWindows()
+            this.updateIsVisible()
+        else
+            this.saveTopWindowPlacement()
+            this.adjustChildWindows()
+            this.makeTopWindowForeground()
+            this.updateIsVisible()
 
     member this.main(hwnd, evt) =
         let location = evt = WinEvent.EVENT_OBJECT_LOCATIONCHANGE

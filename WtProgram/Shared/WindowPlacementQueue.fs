@@ -156,7 +156,9 @@ module FollowerPlacement =
                 // it again.
                 if valid() && not window.isMinimized then
                     let parked = window.parkForMove(None)
-                    if valid() && (not parked || window.isShownOnSomeMonitor) then window.hide()
+                    if valid() && (not parked || window.isShownOnSomeMonitor) then
+                        window.hide()
+                        DragTrace.write(sprintf "HIDE %d fallback shown=%b" (hwnd.ToInt64()) window.isVisible)
             | SetMinimized(minimized,below) ->
                 if window.isMinimized<>minimized && valid() then
                     if minimized then window.prepareMinimizeAnchor(valid)
@@ -205,8 +207,25 @@ module FollowerPlacement =
                 window.prepareMinimizeAnchor(valid)
                 // Restoring can move again after SetWindowPlacement. Correct stacking
                 // after every native phase, using the source captured by the request.
+                // An application that has just been put on a monitor of another scale applies the
+                // rectangle the system suggests for it (measured: 2357x1303 asked, Chromium landed
+                // 3137x1735, exactly the 192/144 ratio) and ignores the size asked for, so the
+                // follower comes back larger than the group's frame and shows outside it until
+                // something places it again. One more move, after that handler has run, is what
+                // puts it back in the frame; it is not repeated, so an application that refuses the
+                // size keeps its own and no move loop starts.
+                if positioned && valid() && not window.isMinimized && window.bounds<>target() then
+                    let refused = window.bounds
+                    window.move(target())
+                    let want = target()
+                    DragTrace.write(sprintf "CORRECT %d asked=%s refused=%s now=%s"
+                                        (hwnd.ToInt64()) (DragTrace.rect want) (DragTrace.rect refused)
+                                        (DragTrace.rect window.bounds))
                 if positioned && valid() && not window.isMinimized && previous<>IntPtr.Zero && WinUserApi.IsWindow(previous) then
                     window.insertAfter(previous)
+                DragTrace.write(sprintf "ALIGN %d want=%s got=%s cmd=%d dpi=%d"
+                                    (hwnd.ToInt64()) (DragTrace.rect bounds) (DragTrace.rect window.bounds)
+                                    wp.showCmd (Dpi.forWindow hwnd))
 
     /// A group's windows usually each have a thread of their own and change state together, so a
     /// large group is not minimized or restored four windows at a time. The thread pool adds threads

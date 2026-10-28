@@ -67,6 +67,19 @@ type ShellEvent =
     //sent for maximized windows
     | HSHELL_RUDEAPPACTIVATED = 0x8004
 
+/// A drag's own log, written only when WINDOWTABS_DRAG_TRACE names a file: what parking and the
+/// placement that follows it did to each window, which neither one shows on its own.
+module DragTrace =
+    let private path = Environment.GetEnvironmentVariable("WINDOWTABS_DRAG_TRACE")
+    let private gate = obj()
+    let enabled = not(String.IsNullOrEmpty path)
+    let write (line:string) =
+        if enabled then
+            lock gate (fun() ->
+                try IO.File.AppendAllText(path, line + Environment.NewLine)
+                with _ -> ())
+    let rect (r:Rect) = sprintf "%d,%d %dx%d" r.x r.y r.width r.height
+
 type IWindow =
     abstract member hwnd : IntPtr
 
@@ -660,8 +673,13 @@ and
         | Some location ->
             WinUserApi.SetWindowPos(hwnd, IntPtr.Zero, location.x, location.y, size.width, size.height,
                 SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_NOACTIVATE).ignore
+            DragTrace.write(sprintf "PARK %d spot=%d,%d size=%dx%d got=%s shown=%b dpi=%d"
+                                (hwnd.ToInt64()) location.x location.y size.width size.height
+                                (DragTrace.rect this.bounds) this.isShownOnSomeMonitor (Dpi.forWindow hwnd))
             true
-        | None -> false
+        | None ->
+            DragTrace.write(sprintf "PARK %d nofreecorner dpi=%d" (hwnd.ToInt64()) (Dpi.forWindow hwnd))
+            false
 
     /// How far below the pointer a dragged window's top edge sits: the middle of the default tab,
     /// so a pointer grabbed mid-tab is released on the same spot. The drag and the drop both use
