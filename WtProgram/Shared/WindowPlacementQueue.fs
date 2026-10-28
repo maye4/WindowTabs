@@ -150,7 +150,13 @@ module FollowerPlacement =
             let window = OS().windowFromHwnd(hwnd)
             match request with
             | PrepareMinimizeAnchor -> window.prepareMinimizeAnchor(valid)
-            | HideForMove -> if valid() && not window.isMinimized then window.hideOffScreen(None)
+            | HideForMove ->
+                // A move takes the followers off the screen; the rare window whose monitor has a
+                // neighbour on every side is hidden instead, and the placement at move end shows
+                // it again.
+                if valid() && not window.isMinimized then
+                    let parked = window.parkForMove(None)
+                    if valid() && (not parked || window.isShownOnSomeMonitor) then window.hide()
             | SetMinimized(minimized,below) ->
                 if window.isMinimized<>minimized && valid() then
                     if minimized then window.prepareMinimizeAnchor(valid)

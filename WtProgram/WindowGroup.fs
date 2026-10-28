@@ -493,7 +493,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         | None -> ()
 
     member private this.hideChildWindows() =
-        zorderCell.value.tail.iter(fun hwnd -> FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd))
+        zorderCell.value.tail.iter(fun hwnd ->
+            // The queue keeps only the newest request per window, so an alignment still waiting
+            // from before the move would replace this hide and put the window back on screen.
+            FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
+                match request with AlignWindow _ -> true | _ -> false))
+            FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd))
 
     member private this.inZorder(windows:List2<IntPtr>) =
         // One desktop snapshot keeps the order consistent and avoids enumerating

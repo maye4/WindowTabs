@@ -624,26 +624,44 @@ and
         tme.hwndTrack <- hwnd
         WinUserApi.TrackMouseEvent(ref tme) |> ignore
 
-    member this.hideOffScreen (size:Sz option) =
-        let corners = Mon.all.map <| fun monitor -> monitor.workRect.BR.sub(monitor.workRect.location)
-        let corner = corners.fold (Pt()) <| fun maxCorner corner ->
-            if maxCorner.x < corner.x then maxCorner else corner
+    /// True when a monitor shows part of this window's visible frame. A pixel of the resize
+    /// border does not count: it is not drawn.
+    member this.isShownOnSomeMonitor =
+        let frame = this.visibleBounds
+        Mon.all.list |> List.exists(fun monitor ->
+            let shown = monitor.displayRect.intersection frame
+            shown.width > 1 && shown.height > 1)
 
-        let corner = corners.fold corner <| fun maxCorner corner ->
-            if  maxCorner.x = corner.x && 
-                maxCorner.y < corner.y then
-                maxCorner
-            else
-                corner
-        let corner = Pt(corner.x-1, corner.y-1)
-        this.setPlacement({
-            this.placement with
-                showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
-                rcNormalPosition = Rect(
-                    corner,
-                    if size.IsSome then size.Value else this.placement.rcNormalPosition.size
-                )
-        }) 
+    /// Where a follower parks for the duration of a move: the last pixel inside a corner of the
+    /// monitor it is already on, so the window extends off the screen without leaving that
+    /// monitor's DPI, and no monitor shows anything but its invisible border. None when a
+    /// neighbour covers every corner.
+    member private this.parkSpot (size:Sz) =
+        match Mon.fromHwnd hwnd with
+        | None -> None
+        | Some own ->
+            let r = own.displayRect
+            let others = Mon.all.where((<>) own).list
+            [ Pt(r.right-1, r.bottom-1)
+              Pt(r.left-size.width+1, r.bottom-1)
+              Pt(r.right-1, r.top-size.height+1)
+              Pt(r.left-size.width+1, r.top-size.height+1) ]
+            |> List.tryFind(fun location ->
+                let parked = Rect(location, size)
+                others |> List.forall(fun monitor -> (monitor.displayRect.intersection parked).isEmpty))
+
+    /// Moves a follower out of sight for the duration of a move. SetWindowPos, not
+    /// SetWindowPlacement: the system adjusts a placement that would put a window completely off
+    /// the screen back onto it, which is no way to hide one, and the point stays inside the
+    /// window's own monitor so its DPI cannot change. False when no corner is free.
+    member this.parkForMove (size:Sz option) =
+        let size = match size with | Some size -> size | None -> this.placement.rcNormalPosition.size
+        match this.parkSpot size with
+        | Some location ->
+            WinUserApi.SetWindowPos(hwnd, IntPtr.Zero, location.x, location.y, size.width, size.height,
+                SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_NOACTIVATE).ignore
+            true
+        | None -> false
 
     /// How far below the pointer a dragged window's top edge sits: the middle of the default tab,
     /// so a pointer grabbed mid-tab is released on the same spot. The drag and the drop both use
