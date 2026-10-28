@@ -266,9 +266,15 @@ type DragAction(info:DragActionInfo) =
             // Asked before the drop commits: the strip's order already holds the tab in the slot its
             // preview chose, and the shade drawn for it is still there to measure the slot against.
             let landing, landingTarget =
-                match state with
-                | Some(:? DragCapturedState as captured) -> captured.landing, Some captured.target
-                | _ -> None, None
+                // Reading the slot talks to the destination's thread, and that group can be gone by
+                // now (its last window closed during the drag). A throw here would skip the commit,
+                // leave the drag action uncleared — no further drag could start — and strand the
+                // overlay on screen.
+                try
+                  match state with
+                  | Some(:? DragCapturedState as captured) -> captured.landing, Some captured.target
+                  | _ -> None, None
+                with _ -> None, None
             // The sprite is built on mouse-down, before this drag proves to be one: a click that never
             // moves would otherwise keep the tab's copied icon for the life of the process.
             info.tab.release()
@@ -308,9 +314,10 @@ type DragAction(info:DragActionInfo) =
             let arrived (cancelled:bool) =
                 if not finished.Value then
                     finished.Value <- true
-                    dispose()
-                    if not cancelled then
-                        try target.dragLanded() with _ -> ()
+                    // The shade goes whether or not the picture got there: what it marks was committed
+                    // before the flight began, and a shade nobody clears is a tab that cannot be used.
+                    (try dispose() with _ -> ())
+                    (try target.dragLanded() with _ -> ())
                     DragTrace.write(sprintf "LANDED cancelled=%b" cancelled)
             DragTrace.write(sprintf "LAND from=%d,%d to=%s ms=%d"
                                 tab.topLeft.x tab.topLeft.y (DragTrace.rect landing) landMilliseconds)
@@ -322,8 +329,8 @@ type DragAction(info:DragActionInfo) =
         | _ ->
             dispose()
             target |> Option.iter(fun target ->
-                try target.dragLanded() with _ -> ())
-            if target.IsSome then DragTrace.write(sprintf "LANDED nocrect cancelled=false")
+                try target.dropSettled() with _ -> ())
+            if target.IsSome then DragTrace.write(sprintf "LANDED nocrect")
 
     member this.wndProc (msg:Win32Message) =
         let ptScreen() =             

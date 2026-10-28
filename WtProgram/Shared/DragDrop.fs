@@ -21,6 +21,9 @@ type IDragDropTarget =
     abstract member dropLanding : unit -> Rect option
     /// The tab has arrived where dropLanding put it: the shade marking the slot can go.
     abstract member dragLanded : unit -> unit
+    /// Nothing will fly (no slot could be measured, or there is no picture to fly): the shade goes
+    /// once this drop's commit has run, which is queued behind this call.
+    abstract member dropSettled : unit -> unit
 
 /// The tab a drag takes off its strip. The window dragged out of its group shows the real window
 /// under the pointer, so the tab has to come along: without it the window loses the chrome the
