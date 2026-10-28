@@ -238,6 +238,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// press itself activates the window, and activation re-places the members, which would put them
     /// back a few milliseconds after the press hid them.
     let mutable pressHolding = false
+    /// The windows the press took off the screen. The restore follows this list, not the z-order: the
+    /// window a press hid can become the top one before the button comes up (the pressed window closes
+    /// or leaves the group), and a restore that walked the tail would leave that one invisible.
+    let pressHidden = Collections.Generic.HashSet<IntPtr>()
     /// The frame the dragged window had when its move began: the followers are hidden on the first
     /// movement, not on the mouse press, so a click that never becomes a drag blinks nothing. The
     /// pointer has to have moved as well, because a title-bar double-click changes the window's
@@ -492,6 +496,11 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             inMoveSize.value.not
             
     member private this.updatePlacements() =
+        // A press whose release never arrived - the hook gone, a modal loop, a secure desktop - would
+        // otherwise freeze placements for the life of the group. The button itself says whether the
+        // press is still held.
+        if pressHolding && not(Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)) then
+            pressHolding <- false
         // While a press is held, placing the members is what would bring them back on screen.
         if not pressHolding then zorderCell.value.tail.iter(this.adjustWindowPlacement)
 
@@ -863,26 +872,42 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// A press on the group's caption hides the other windows at once, before anything has moved: the
     /// group is alone on the screen from the first pixel of a drag, and a click that never becomes one
     /// shows the same thing for as long as the button is held.
-    member this.pressHide() =
-        pressHolding <- true
-        if not inMoveSize.value then
-            zorderCell.value.tail.iter(fun hwnd ->
-                // An alignment still waiting would put the window back after the hide, and the queue
-                // keeps only the newest request per window.
-                FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
-                    match request with AlignWindow _ -> true | _ -> false))
-                let window = this.os.windowFromHwnd(hwnd)
-                if not window.isMinimized && window.isVisible && not (MoveHidden.holds hwnd) then
-                    window.hideForMove()
-                    DragTrace.write(sprintf "PRESS-HIDE %d" (hwnd.ToInt64())))
+    member this.pressHide(pressed:IntPtr) =
+        // The top window is the group's own state, so it is read here, on the group's thread, and not
+        // in the hook that saw the press.
+        if this.topWindow = pressed then
+            pressHolding <- true
+            pressHidden.Clear()
+            if not inMoveSize.value then
+                zorderCell.value.tail.iter(fun hwnd ->
+                    let window = this.os.windowFromHwnd(hwnd)
+                    if not window.isMinimized && window.isVisible && not (MoveHidden.holds hwnd) then
+                        // Submitted, not hidden here: a window that does not answer would hold this
+                        // thread, and with it every restore queued behind it.
+                        FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd)
+                        pressHidden.Add hwnd |> ignore
+                        DragTrace.write(sprintf "PRESS-HIDE %d" (hwnd.ToInt64())))
 
     /// The press is over. A press that never became a drag brings the other windows back here; one
     /// that did is restored by the end of its move, which comes after the release.
     member this.pressShow() =
         pressHolding <- false
         if not inMoveSize.value then
-            DragTrace.write(sprintf "PRESS-SHOW top=%d" (this.topWindow.ToInt64()))
-            this.adjustChildWindows()
+            DragTrace.write(sprintf "PRESS-SHOW top=%d held=%d" (this.topWindow.ToInt64()) pressHidden.Count)
+            this.restorePressHidden()
+            pressHidden.Clear()
+
+    /// Brings back exactly the windows the press hid, whatever the order is now. A window whose frame
+    /// is not known is shown as it is, rather than left off the screen because nothing placed it.
+    member private this.restorePressHidden() =
+        pressHidden |> Seq.iter(fun hwnd ->
+            if MoveHidden.holds hwnd then
+                if placement.value.IsSome then this.adjustWindowPlacement(hwnd)
+                else
+                    let window = this.os.windowFromHwnd(hwnd)
+                    MoveHidden.release hwnd |> ignore
+                    window.showCurrentStateNoActivate()
+                    DragTrace.write(sprintf "PRESS-SHOW-RAW %d" (hwnd.ToInt64())))
 
     member this.onEnterMoveSize() =
         if not inMoveSize.value then
@@ -912,6 +937,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     member this.onExitMoveSize() =
         soloSizeBeforeMove <- None
         pressHolding <- false
+        pressHidden.Clear()
         moveStartedFrom <- None
         moveStartedAt <- None
         inMoveSize.set(false)
