@@ -85,9 +85,35 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
                     info.group.bb.write("numberBadges",true))
                 timer.Start())
 
+    /// The group whose caption is under the pointer, if that group's own top window is the one being
+    /// pressed. A press anywhere else in a window belongs to the application and must not disturb the
+    /// group, and pressing a window that is not on top is about to change which one is.
+    member private this.captionGroup(pt:Pt) =
+        let hwnd = WinUserApi.WindowFromPoint(pt.POINT)
+        if hwnd=IntPtr.Zero then None else
+        this.desktop.groups.tryFind(fun group -> group.windows.contains((=)hwnd))
+        |> Option.filter(fun group ->
+            let info = group.cast<GroupInfo>()
+            not info.isExited && info.group.topWindow=hwnd &&
+            // Ask the window what that point of it is: WM_NCHITTEST, answered with HTCAPTION when the
+            // press would start a move. A hung application is not worth waiting for.
+            (let mutable result = IntPtr.Zero
+             let lParam = IntPtr((pt.y <<< 16) ||| (pt.x &&& 0xFFFF))
+             let answered = WinUserApi.SendMessageTimeout(hwnd,0x0084,IntPtr.Zero,lParam,0x0002,100,&result)
+             answered<>IntPtr.Zero && result.ToInt32()=2))
+        |> Option.map(fun group -> group.cast<GroupInfo>())
+
     member this.llHook nCode (wParam:IntPtr) lParam = 
         let msg = wParam.ToInt32()
         if nCode>=0 && List.contains msg [WindowMessages.WM_LBUTTONDOWN;WindowMessages.WM_RBUTTONDOWN;WindowMessages.WM_MBUTTONDOWN;WindowMessages.WM_XBUTTONDOWN] then this.cancelLeader()
+        // The button is what the user pressed, so the group hides its other windows for the whole
+        // press, not from the first frame of a move it may never make.
+        if nCode>=0 && (msg=WindowMessages.WM_LBUTTONDOWN || msg=WindowMessages.WM_LBUTTONUP) then
+            let hookStruct = unbox<MSLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<MSLLHOOKSTRUCT>))
+            this.captionGroup hookStruct.pt.Pt |> Option.iter(fun info ->
+                info.invokeGroup <| fun() ->
+                    if msg=WindowMessages.WM_LBUTTONDOWN then info.group.pressHide()
+                    else info.group.pressShow())
         if nCode>=0 && msgSet.contains(msg) then
             this.foregroundGroup.iter <| fun group ->
                 let hookStruct = unbox<MSLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<MSLLHOOKSTRUCT>))

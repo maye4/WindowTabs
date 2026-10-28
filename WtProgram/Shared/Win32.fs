@@ -73,10 +73,12 @@ module DragTrace =
     let private path = Environment.GetEnvironmentVariable("WINDOWTABS_DRAG_TRACE")
     let private gate = obj()
     let enabled = not(String.IsNullOrEmpty path)
+    /// Milliseconds since the trace began: the order of these lines is not the story, their spacing is.
+    let private clock = Diagnostics.Stopwatch.StartNew()
     let write (line:string) =
         if enabled then
             lock gate (fun() ->
-                try IO.File.AppendAllText(path, line + Environment.NewLine)
+                try IO.File.AppendAllText(path, sprintf "%6d %s%s" clock.ElapsedMilliseconds line Environment.NewLine)
                 with _ -> ())
     let rect (r:Rect) = sprintf "%d,%d %dx%d" r.x r.y r.width r.height
 

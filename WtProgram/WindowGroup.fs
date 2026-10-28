@@ -234,6 +234,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     let _ts = ref None 
     let inMoveSize = Cell.create(false)
     let mutable soloSizeBeforeMove : (IntPtr * Sz) option = None
+    /// A press on the caption holds the other windows off the screen until the button comes up. The
+    /// press itself activates the window, and activation re-places the members, which would put them
+    /// back a few milliseconds after the press hid them.
+    let mutable pressHolding = false
     /// The frame the dragged window had when its move began: the followers are hidden on the first
     /// movement, not on the mouse press, so a click that never becomes a drag blinks nothing. The
     /// pointer has to have moved as well, because a title-bar double-click changes the window's
@@ -488,7 +492,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             inMoveSize.value.not
             
     member private this.updatePlacements() =
-        zorderCell.value.tail.iter(this.adjustWindowPlacement)
+        // While a press is held, placing the members is what would bring them back on screen.
+        if not pressHolding then zorderCell.value.tail.iter(this.adjustWindowPlacement)
 
     member private this.adjustChildWindows = fun() ->
         this.updatePlacements()
@@ -855,6 +860,30 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         Cell.endUpdate()
         
 
+    /// A press on the group's caption hides the other windows at once, before anything has moved: the
+    /// group is alone on the screen from the first pixel of a drag, and a click that never becomes one
+    /// shows the same thing for as long as the button is held.
+    member this.pressHide() =
+        pressHolding <- true
+        if not inMoveSize.value then
+            zorderCell.value.tail.iter(fun hwnd ->
+                // An alignment still waiting would put the window back after the hide, and the queue
+                // keeps only the newest request per window.
+                FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
+                    match request with AlignWindow _ -> true | _ -> false))
+                let window = this.os.windowFromHwnd(hwnd)
+                if not window.isMinimized && window.isVisible && not (MoveHidden.holds hwnd) then
+                    window.hideForMove()
+                    DragTrace.write(sprintf "PRESS-HIDE %d" (hwnd.ToInt64())))
+
+    /// The press is over. A press that never became a drag brings the other windows back here; one
+    /// that did is restored by the end of its move, which comes after the release.
+    member this.pressShow() =
+        pressHolding <- false
+        if not inMoveSize.value then
+            DragTrace.write(sprintf "PRESS-SHOW top=%d" (this.topWindow.ToInt64()))
+            this.adjustChildWindows()
+
     member this.onEnterMoveSize() =
         if not inMoveSize.value then
             soloSizeBeforeMove <-
@@ -882,6 +911,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
 
     member this.onExitMoveSize() =
         soloSizeBeforeMove <- None
+        pressHolding <- false
         moveStartedFrom <- None
         moveStartedAt <- None
         inMoveSize.set(false)
@@ -997,9 +1027,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             // the screen at the first frame the window actually moves, which is what a drag is.
             if this.isTop(hwnd) && inMoveSize.value then
                 let moved = this.os.windowFromHwnd(hwnd).bounds
+                // Any movement counts: the followers go at the first pixel the pointer travels, so
+                // the window a drag can expose at its very start is exposed for as short a time as
+                // the event order allows.
                 let pointerMoved =
                     match moveStartedAt with
-                    | Some start -> abs(Cursor.Position.X - start.x) > 2 || abs(Cursor.Position.Y - start.y) > 2
+                    | Some start -> Cursor.Position.X <> start.x || Cursor.Position.Y <> start.y
                     | None -> false
                 match moveStartedFrom with
                 | Some start when moved <> start && pointerMoved ->
