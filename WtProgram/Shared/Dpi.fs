@@ -25,6 +25,15 @@ module Dpi =
     let scale value = scaleAt (current.Value) value
     let scaleF value = value * currentFactor()
     let scaleSize (size:Sz) = Sz(scale size.width,scale size.height)
+    [<System.Runtime.InteropServices.DllImport("user32.dll")>]
+    extern IntPtr private MonitorFromPoint(POINT pt, uint32 flags)
+    /// The scale of the monitor a point is on, for a window that is not there yet.
+    let forMonitorPoint (pt:Pt) =
+        try
+            let mutable x,y = 0u,0u
+            if GetDpiForMonitor(MonitorFromPoint(pt.POINT,2u),0,&x,&y)=0 && x>0u then int x
+            else systemDpi.Value
+        with _ -> systemDpi.Value
     let forWindow hwnd =
         try
             let dpi = int(GetDpiForWindow(hwnd))

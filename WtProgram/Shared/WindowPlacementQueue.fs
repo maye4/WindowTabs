@@ -131,7 +131,7 @@ type WindowPlacementQueue<'a>(apply:IntPtr -> 'a -> (unit -> bool) -> unit, ?wor
 type FollowerPlacementRequest =
     /// The source's window bounds and placement, the window to stay below, and the source's
     /// visible frame when the follower should match that rather than the window bounds.
-    | AlignWindow of Rect * OSWindowPlacement * IntPtr option * Rect option
+    | AlignWindow of Rect * OSWindowPlacement * IntPtr option * Rect option * bool
     /// A window restored without activation can still rise above the tab that asked for it;
     /// the handle it should stay below goes with the request.
     | SetMinimized of bool * IntPtr option
@@ -151,20 +151,100 @@ module FollowerPlacement =
             match request with
             | PrepareMinimizeAnchor -> window.prepareMinimizeAnchor(valid)
             | HideForMove ->
-                // A move takes the followers off the screen; the rare window whose monitor has a
-                // neighbour on every side is hidden instead, and the placement at move end shows
-                // it again.
-                if valid() && not window.isMinimized then
-                    let parked = window.parkForMove(None)
-                    if valid() && (not parked || window.isShownOnSomeMonitor) then
-                        window.hide()
-                        DragTrace.write(sprintf "HIDE %d fallback shown=%b" (hwnd.ToInt64()) window.isVisible)
+                // A move takes the followers off the screen for as long as the window is held:
+                // nothing of them can show, on any monitor and at any scale, and neither the strip
+                // nor the taskbar is in use while a drag runs. A window the mark cannot be put on
+                // stays visible, so a killed run cannot leave one invisible for good.
+                if valid() && not window.isMinimized && window.isVisible then
+                    window.hideForMove()
+                    DragTrace.write(sprintf "HIDE %d at=%s hidden=%b dpi=%d"
+                                        (hwnd.ToInt64()) (DragTrace.rect window.bounds)
+                                        (not window.isVisible) (Dpi.forWindow hwnd))
+                    // The group can be torn down, or the window can leave it, while this hide is
+                    // in flight: nothing else will show it again in this run, so the hide undoes
+                    // itself.
+                    if not(valid()) then
+                        window.showCurrentStateNoActivate()
+                        MoveHidden.release hwnd |> ignore
+                        DragTrace.write(sprintf "UNHIDE %d stale-request" (hwnd.ToInt64()))
             | SetMinimized(minimized,below) ->
                 if window.isMinimized<>minimized && valid() then
                     if minimized then window.prepareMinimizeAnchor(valid)
                     if valid() then window.showWindow(if minimized then ShowWindowCommands.SW_SHOWMINNOACTIVE else ShowWindowCommands.SW_SHOWNOACTIVATE)
                     below |> Option.iter(fun top -> if valid() && WinUserApi.IsWindow(top) then window.insertAfter(top))
-            | AlignWindow(bounds,wp,below,visible) ->
+            | AlignWindow(bounds,wp,below,visible,_) when MoveHidden.holds hwnd ->
+                // A follower this run hid for the move comes back here: set the group's frame while
+                // it is still off the screen, then show it. A window that is maximized cannot be
+                // moved, so it is placed instead, which also restores it onto that frame; the show
+                // is a plain SW_SHOWNA so it does not undo that.
+                if valid() && window.isMinimized then
+                    // Hidden and minimized at once: nothing in this run would show it, and the group
+                    // cannot place a minimized window, so it comes back minimized and unmarked.
+                    if not window.isVisible then
+                        window.showWindow(ShowWindowCommands.SW_SHOWMINNOACTIVE)
+                    if window.isVisible then MoveHidden.release hwnd |> ignore
+                    DragTrace.write(sprintf "BACK %d minimized visible=%b marked=%b"
+                                        (hwnd.ToInt64()) window.isVisible (MoveHidden.holds hwnd))
+                elif valid() && not window.isMinimized then
+                    let own,seen = window.bounds,window.visibleBounds
+                    let target =
+                        match visible with
+                        | Some frame when not seen.size.isEmptyArea ->
+                            let left,top = seen.x-own.x,seen.y-own.y
+                            Rect(Pt(frame.x-left,frame.y-top),Sz(frame.width+own.width-seen.width,frame.height+own.height-seen.height))
+                        | _ -> bounds
+                    // An application that is shown on a monitor of another scale rescales itself by
+                    // the ratio between the two (measured: asked 2353x1301 on a 192 dpi monitor from
+                    // a window at 144, landed 3137x1735). It is asked for the frame divided by that
+                    // ratio instead, so its own scaling lands on the frame and no wrong-sized frame
+                    // is ever painted. Only a window whose scale really changes takes this path.
+                    let windowDpi = Dpi.forWindow hwnd
+                    let targetDpi = Dpi.forMonitorPoint target.location
+                    let asked =
+                        if windowDpi<>targetDpi && targetDpi>0 then
+                            let ratio = float windowDpi / float targetDpi
+                            Rect(target.location, Sz(int(Math.Round(float target.size.width * ratio)),
+                                                     int(Math.Round(float target.size.height * ratio))))
+                        else target
+                    // A maximized follower refuses a move, and the group's frame is a normal
+                    // rectangle, so it would come back maximized and covering the screen instead of
+                    // in the group. A placement sets its state and its rectangle in one call, onto
+                    // the frame it is being given: rcNormalPosition is in workspace coordinates
+                    // while the frame is on the screen, converted the way the drag restore does.
+                    if window.isMaximized then
+                        let workspaceOffset =
+                            match Mon.fromPoint target.location with
+                            | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
+                            | None -> Pt()
+                        window.setPlacement { window.placement with
+                                                showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
+                                                flags = 0
+                                                rcNormalPosition = Rect(asked.location.sub(workspaceOffset), asked.size) }
+                    elif window.bounds<>asked then window.move(asked)
+                    if valid() && not window.isVisible then window.showCurrentStateNoActivate()
+                    // A show the application refused keeps the mark, so the next start finds the
+                    // window and gives it back; only a window that is really on screen is done.
+                    if valid() && window.isVisible then MoveHidden.release hwnd |> ignore
+                    // A follower restored without activation can rise above the window it belongs
+                    // under, and nothing later in this request would put it back.
+                    if valid() && window.isVisible && not window.isMinimized then
+                        below |> Option.iter(fun top ->
+                            if valid() && WinUserApi.IsWindow(top) then window.insertAfter(top))
+                    // A hidden window learns its monitor's scale when it is shown, not when it is
+                    // moved, so an application placed across two scales rescales itself *after*
+                    // this show and comes back larger than the frame it was given. The frame is
+                    // re-applied once, after that, and only when the window really moved off it.
+                    if valid() && window.isVisible && window.bounds<>target then
+                        let refused = window.bounds
+                        window.move(target)
+                        DragTrace.write(sprintf "CORRECT %d asked=%s refused=%s now=%s dpi=%d"
+                                            (hwnd.ToInt64()) (DragTrace.rect target) (DragTrace.rect refused)
+                                            (DragTrace.rect window.bounds) (Dpi.forWindow hwnd))
+                    DragTrace.write(sprintf "BACK %d want=%s got=%s visible=%b marked=%b minimized=%b dpi=%d"
+                                        (hwnd.ToInt64()) (DragTrace.rect target) (DragTrace.rect window.bounds)
+                                        window.isVisible (MoveHidden.holds hwnd) window.isMinimized
+                                        (Dpi.forWindow hwnd))
+            | AlignWindow(bounds,wp,below,visible,_) ->
                 let actual = window.placement
                 let previous = defaultArg below window.prevZorder.hwnd
                 let mutable positioned = false
@@ -231,10 +311,13 @@ module FollowerPlacement =
     /// large group is not minimized or restored four windows at a time. The thread pool adds threads
     /// beyond the processor count only slowly, so the limit stays within it.
     let queue = WindowPlacementQueue(apply, workerLimit=(Environment.ProcessorCount |> min 16 |> max 4))
-    let request hwnd bounds placement = identity hwnd,AlignWindow(bounds,placement,None,None)
-    let alignBelowRequest hwnd bounds placement top = identity hwnd,AlignWindow(bounds,placement,Some top,None)
+    let request hwnd bounds placement = identity hwnd,AlignWindow(bounds,placement,None,None,true)
+    let alignBelowRequest hwnd bounds placement top = identity hwnd,AlignWindow(bounds,placement,Some top,None,true)
     /// As request and alignBelowRequest, matching the source's visible frame when restored.
-    let alignFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible)
+    let alignFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,true)
+    /// As alignFrameRequest, for a follower this run hid for the move: the frame is applied by a
+    /// move and the window is shown once it is in it.
+    let alignHiddenFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,false)
     let minimizeRequest hwnd minimized = identity hwnd,SetMinimized(minimized,None)
     let restoreBelowRequest hwnd top = identity hwnd,SetMinimized(false,Some top)
     let hideRequest hwnd = identity hwnd,HideForMove

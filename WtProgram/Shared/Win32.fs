@@ -80,6 +80,45 @@ module DragTrace =
                 with _ -> ())
     let rect (r:Rect) = sprintf "%d,%d %dx%d" r.x r.y r.width r.height
 
+/// The windows WindowTabs took off the screen for the duration of a drag. Hidden, not minimized
+/// and not moved: the window keeps its frame and its state, so showing it again is all a drag's end
+/// needs. The mark also goes on the window itself, so a run that is killed mid-drag is recovered by
+/// the next one instead of leaving a window invisible.
+module MoveHidden =
+    let private key = "WindowTabs.MoveHidden.v1"
+    let private gate = obj()
+    let private hidden = Collections.Generic.HashSet<IntPtr>()
+
+    /// The window carries the mark, so a handle the system has since reused does not inherit it.
+    let holds (hwnd:IntPtr) =
+        WinUserApi.IsWindow hwnd && WinUserApi.GetProp(hwnd,key) <> IntPtr.Zero
+
+    /// Marks the window before it is taken off the screen. A window the system refuses a property
+    /// for is left visible: nothing would bring it back after a killed run.
+    let hold hwnd =
+        if WinUserApi.IsWindow hwnd && WinUserApi.SetProp(hwnd,key,IntPtr(1)) then
+            lock gate (fun () -> hidden.Add hwnd |> ignore)
+            true
+        else false
+
+    let release hwnd =
+        if lock gate (fun () -> hidden.Remove hwnd) then
+            if WinUserApi.IsWindow hwnd then WinUserApi.RemoveProp(hwnd,key) |> ignore
+            true
+        else false
+
+    /// Windows a killed run left hidden, shown before anything is grouped: a window is never left
+    /// invisible by a crash. Its state is kept, so a window that was maximized comes back maximized.
+    let recover (hwnds:IntPtr seq) =
+        for hwnd in hwnds do
+            if WinUserApi.IsWindow hwnd && WinUserApi.GetProp(hwnd,key) <> IntPtr.Zero then
+                if not(WinUserApi.IsWindowVisible hwnd) then
+                    let cmd =
+                        if WinUserApi.IsIconic hwnd then ShowWindowCommands.SW_SHOWMINNOACTIVE
+                        else ShowWindowCommands.SW_SHOWNA
+                    WinUserApi.ShowWindow(hwnd,cmd) |> ignore
+                WinUserApi.RemoveProp(hwnd,key) |> ignore
+
 type IWindow =
     abstract member hwnd : IntPtr
 
@@ -637,49 +676,15 @@ and
         tme.hwndTrack <- hwnd
         WinUserApi.TrackMouseEvent(ref tme) |> ignore
 
-    /// True when a monitor shows part of this window's visible frame. A pixel of the resize
-    /// border does not count: it is not drawn.
-    member this.isShownOnSomeMonitor =
-        let frame = this.visibleBounds
-        Mon.all.list |> List.exists(fun monitor ->
-            let shown = monitor.displayRect.intersection frame
-            shown.width > 1 && shown.height > 1)
+    /// Shows the window as it is, without activating it: SW_SHOWNA keeps its size, position and
+    /// state, where SW_SHOWNOACTIVATE restores a maximized window to its remembered normal frame.
+    member this.showCurrentStateNoActivate() =
+        WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNA).ignore
 
-    /// Where a follower parks for the duration of a move: the last pixel inside a corner of the
-    /// monitor it is already on, so the window extends off the screen without leaving that
-    /// monitor's DPI, and no monitor shows anything but its invisible border. None when a
-    /// neighbour covers every corner.
-    member private this.parkSpot (size:Sz) =
-        match Mon.fromHwnd hwnd with
-        | None -> None
-        | Some own ->
-            let r = own.displayRect
-            let others = Mon.all.where((<>) own).list
-            [ Pt(r.right-1, r.bottom-1)
-              Pt(r.left-size.width+1, r.bottom-1)
-              Pt(r.right-1, r.top-size.height+1)
-              Pt(r.left-size.width+1, r.top-size.height+1) ]
-            |> List.tryFind(fun location ->
-                let parked = Rect(location, size)
-                others |> List.forall(fun monitor -> (monitor.displayRect.intersection parked).isEmpty))
-
-    /// Moves a follower out of sight for the duration of a move. SetWindowPos, not
-    /// SetWindowPlacement: the system adjusts a placement that would put a window completely off
-    /// the screen back onto it, which is no way to hide one, and the point stays inside the
-    /// window's own monitor so its DPI cannot change. False when no corner is free.
-    member this.parkForMove (size:Sz option) =
-        let size = match size with | Some size -> size | None -> this.placement.rcNormalPosition.size
-        match this.parkSpot size with
-        | Some location ->
-            WinUserApi.SetWindowPos(hwnd, IntPtr.Zero, location.x, location.y, size.width, size.height,
-                SetWindowPosFlags.SWP_NOZORDER ||| SetWindowPosFlags.SWP_NOACTIVATE).ignore
-            DragTrace.write(sprintf "PARK %d spot=%d,%d size=%dx%d got=%s shown=%b dpi=%d"
-                                (hwnd.ToInt64()) location.x location.y size.width size.height
-                                (DragTrace.rect this.bounds) this.isShownOnSomeMonitor (Dpi.forWindow hwnd))
-            true
-        | None ->
-            DragTrace.write(sprintf "PARK %d nofreecorner dpi=%d" (hwnd.ToInt64()) (Dpi.forWindow hwnd))
-            false
+    /// Takes a follower off the screen for the duration of a move, once it is marked.
+    member this.hideForMove() =
+        if MoveHidden.hold hwnd then
+            this.hide()
 
     /// How far below the pointer a dragged window's top edge sits: the middle of the default tab,
     /// so a pointer grabbed mid-tab is released on the same spot. The drag and the drop both use

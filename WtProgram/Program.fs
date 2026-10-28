@@ -37,6 +37,8 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     let invoker = InvokerService.invoker
     let taskSwitchCell = Cell.create(None)
     let mutable initialDiscoveryComplete = false
+    /// Whether the windows a killed run left hidden for a move have been shown again.
+    let mutable recoveredMoveHidden = false
     let tabSearchCell = Cell.create(None:TabSearchForm option)
     let isTabMonitoringSuspendedCell = Cell.create(0)
     let llMouseEvent = Event<_>()
@@ -369,6 +371,11 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
         if this.desktop.isDragging.not then
             if inShutdown.value.not then
                 let windows = StartupTrace.measure "scan.enumerate" (fun () -> os.windowsInZorder)
+                if not recoveredMoveHidden then
+                    // A run that was killed during a drag left the windows it hid hidden: show them
+                    // before anything is grouped, so no window stays invisible for good.
+                    recoveredMoveHidden <- true
+                    MoveHidden.recover (windows.map(fun window -> window.hwnd).list)
                 windows.iter <| fun window ->
                     StartupTrace.measure "scan.subscribe" (fun () -> this.ensureWindowIsSubscribed(window))
                     if this.isTabMonitoringSuspended.not then

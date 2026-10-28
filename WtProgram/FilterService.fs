@@ -46,7 +46,8 @@ type FilterService() as this =
             fun() -> this.isAppWindowStyle(window)
             fun() -> window.pid.isCurrentProcess.not
             fun() -> window.isWindow
-            fun() -> window.isVisible
+            // A window held off the screen for a drag is still one of its group's tabs.
+            fun() -> window.isVisible || MoveHidden.holds window.hwnd
             fun() -> window.isTopMost.not
             fun() -> this.isValidOwner(window)
             //Win32 Dialogue class

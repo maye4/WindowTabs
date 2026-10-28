@@ -247,7 +247,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// The last tab the foreground left for a window outside the group, and when.
     let mutable leftGroup : (IntPtr * int64) option = None
     let isMinimized hwnd = this.os.windowFromHwnd(hwnd).isMinimized
-    let isOpen hwnd = WinUserApi.IsWindow(hwnd) && WinUserApi.IsWindowVisible(hwnd)
+    /// A member is still open while WindowTabs is the one holding it off the screen for a move:
+    /// hidden is not closed.
+    let isOpen hwnd = WinUserApi.IsWindow(hwnd) && (WinUserApi.IsWindowVisible(hwnd) || MoveHidden.holds hwnd)
     let hookCleanup = Cell.create(Map2<IntPtr, IDisposable>())
     let shellHookWindow = Cell.create(None)
     let winEventHandler = Cell.create(None)
@@ -797,7 +799,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         if placement.value.IsSome && not changingMinimizeState then
             let bounds,wp,visible = placement.value.Value
             let below = zorderCell.value.tryHead |> Option.filter((<>) hwnd)
-            let request = FollowerPlacement.alignFrameRequest hwnd bounds visible wp below
+            let request =
+                if MoveHidden.holds hwnd then FollowerPlacement.alignHiddenFrameRequest hwnd bounds visible wp below
+                else FollowerPlacement.alignFrameRequest hwnd bounds visible wp below
             FollowerPlacement.queue.submit(placementOwner,hwnd,request)
             // Maximize/snap can hide or cover the owned strip after its early events.
             reconcilePlacementState <- true
@@ -876,6 +880,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             this.saveTopWindowPlacement()
             this.adjustChildWindows()
             this.makeTopWindowForeground()
+            // Dragging a fullscreen window out of fullscreen ends the state without a location
+            // change of the kind that updates this, and the strip's shape and auto-hide are read
+            // from it.
+            isMaximizedExport.update()
             this.updateIsVisible()
 
     member this.main(hwnd, evt) =
@@ -964,6 +972,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         //event when they loose focus, we don't want to automatically give them focus in this case
         //so make sure that the window HAD focus before reapplying it
         | WinEvent.EVENT_OBJECT_LOCATIONCHANGE ->
+            // A move can end without its end being reported — a scale change restarts the loop, and a
+            // window destroyed mid-drag takes its hooks with it — and while the group still believes
+            // it is dragging, every follower stays off the screen and the very handler that could
+            // end the move is gated on that belief. The window itself says whether it is moving.
+            if this.isTop(hwnd) && inMoveSize.value && not (this.os.windowFromHwnd(hwnd).isInMoveSize) then
+                this.onExitMoveSize()
             if this.isTop(hwnd) && inMoveSize.value.not then
                 //you can miss EVENT_SYSTEM_MOVESIZESTART events
                 //when a window is created and is immediatly in move size, we subscribe
@@ -1073,6 +1087,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             //into another chrome group, need to exit the move/size and restore windows on screen in this case
             if inMoveSize.value then
                 this.onExitMoveSize()
+            // A member that leaves while this run is holding it off the screen for a move takes its
+            // place on the screen back with it: nothing else in this run would show it again.
+            if MoveHidden.holds hwnd then
+                let leaving = this.os.windowFromHwnd(hwnd)
+                if WinUserApi.IsWindow hwnd then
+                    if leaving.isMinimized then leaving.showWindow(ShowWindowCommands.SW_SHOWMINNOACTIVE)
+                    else leaving.showCurrentStateNoActivate()
+                MoveHidden.release hwnd |> ignore
             let window = this.os.windowFromHwnd(hwnd)
             // A window leaving alone is merged into another group or ungrouped, not closed:
             // keep the size the user chose for it before the next group places it.
@@ -1164,6 +1186,15 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             placementCompletion |> Option.iter(fun subscription -> subscription.Dispose())
             placementCompletion <- None
             this.windows.items.iter(fun hwnd -> FollowerPlacement.queue.release(placementOwner,hwnd))
+            // An orderly exit gives back the windows this run is holding off the screen, so quitting
+            // mid-drag cannot leave one invisible; a killed run is covered by the next start.
+            this.windows.items.iter(fun hwnd ->
+                if MoveHidden.holds hwnd then
+                    let window = this.os.windowFromHwnd(hwnd)
+                    if WinUserApi.IsWindow hwnd then
+                        if window.isMinimized then window.showWindow(ShowWindowCommands.SW_SHOWMINNOACTIVE)
+                        else window.showCurrentStateNoActivate()
+                    MoveHidden.release hwnd |> ignore)
             lock locationGate (fun () -> pendingLocations.Clear())
             minimizeStateTimer.Dispose()
             pendingMinimizeStates.Clear()

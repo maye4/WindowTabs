@@ -75,6 +75,11 @@ type TabStripDecorator(group:WindowGroup) as this =
 
         group.bounds.changed.Add <| fun() ->
             this.updateTsPlacement()
+        // Inside the title bar or outside it is decided by the maximized state too, which can
+        // change without the bounds changing with it: a fullscreen group dragged out of fullscreen
+        // kept a strip laid out for the title bar, and auto-hide left it collapsed.
+        group.isMaximized.changed.Add <| fun() ->
+            this.updateTsPlacement()
 
         let geometrySubscription = group.geometryChanged.Subscribe(fun () -> this.updateTsPlacement())
         let mutable disposed = false
