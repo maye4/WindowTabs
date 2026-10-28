@@ -62,6 +62,14 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     let mutable drawnFor : obj = null
     /// The size the anchor was measured for.
     let mutable anchorSize = Sz()
+    /// Where the picture's top-left corner is now. Tracked where the picture is placed, so the flight
+    /// into a slot starts from what the hand can see rather than from where the pointer is.
+    let mutable position = Pt()
+    /// The flight into a slot, if one is running. It belongs to the drag and goes with it.
+    let mutable flight : Timer option = None
+    let stopFlight () =
+        flight |> Option.iter(fun timer -> timer.Stop(); timer.Dispose())
+        flight <- None
     let place (visible:Rect) =
         let key, image, location = sprite.frame visible
         if not(obj.Equals(drawnFor, key)) then
@@ -76,7 +84,9 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// frame, so it always sits flush on the window's edge. Holding it by the grabbed point instead left
     /// a gap or an overlap between the two, by wherever the hand happened to close on the tab.
     member this.follow(ptScreen:Pt) (visible:Rect) =
-        window.setLocation(place visible)
+        let location = place visible
+        position <- location
+        window.setLocation(location)
         window.setIsVisible(true)
     /// The grabbed point inside the picture, for a strip taking the tab over to hold it by.
     member this.anchorOffset = anchor
@@ -88,12 +98,50 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
         this.holdAt(ptScreen.sub(anchor))
     /// Hold the tab at a screen point, keeping the picture it already has: over a strip the window
     /// belongs to the group, so only the tab the user is holding follows the pointer.
-    member this.holdAt(topLeft:Pt) =
-        window.setLocation(topLeft)
+    member this.holdAt(location:Pt) =
+        position <- location
+        window.setLocation(location)
         window.setIsVisible(true)
+    /// Where the picture is drawn now: where the flight to a slot starts, and what the trace reports.
+    member this.topLeft = position
+    /// Fly the picture into the slot the strip took the tab into. The tab the hand let go of moves to
+    /// where the strip already shades the place, so the drop reads as one gesture instead of a cut.
+    /// A timer on this thread steps it and a stopwatch decides the progress, because a queued tick
+    /// arrives late and unevenly; the last frame is the target itself, and `arrived` runs once.
+    member this.animateTo (target:Pt) (milliseconds:int) (arrived:unit -> unit) =
+        stopFlight()
+        let from = position
+        let duration = float (max 1 milliseconds)
+        let clock = Diagnostics.Stopwatch.StartNew()
+        let finished = ref false
+        let step () =
+            if not finished.Value then
+                let progress = min 1.0 (float clock.ElapsedMilliseconds / duration)
+                if progress >= 1.0 then
+                    finished.Value <- true
+                    stopFlight()
+                    position <- target
+                    window.setLocation(target)
+                    arrived()
+                else
+                    // Cubic ease-out: most of the distance in the first frames, no overshoot.
+                    let eased = 1.0 - pown (1.0 - progress) 3
+                    let at = Pt(from.x + int (Math.Round(eased * float (target.x - from.x))),
+                                from.y + int (Math.Round(eased * float (target.y - from.y))))
+                    position <- at
+                    window.setLocation(at)
+        let timer = new Timer(Interval = 16)
+        timer.Tick.Add <| fun _ -> step()
+        flight <- Some timer
+        // The first step now rather than at the first tick: waiting 16 ms shows as a pause on release.
+        step()
+        if not finished.Value then timer.Start()
     member this.hwnd = window.hwnd
     interface IDisposable with
-        member this.Dispose() = window.Dispose()
+        // A flight still in progress is stopped first: its timer must not step a disposed window.
+        member this.Dispose() =
+            stopFlight()
+            window.Dispose()
 
 type DragCapturedStateInfo = {
     target : IDragDropTarget
@@ -110,6 +158,10 @@ type DragCapturedState(info:DragCapturedStateInfo) =
     /// How far past the strip a tab has to be before it leaves the group and the window starts to
     /// float. This was 20, which the hand read as "nothing happens" before the drag began.
     let dragOutDistance = 6
+    /// The strip showing the preview this drag would land in.
+    member this.target = info.target
+    /// Where that strip leaves the tab once the drop commits, or None if it is not taking it.
+    member this.landing = info.target.dropLanding()
     interface IDragState with
         member this.mouseMove(ptScreen) =
             let dragBounds = info.targetWindow.bounds.inflate(dragOutDistance, dragOutDistance)
@@ -179,6 +231,9 @@ type DragAction(info:DragActionInfo) =
     /// The end of the drag happens once, however many of the timer, the mouse-leave and the
     /// button-up arrive: the rest find the capture gone and the icon copies already released.
     let mutable ended = false
+    /// How long the tab takes to fly into the slot it was dropped into: long enough to read as the
+    /// tab landing, short enough not to hold up the next gesture.
+    let landMilliseconds = 175
 
     member this.setNextState(newState:obj) =
         let newState = unbox<IDragState>(newState)
@@ -204,18 +259,28 @@ type DragAction(info:DragActionInfo) =
             let state = dragStateCell.value
             dragStateCell.set None
             state |> Option.iter(fun s -> s.dispose())
-            floatingTabCell.value.iter(fun tab -> (tab :> IDisposable).Dispose())
+            // The tab the hand let go of outlives the capture when a strip has taken it: that picture
+            // is what has to be seen arriving in the slot, and it is disposed when it gets there.
+            let tab = floatingTabCell.value
             floatingTabCell.set None
+            // Asked before the drop commits: the strip's order already holds the tab in the slot its
+            // preview chose, and the shade drawn for it is still there to measure the slot against.
+            let landing, landingTarget =
+                match state with
+                | Some(:? DragCapturedState as captured) -> captured.landing, Some captured.target
+                | _ -> None, None
             // The sprite is built on mouse-down, before this drag proves to be one: a click that never
             // moves would otherwise keep the tab's copied icon for the life of the process.
             info.tab.release()
             match state with
             | Some(:? DragDetectingState) ->
+                this.land tab landing landingTarget
                 info.onCancel()
             | Some(:? DragCapturedState) ->
                 info.targets.values.iter <| fun target -> target.dragEnd()
                 info.notifications.items.iter <| fun n -> n.dragEnd()
                 info.onEnd()
+                this.land tab landing landingTarget
             | Some(:? DragFloatingState) ->
                 info.targets.values.iter <| fun target -> target.dragEnd()
                 info.notifications.items.iter <| fun n -> n.dragEnd()
@@ -223,10 +288,42 @@ type DragAction(info:DragActionInfo) =
                 // user's window now, so nothing hides it afterwards.
                 info.onDrop(ptScreen)
                 info.onEnd()
-            | _ -> ()
+                // Nothing took the tab into a row: it was dropped on the desktop, so there is no slot
+                // to fly to and the picture goes at once.
+                this.land tab None None
+            | _ -> this.land tab None None
             // After the previews were told to clear: every strip that took one holds its own copy,
             // and the drag's copy has no reader left.
             DragIcon.release()
+
+    /// Show the tab arriving: the picture the hand let go of flies from where it was drawn to the slot
+    /// the strip marked, and the strip stops shading the slot once it is there. Only the arrival moves
+    /// — what the drop committed was committed before this runs, so a flight cut short changes
+    /// nothing. With no slot to fly to, the overlay goes at once, as it always has.
+    member private this.land (tab:FloatingTab option) (landing:Rect option) (target:IDragDropTarget option) =
+        let dispose () = tab |> Option.iter(fun tab -> (tab :> IDisposable).Dispose())
+        match tab, target, landing with
+        | Some(tab), Some(target), Some(landing) ->
+            let finished = ref false
+            let arrived (cancelled:bool) =
+                if not finished.Value then
+                    finished.Value <- true
+                    dispose()
+                    if not cancelled then
+                        try target.dragLanded() with _ -> ()
+                    DragTrace.write(sprintf "LANDED cancelled=%b" cancelled)
+            DragTrace.write(sprintf "LAND from=%d,%d to=%s ms=%d"
+                                tab.topLeft.x tab.topLeft.y (DragTrace.rect landing) landMilliseconds)
+            try tab.animateTo landing.location landMilliseconds (fun() -> arrived false)
+            with _ -> arrived true
+        // A target that took the drop but gave no rectangle still owns a shade: telling it that the
+        // tab has landed is what clears it. Without this, a drop whose slot could not be measured
+        // left the strip shading the tab for good.
+        | _ ->
+            dispose()
+            target |> Option.iter(fun target ->
+                try target.dragLanded() with _ -> ())
+            if target.IsSome then DragTrace.write(sprintf "LANDED nocrect cancelled=false")
 
     member this.wndProc (msg:Win32Message) =
         let ptScreen() =             

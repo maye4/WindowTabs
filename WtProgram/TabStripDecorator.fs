@@ -12,6 +12,9 @@ type TabStripDecorator(group:WindowGroup) as this =
     let dragInfoCell = Cell.create(None:Option<TabDragInfo>)
     /// A tab from another group was dragged in and is still here: dropped, it makes this group one made by hand.
     let mutable joinedByDrag = false
+    /// The tab the last drop committed here. Its slot stays shaded until the picture of the tab,
+    /// still flying in from the pointer, has arrived.
+    let mutable landedTab : Tab option = None
     let dragPtCell = Cell.create(Pt.empty)
     let dropTarget = Cell.create(None)
     let mouseEvent = Event<_>()
@@ -644,6 +647,9 @@ type TabStripDecorator(group:WindowGroup) as this =
     interface IDragDropTarget with
         member this.dragBegin() =
             this.invokeAsync <| fun() -> 
+                // A drag starting is the moment to drop a shade an earlier drop left behind: nothing
+                // previews in this strip until its own dragEnter sets one.
+                landedTab <- None
                 isDraggingCell.value <- true
                 this.ts.transparent <- false
                 
@@ -725,8 +731,39 @@ type TabStripDecorator(group:WindowGroup) as this =
                         | None -> ()
                     | None -> ()
                 if joinedByDrag && dragInfoCell.value.IsSome then group.isManual <- true
-                // The tab is a tab of this strip now, so it is drawn like one.
-                this.ts.ghostTab <- None
+                // The shade stays until the tab is seen arriving in it: the picture is still in the
+                // air, and drawing the tab here as well would show it twice. Cleared in dragLanded.
+                landedTab <- this.ts.ghostTab |> Option.map(fun (_, tab) -> tab)
                 joinedByDrag <- false
                 dragInfoCell.set(None)
                 this.updateTsSlide()
+
+        /// The slot the dropped tab will occupy: its laid-out position in this strip, through the
+        /// strip window, so a strip inside a title bar, a vertical dock or on another monitor answers
+        /// in screen coordinates. None when this strip did not take the tab.
+        member this.dropLanding() =
+            this.invokeSync <| fun() ->
+                match dragInfoCell.value with
+                | Some(info) when this.ts.tabs.contains(info.tab) ->
+                    this.ts.tabSprites.tryPick(fun (_, sprite) -> if sprite.id = info.tab then Some sprite.size else None)
+                    |> Option.map(fun size ->
+                        let strip = os.windowFromHwnd(this.ts.hwnd)
+                        Rect(strip.ptToScreen(this.ts.tabLocation info.tab), size))
+                | _ -> None
+
+        member this.dragLanded() =
+            this.invokeSync <| fun() ->
+                // Only the shade this drop put there: a newer drag's preview is not this one's to clear.
+                match landedTab, this.ts.ghostTab with
+                | Some(tab), Some(_, ghost) when ghost = tab ->
+                    this.ts.ghostTab <- None
+                    this.updateTsSlide()
+                    landedTab <- None
+                // Nothing is recorded and no drag is running: a shade left from an earlier drop is
+                // not a preview of anything and would otherwise stay for good — the strip would keep
+                // the tab drawn as a shadow that cannot be used.
+                | None, Some _ when dragInfoCell.value.IsNone ->
+                    this.ts.ghostTab <- None
+                    this.updateTsSlide()
+                    DragTrace.write(sprintf "GHOST %d cleared=stale" (this.ts.hwnd.ToInt64()))
+                | _ -> ()

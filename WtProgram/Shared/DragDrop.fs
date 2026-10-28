@@ -15,6 +15,12 @@ type IDragDropTarget =
     abstract member dragEnter : obj -> Pt -> bool
     abstract member dragMove : Pt -> unit
     abstract member dragExit : unit -> unit
+    /// The screen rect the carried tab occupies once this target has taken it, or None when this
+    /// target did not take it. Read when the drop is released, so the picture held under the pointer
+    /// can be flown to the slot the strip is already shading.
+    abstract member dropLanding : unit -> Rect option
+    /// The tab has arrived where dropLanding put it: the shade marking the slot can go.
+    abstract member dragLanded : unit -> unit
 
 /// The tab a drag takes off its strip. The window dragged out of its group shows the real window
 /// under the pointer, so the tab has to come along: without it the window loses the chrome the
