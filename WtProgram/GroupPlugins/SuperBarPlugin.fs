@@ -300,9 +300,10 @@ type TaskBarButton(info) as this =
         TaskbarPreviewTrace.write "register" hwndTab "" (sprintf "host=%d" (this.window.hwnd.ToInt64()))
     /// Each preview goes to the end in turn, which leaves them in the strip's order.
     let sendTabOrder() =
-        infoCell.value |> Option.iter(fun info ->
-            info.tabs.map(fst).choose(tabWindowsCell.value.tryFind).iter <| fun (tabWindow:TaskbarTab) ->
-                taskbar.SetTabOrder(tabWindow.window.hwnd, IntPtr.Zero))
+        StartupTrace.measure "taskbar.order" (fun () ->
+            infoCell.value |> Option.iter(fun info ->
+                info.tabs.map(fst).choose(tabWindowsCell.value.tryFind).iter <| fun (tabWindow:TaskbarTab) ->
+                    taskbar.SetTabOrder(tabWindow.window.hwnd, IntPtr.Zero)))
     /// A new window can leave its group and join again within moments (Neovide and Alacritty
     /// change their title as they start). Explorer can take the new preview's registration after
     /// the order that places it, and then shows it first, so the order is sent again once settled.

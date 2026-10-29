@@ -114,6 +114,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let nudgeClock = Diagnostics.Stopwatch()
     let nudgeTimer = new Timer(Interval=15)
     let mutable lastNudgeFrame = 0.0
+    /// Rebuilding the tab shadow is the most expensive part of a paint: it scans the whole strip bitmap
+    /// for its mask and blurs it into a second layered window. A paint that follows another one closely
+    /// only moves the shadow; the rebuild happens once the row has stopped changing.
+    let mutable shadowPending = false
+    let mutable shadowRefreshing = false
+    let mutable lastPaintAt = 0.0
+    let paintClock = Diagnostics.Stopwatch()
+    let shadowTimer = new Timer(Interval=40)
     /// The rounded offsets the last frame was drawn with: a frame that would draw the same pixels is
     /// not worth the render, the upload and the shadow.
     let mutable lastOffsets : int[] = [||]
@@ -165,6 +173,12 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
         revealTimer.Tick.Add(fun _ -> this.stepReveal())
         nudgeTimer.Tick.Add(fun _ -> this.stepNudge())
+        shadowTimer.Tick.Add(fun _ ->
+            shadowTimer.Stop()
+            shadowPending <- false
+            shadowRefreshing <- true
+            try if this.visible then this.paint()
+            finally shadowRefreshing <- false)
         dragScrollTimer.Tick.Add(fun _ ->
             match dragScrollLocation with
             | Some pt when this.isVertical && slideCell.value.IsSome ->
@@ -463,7 +477,11 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         if this.visible then this.paint()
 
     member private this.paint() =
+        StartupTrace.measure "strip.paint" (fun () -> this.paintCore())
+
+    member private this.paintCore() =
         let image,offset =
+            StartupTrace.measure "strip.paint.render" (fun () ->
             if reveal>=1.0 then this.renderAt false,0
             elif reveal<=0.0 then
                 let offset =
@@ -482,17 +500,27 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                         images
                 if this.isVertical then
                     TabReveal.sideFrame full.bitmap collapsed.bitmap reveal ((this.dock=TabDockLeft) <> this.showInside)
-                else TabReveal.frame full.bitmap collapsed.bitmap reveal this.direction
+                else TabReveal.frame full.bitmap collapsed.bitmap reveal this.direction)
         try
             renderedOffset <- offset
             renderedFrames <- renderedFrames+1L
-            this.window.update(image, this.location.add(this.renderedShift), 255uy)
-            shadowWindow |> Option.iter (fun shadow ->
+            StartupTrace.measure "strip.paint.upload" (fun () ->
+                this.window.update(image, this.location.add(this.renderedShift), 255uy))
+            // A burst of paints - a join, a slide, a resize - would rebuild the mask on every frame.
+            let recent = paintClock.Elapsed.TotalMilliseconds - lastPaintAt < 40.0
+            let skip = (not shadowRefreshing) && (nudges.Count > 0 || shadowPending)
+            StartupTrace.measure "strip.paint.shadow" (fun () ->
+              shadowWindow |> Option.iter (fun shadow ->
                 if reveal<1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
-                // A sliding row would rebuild the shadow's mask on every frame and upload it; the row
-                // settles in a sixth of a second, and the last frame draws the shadow it ends with.
-                elif nudges.Count > 0 then shadow.move()
-                else shadow.update(image, 255uy, this.direction))
+                elif skip then shadow.move()
+                else shadow.update(image, 255uy, this.direction)))
+            // Only a paint that came hot on the heels of another arms the deferred rebuild: a lone paint
+            // has already drawn the shadow it needs.
+            if recent && not skip && not shadowRefreshing && shadowWindow.IsSome && nudges.Count = 0 then
+                shadowPending <- true
+                shadowTimer.Stop()
+                shadowTimer.Start()
+            lastPaintAt <- paintClock.Elapsed.TotalMilliseconds
         finally
             image.bitmap.Dispose()
 
@@ -1082,6 +1110,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         dragScrollTimer.Dispose()
         destroyingEvent.Trigger()
         revealTimer.Dispose()
+        shadowTimer.Dispose()
         captureWatch.Dispose()
         titleTimer.Dispose()
         titleTip |> Option.iter(fun tip -> tip.Dispose())

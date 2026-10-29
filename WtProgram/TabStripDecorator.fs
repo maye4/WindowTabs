@@ -708,7 +708,9 @@ type TabStripDecorator(group:WindowGroup) as this =
                 this.ts.transparent <- false
                 
         member this.dragEnter dragInfo pt =
+            let queued = StartupTrace.now()
             this.invokeSync <| fun() -> 
+                StartupTrace.recordSpan "drag.enter.wait" queued
                 let dragInfo = dragInfo :?> TabDragInfo
                 let (Tab(hwnd)) = dragInfo.tab
                 let result = 
@@ -746,7 +748,9 @@ type TabStripDecorator(group:WindowGroup) as this =
                 this.ts.dragScrollPoint <- Some pt
 
         member this.dragExit() =
+            let queued = StartupTrace.now()
             this.invokeSync <| fun() ->
+                StartupTrace.recordSpan "drag.exit.wait" queued
                 this.ts.dragScrollPoint <- None
                 match dragInfoCell.value with
                 | Some(dragInfo) ->

@@ -11,27 +11,48 @@ module StartupTrace =
         if not(String.IsNullOrWhiteSpace configured) then configured
         elif exists (IO.Path.Combine(directory,"startup-trace.enabled")) then IO.Path.Combine(directory,"startup-trace.jsonl")
         else null
-    let private path = resolvePath (Environment.GetEnvironmentVariable("WINDOWTABS_STARTUP_TRACE")) AppDomain.CurrentDomain.BaseDirectory IO.File.Exists
+    let private startupPath = resolvePath (Environment.GetEnvironmentVariable("WINDOWTABS_STARTUP_TRACE")) AppDomain.CurrentDomain.BaseDirectory IO.File.Exists
+    /// A trace for work that happens long after startup: a tab joining or leaving a group, the drag
+    /// that does it, and the taskbar work it causes. Off unless asked for, like the startup trace, and
+    /// unlike it, it keeps recording for the whole run.
+    let private joinPath = resolvePath (Environment.GetEnvironmentVariable("WINDOWTABS_JOIN_TRACE")) AppDomain.CurrentDomain.BaseDirectory IO.File.Exists
+    let private path = if String.IsNullOrWhiteSpace joinPath then startupPath else joinPath
+    let private unlimited = not(String.IsNullOrWhiteSpace joinPath)
     let private clock = Stopwatch.StartNew()
     let private entries = Collections.Concurrent.ConcurrentQueue<string>()
     let mutable private writer : Threading.Timer option = None
     let private flush() =
-        try IO.File.WriteAllLines(path,entries.ToArray()) with _ -> ()
-        if clock.ElapsedMilliseconds>16000L then writer |> Option.iter(fun timer -> timer.Dispose())
+        try
+            if unlimited then
+                // Append what is queued: a run-long trace is never rewritten, and never stops.
+                let batch = ResizeArray<string>()
+                let mutable line = ""
+                while entries.TryDequeue(&line) do batch.Add line
+                if batch.Count > 0 then IO.File.AppendAllLines(path,batch)
+            else IO.File.WriteAllLines(path,entries.ToArray())
+        with _ -> ()
+        if not unlimited && clock.ElapsedMilliseconds>16000L then writer |> Option.iter(fun timer -> timer.Dispose())
     do
         if not(String.IsNullOrWhiteSpace path) then
             writer <- Some(new Threading.Timer(Threading.TimerCallback(fun _ -> flush()),null,1000,1000))
+    /// When the run-long trace began, for a span that started before the call that reports it.
+    let now() = clock.Elapsed.TotalMilliseconds
+    let private record (stage:string) (started:float) (duration:float) =
+        let record = JObject(JProperty("stage",stage),JProperty("startMs",started),
+                             JProperty("durationMs",duration),
+                             JProperty("thread",Threading.Thread.CurrentThread.ManagedThreadId))
+        entries.Enqueue(record.ToString(Formatting.None))
+    /// Reports a span measured from a timestamp taken before a cross-thread hop: the wait a group's
+    /// own thread cannot see, because it is the caller that waits.
+    let recordSpan (stage:string) (startedMs:float) =
+        if not(String.IsNullOrWhiteSpace path) then record stage startedMs (clock.Elapsed.TotalMilliseconds-startedMs)
     let measure (stage:string) action =
-        if String.IsNullOrWhiteSpace path || clock.ElapsedMilliseconds>15000L then action()
+        if String.IsNullOrWhiteSpace path || (not unlimited && clock.ElapsedMilliseconds>15000L) then action()
         else
             let started = clock.Elapsed.TotalMilliseconds
             let watch = Stopwatch.StartNew()
             try action()
-            finally
-                let record = JObject(JProperty("stage",stage),JProperty("startMs",started),
-                                     JProperty("durationMs",watch.Elapsed.TotalMilliseconds),
-                                     JProperty("thread",Threading.Thread.CurrentThread.ManagedThreadId))
-                entries.Enqueue(record.ToString(Formatting.None))
+            finally record stage started watch.Elapsed.TotalMilliseconds
 
 module RuntimeMetrics =
     let private gate = obj()

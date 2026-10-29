@@ -661,9 +661,13 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
 
     member this.tabColor hwnd = tabColors.TryFind hwnd
 
-    member private this.setTabInfo(hwnd) =
+    /// `fetchColor` is false when the caller is a join: the whole-group colour refresh that follows
+    /// already covers this window, and the first result was overwritten before anything painted.
+    member private this.setTabInfo(hwnd, ?fetchColor:bool) =
+        let fetchColor = defaultArg fetchColor true
         let isNew = not(this.ts.hasTabInfo(Tab(hwnd)))
-        if isNew then this.refreshTabColor(hwnd)
+        if isNew && fetchColor then
+            StartupTrace.measure "group.add.colorOne" (fun () -> this.refreshTabColor(hwnd))
         let info = this.getTabInfo(hwnd)
         let previous = this.ts.tabInfo(Tab(hwnd))
         if isNew || info.text <> previous.text || info.isRenamed <> previous.isRenamed ||
@@ -1132,7 +1136,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             let registerEvent evt = 
                 let handler = fun() -> this.main(hwnd, evt)
                 window.setWinEventHook evt handler
-            let hooks = 
+            let hooks = StartupTrace.measure "group.add.hooks" (fun () ->
                 List2([
                     WinEvent.EVENT_OBJECT_NAMECHANGE
                     WinEvent.EVENT_OBJECT_LOCATIONCHANGE
@@ -1144,14 +1148,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     WinEvent.EVENT_OBJECT_DESTROY
                     WinEvent.EVENT_OBJECT_CLOAKED
                     WinEvent.EVENT_OBJECT_UNCLOAKED
-                ]).map(registerEvent)
+                ]).map(registerEvent))
             let dispose = 
                 {
                     new IDisposable with
                         member this.Dispose() = hooks.iter(fun h -> h.Dispose())
                 }
             hookCleanup.map(fun hooks -> hooks.add hwnd dispose)
-            StartupTrace.measure "group.add.info" (fun () -> this.setTabInfo hwnd)
+            StartupTrace.measure "group.add.info" (fun () -> this.setTabInfo(hwnd, false))
             StartupTrace.measure "group.add.strip" (fun () -> this.ts.addTab(Tab(hwnd)))
             StartupTrace.measure "group.add.colors" this.refreshTabColors
             // Only a window that opens in the foreground has an opener. Windows found at

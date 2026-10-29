@@ -108,7 +108,7 @@ type GroupInfo(enableSuperBar, settings:ISettings, desktopDispatcher:IDispatcher
     member private this.removeWindow hwnd =
         if stagedAdds.Remove hwnd then
             windowsCell.map(fun windows -> windows.where((<>)hwnd))
-        this.invokeGroup <| fun() -> this.group.removeWindow(hwnd)
+        this.invokeGroup <| fun() -> StartupTrace.measure "group.remove" (fun () -> this.group.removeWindow(hwnd))
     /// Stage main-thread membership, then attach only after the source STA has finished cleanup.
     member this.addAfterDetaching(source:GroupInfo, hwnd:IntPtr) =
         if not(windowsCell.value.contains((=)hwnd)) then windowsCell.map(fun windows -> windows.append hwnd)
@@ -132,7 +132,7 @@ type GroupInfo(enableSuperBar, settings:ISettings, desktopDispatcher:IDispatcher
         else source.invokeGroup(fun () ->
             if not source.isExited then source.group.removeWindow hwnd
             desktopDispatcher.Post attach)
-    member private this.destroy() = this.invokeGroup <| fun() -> this.group.destroy()
+    member private this.destroy() = this.invokeGroup <| fun() -> StartupTrace.measure "group.destroy" (fun () -> this.group.destroy())
     member private x.switchWindow(next, force) = this.invokeGroup <| fun() -> this.group.switchWindow(next, force)
 
     interface IGroup with
