@@ -114,6 +114,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let nudgeClock = Diagnostics.Stopwatch()
     let nudgeTimer = new Timer(Interval=15)
     let mutable lastNudgeFrame = 0.0
+    /// The rounded offsets the last frame was drawn with: a frame that would draw the same pixels is
+    /// not worth the render, the upload and the shadow.
+    let mutable lastOffsets : int[] = [||]
     /// Waits out a press that handed the capture to the drag check, see WM_MOUSELEAVE.
     let captureWatch = new Timer(Interval=30)
     let mutable pointerSource : unit -> Point = fun () -> Cursor.Position
@@ -161,7 +164,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         showInsideExport.init()
 
         revealTimer.Tick.Add(fun _ -> this.stepReveal())
-        nudgeTimer.Tick.Add(fun _ -> this.stepNudge(true))
+        nudgeTimer.Tick.Add(fun _ -> this.stepNudge())
         dragScrollTimer.Tick.Add(fun _ ->
             match dragScrollLocation with
             | Some pt when this.isVertical && slideCell.value.IsSome ->
@@ -486,6 +489,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             this.window.update(image, this.location.add(this.renderedShift), 255uy)
             shadowWindow |> Option.iter (fun shadow ->
                 if reveal<1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
+                // A sliding row would rebuild the shadow's mask on every frame and upload it; the row
+                // settles in a sixth of a second, and the last frame draws the shadow it ends with.
+                elif nudges.Count > 0 then shadow.move()
                 else shadow.update(image, 255uy, this.direction))
         finally
             image.bitmap.Dispose()
@@ -815,7 +821,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             | Some at when at = index ->
                 // A move inside one slot changes nothing, but a slide may still be running and the
                 // drag starves the strip's timer, so the pointer path advances it here.
-                if nudges.Count > 0 then this.stepNudge(false)
+                if nudges.Count > 0 then this.stepNudge()
             | _ -> this.nudgeTo (current.move((=) ghost, index)) animate
         | None -> ()
 
@@ -838,8 +844,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             let vertical = this.isVertical
             fun (tab:Tab) ->
                 match nudges.TryGetValue tab with
-                | true,(from,_) ->
-                    let distance = int(Math.Round(TabNudge.offset from elapsed))
+                | true,(from,start) ->
+                    // Aged from this tab's own push: a second push starts at its full offset and eases
+                    // from there, instead of inheriting the age of the first.
+                    let distance = int(Math.Round(TabNudge.offset from (elapsed - start)))
                     if vertical then Pt(0,distance) else Pt(distance,0)
                 | _ -> Pt.empty
 
@@ -885,32 +893,48 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 pushed |> List.iter(fun (tab,from) -> nudges.[tab] <- (from, startedAt))
                 nudgeKey <- Some(this.nudgeRowKey after next.list)
                 if not nudgeTimer.Enabled then nudgeTimer.Start()
+        // The order change paints synchronously; counting it as the last frame keeps the pointer path
+        // and the timer from painting again a millisecond later.
+        if nudges.Count > 0 then lastNudgeFrame <- nudgeClock.Elapsed.TotalMilliseconds
         lorderCell.set next
 
     /// Advance the slides. Progress is read from the clock, never from tick counts: a tick that
     /// arrives late must not stretch or shorten the motion.
-    member private this.stepNudge (paintAlways:bool) =
+    member private this.stepNudge () =
         if nudges.Count > 0 then
-            if nudgeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
-                nudges.Clear()
-                nudgeKey <- None
-                nudgeTimer.Stop()
-                nudgeClock.Stop()
-            else
-                let nowMs = nudgeClock.Elapsed.TotalMilliseconds
-                let settled =
-                    nudges |> Seq.filter(fun entry -> nowMs - snd entry.Value >= TabNudge.duration)
-                           |> Seq.map(fun entry -> entry.Key) |> List.ofSeq
-                settled |> List.iter(fun tab -> nudges.Remove tab |> ignore)
-                // The pointer path paints at most once every 12 ms; the strip's own tick always does.
-                if paintAlways || nowMs - lastNudgeFrame >= 12.0 || nudges.Count = 0 then
-                    lastNudgeFrame <- nowMs
-                    if this.visible then this.paint()
-                    DragTrace.write(sprintf "NUDGE frame tabs=%d elapsed=%d" nudges.Count (int nowMs))
-                if nudges.Count = 0 then
+            let nowMs = nudgeClock.Elapsed.TotalMilliseconds
+            let settled =
+                nudges |> Seq.filter(fun entry -> nowMs - snd entry.Value >= TabNudge.duration)
+                       |> Seq.map(fun entry -> entry.Key) |> List.ofSeq
+            settled |> List.iter(fun tab -> nudges.Remove tab |> ignore)
+            // Every producer of a frame - the order change, the pointer, the timer - shares this one
+            // deadline, so a burst of pointer moves cannot repaint the row several times over.
+            let due = nowMs - lastNudgeFrame >= 12.0 || nudges.Count = 0
+            // A frame whose rounded offsets are the ones already drawn changes nothing on screen.
+            let offsets =
+                if due then nudges |> Seq.map(fun entry ->
+                                            let from,start = entry.Value
+                                            int(Math.Round(TabNudge.offset from (nowMs - start))))
+                                        |> Array.ofSeq |> Array.sort
+                else [||]
+            let changed = not(lastOffsets = offsets)
+            if due && changed then
+                if nudgeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
+                    nudges.Clear()
+                    nudgeKey <- None
                     nudgeTimer.Stop()
                     nudgeClock.Stop()
-                    nudgeKey <- None
+                else
+                    lastNudgeFrame <- nowMs
+                    lastOffsets <- offsets
+                    if this.visible then this.paint()
+                    DragTrace.write(sprintf "NUDGE frame tabs=%d elapsed=%d" nudges.Count (int nowMs))
+            elif due then lastNudgeFrame <- nowMs
+            if nudges.Count = 0 then
+                nudgeTimer.Stop()
+                nudgeClock.Stop()
+                nudgeKey <- None
+                lastOffsets <- [||]
     
     /// The tab a floating drag carries: where a strip that holds only this tab puts it, and how that
     /// strip draws it. That strip is the floating window's own, and not the one the drag started in —
