@@ -81,6 +81,20 @@ let main () =
             if direction=TabDown then expected.RotateFlip(RotateFlipType.RotateNoneFlipY)
             use actual = renderer.Render(width,height,mask,padding,direction)
             check (pixels actual = pixels expected) "Optimized shadow pixels differ from the original convolution"
+    // A strip as wide as its window with separate tabs: the render only visits the columns the tabs
+    // reach and the rows each column holds, and must still match the full convolution exactly.
+    for width,height,padding,offset in [900,52,30,300;1200,40,30,0;400,30,15,370] do
+        let mask = Array.init (width*height) (fun i ->
+            let x,y = i%width - offset,i/width
+            if x >= 0 && (x/60)%2=0 && y>3 then (if x%60<3 then 128uy else 255uy) else 0uy)
+        for direction in [TabUp;TabDown] do
+            let input = if direction=TabUp then mask else Array.init mask.Length (fun i -> mask.[(height-1-i/width)*width+i%width])
+            use expected = referenceShadow width height input padding
+            if direction=TabDown then expected.RotateFlip(RotateFlipType.RotateNoneFlipY)
+            use actual = renderer.Render(width,height,mask,padding,direction)
+            check (pixels actual = pixels expected) "A wide strip's shadow differs from the original convolution"
+    check (TabShadow.sameMask [|1uy;2uy|] [|1uy;2uy|] && not(TabShadow.sameMask [|1uy;2uy|] [|1uy;3uy|]) &&
+           not(TabShadow.sameMask [|1uy|] [|1uy;0uy|])) "Shadow masks compare wrongly"
     let padding = 15
     let width, height = 160, 26
     let mask = Array.init (width * height) (fun i ->

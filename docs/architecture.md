@@ -44,9 +44,11 @@ behind that call, while its UI remains responsive. Releasing a group does not wa
 for native calls and releases queue entries when outstanding work ends.
 
 Minimize/restore uses the same stream and acknowledges its own WinEvents to avoid
-feeding an older transition back into the group. Native animation settings are
-left unchanged. The placement queue publishes completion outside its lock; the
-owning group posts reconciliation to its STA without requiring another foreground
+feeding an older transition back into the group. Maximize/normal changes temporarily
+disable DWM transitions per window, restoring them after the last change settles;
+minimize animations and global animation preferences stay unchanged. The placement
+queue publishes completion outside its lock; the owning group posts reconciliation
+to its STA without requiring another foreground
 event. A 16 ms timer only acknowledges pending native minimize/restore events, with
 a one-second deadline per acknowledgement. It stops once those acknowledgements
 are resolved or expire, even if a native call remains blocked.
@@ -57,6 +59,10 @@ the strip after maximize/snap, preserving its auto-hide state and
 keeping its collapsed hover area above its owner. This does not activate the group.
 Maximized cross-monitor positioning still moves before applying
 placement; normal positioning still uses `MoveWindow` to preserve snapped bounds.
+Floating tab drags coalesce native moves on a worker. Entering another strip or
+releasing capture waits by callback, not by blocking the drag STA, until the
+in-flight move has returned. New pointer frames invalidate queued handoffs, and
+release preserves the newest pending strip entry before committing the drop.
 When a maximized follower returns to normal, restore it without activation, apply
 the source's actual bounds (its saved restore rectangle may predate snapping), and
 retain its native stacking position. The same stacking protection applies when

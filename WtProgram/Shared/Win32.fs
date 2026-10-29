@@ -121,6 +121,50 @@ module MoveHidden =
                     WinUserApi.ShowWindow(hwnd,cmd) |> ignore
                 WinUserApi.RemoveProp(hwnd,key) |> ignore
 
+/// A window WindowTabs maximizes into a group or restores out of one jumps to its new frame instead
+/// of playing the system's min/max animation: that animation grows or shrinks a large window over a
+/// few hundred milliseconds while the app repaints behind it, which reads as lag. DWM takes the
+/// setting from another process, and the window gets its animations back a moment later, once the
+/// change has been composed.
+module NoTransition =
+    let private settle = 1000L
+    let private gate = obj()
+    let private clock = Diagnostics.Stopwatch.StartNew()
+    /// Each window's timer and when its animations come back.
+    let private restoring = Collections.Generic.Dictionary<IntPtr,Threading.Timer * int64>()
+    let private set (hwnd:IntPtr) (disabled:bool) =
+        let mutable value = if disabled then 1 else 0
+        try DwmApi.DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE.DWMWA_TRANSITIONS_FORCEDISABLED, &value, sizeof<int>) |> ignore
+        with :? DllNotFoundException -> ()
+    let private restore (state:obj) =
+        let hwnd = state :?> IntPtr
+        lock gate (fun () ->
+            match restoring.TryGetValue hwnd with
+            // A suppress that came while this callback was queued has moved the time on.
+            | true,(timer,due) when clock.ElapsedMilliseconds >= due ->
+                restoring.Remove hwnd |> ignore
+                timer.Dispose()
+                if WinUserApi.IsWindow hwnd then set hwnd false
+            | true,(timer,due) ->
+                // Timer uses the coarse system clock, not Stopwatch. An early one-shot callback
+                // still needs another turn, or this window keeps transitions disabled forever.
+                timer.Change(max 1L (due-clock.ElapsedMilliseconds),int64 Threading.Timeout.Infinite) |> ignore
+            | _ -> ())
+
+    /// Call before the state change; repeated calls keep the animation off until the last one settles.
+    let suppress (hwnd:IntPtr) =
+        lock gate (fun () ->
+            set hwnd true
+            let due = clock.ElapsedMilliseconds + settle
+            match restoring.TryGetValue hwnd with
+            | true,(timer,_) ->
+                restoring.[hwnd] <- (timer,due)
+                timer.Change(settle,int64 Threading.Timeout.Infinite) |> ignore
+            | _ ->
+                let timer = new Threading.Timer(Threading.TimerCallback restore, box hwnd, Threading.Timeout.Infinite, Threading.Timeout.Infinite)
+                restoring.[hwnd] <- (timer,due)
+                timer.Change(settle,int64 Threading.Timeout.Infinite) |> ignore)
+
 type IWindow =
     abstract member hwnd : IntPtr
 
@@ -595,14 +639,22 @@ and
     member this.showNoActivate() = WinUserApi.ShowWindow(hwnd, ShowWindowCommands.SW_SHOWNOACTIVATE).ignore
 
     member this.update(image:Img, location:Pt, alpha) =       
-        use imageWithBg = new Bitmap(image.width, image.height)
-        do
-            use gfx = Graphics.FromImage(imageWithBg)
-            use brush = new SolidBrush(Color.Transparent)
-            gfx.FillRectangle(brush, new Rectangle(Point.Empty, image.size.Size))
-            gfx.DrawImage(image.bitmap, Point.Empty)
-        Win32Helper.UpdateLayeredWindow(hwnd, location.Point, imageWithBg, alpha)
-        this.showNoActivate()
+        // A 32-bit ARGB image at the screen's resolution is already what the layered window takes; the
+        // copy onto a transparent bitmap cost 4 ms a paint on a strip as wide as a 4K screen.
+        let bitmap = image.bitmap
+        if bitmap.PixelFormat = Imaging.PixelFormat.Format32bppArgb &&
+           bitmap.HorizontalResolution = 96.0f && bitmap.VerticalResolution = 96.0f then
+            Win32Helper.UpdateLayeredWindow(hwnd, location.Point, bitmap, alpha)
+        else
+            use imageWithBg = new Bitmap(image.width, image.height)
+            do
+                use gfx = Graphics.FromImage(imageWithBg)
+                use brush = new SolidBrush(Color.Transparent)
+                gfx.FillRectangle(brush, new Rectangle(Point.Empty, image.size.Size))
+                gfx.DrawImage(bitmap, Point.Empty)
+            Win32Helper.UpdateLayeredWindow(hwnd, location.Point, imageWithBg, alpha)
+        // Showing a window that is already shown is a ShowWindow call on every frame.
+        if not this.isVisible then this.showNoActivate()
     
     member this.updateLocation(location:Pt) =       
         Win32Helper.UpdateLayeredWindow(hwnd, location.Point)
@@ -715,8 +767,11 @@ and
     /// user sees centered under the cursor and a little below it. The drop uses the same
     /// anchor, so letting go where the pointer is does not move the window.
     member this.dragFollowRect(ptScreen:Pt) (size:Sz) =
-        let visible = Pt(ptScreen.x - size.width/2, ptScreen.y + this.dragAnchorY)
-        Rect(visible.add(this.dragFrameOffset), size)
+        Rect((this.dragVisibleAt ptScreen size : Pt).add(this.dragFrameOffset), size)
+
+    /// Where what the user sees of a window of this size starts while it follows the pointer.
+    member this.dragVisibleAt(ptScreen:Pt) (size:Sz) : Pt =
+        Pt(ptScreen.x - size.width/2, ptScreen.y + this.dragAnchorY)
 
     /// A window that covers its whole monitor, taskbar included, is running fullscreen of its own
     /// accord — a video player, or a browser in its own fullscreen. That is not the same state as
@@ -733,36 +788,43 @@ and
     /// placing keeps the normal rect as it was and leaves a maximized window restored. Never
     /// activates the window.
     member this.followDrag(ptScreen:Pt) (normalSize:Sz option) =
+        // The size is read before the placement is changed: un-maximizing overwrites rcNormalPosition,
+        // and it is what the drag falls back to when nothing remembered one for the window.
+        let size = this.dragSize ptScreen (normalSize |> Option.orElse (Some this.placement.rcNormalPosition.size))
+        this.followDragTo (this.dragVisibleAt ptScreen size) size
+
+    /// As followDrag, to a frame the caller has already worked out: what the user sees starts at
+    /// `visibleAt`, and the window is `size`. The anchor depends on the caller's DPI, which is kept per
+    /// thread, so a worker that moves the window for a drag thread is told the result instead.
+    member this.followDragTo (visibleAt:Pt) (size:Sz) =
         // Restored the way the tray restores a window: a maximized one has to come back to its own
         // size, but taking the foreground from the app the user is working in is not part of a drag.
         if this.isMinimized then this.showNoActivate()
+        let frame () = Rect(visibleAt.add(this.dragFrameOffset), size)
         // A maximized window refuses to be moved, so it is restored before the move below. Restoring it
         // the ordinary way puts the window's remembered size on screen for a frame first, and everything
         // around that smaller frame is background: measured 3866x2186 to 3236x1991 in one step, which
-        // was the size the drag was already heading for, so the drag flashed. The frame the user is
-        // looking at is taken first, and the restore lands on that instead.
-        let maximizedFrame = if this.isMaximized then Some(this.bounds) else None
-        // Read before the placement below is changed: un-maximizing overwrites rcNormalPosition, and this
-        // is the size the drag falls back to when nothing remembered one for the window.
-        let normalRect = this.placement.rcNormalPosition
-        // Un-maximize onto the frame that is already on screen, rather than onto the window's remembered
-        // normal rect: the drop sets the placement it wants anyway, so the rect used here is only a way
-        // to stop being maximized without changing what the user is looking at.
+        // was the size the drag was already heading for, so the drag flashed. The restore lands on the
+        // frame the drag is heading for instead, so the app lays itself out once rather than once for
+        // the restore and again for the move, and without the restore animation it arrives in one frame.
         //
         // rcNormalPosition is in workspace coordinates while bounds are on the screen: a window on a
         // monitor whose work area starts below or right of its display area is restored to the same
         // place the drop converts for, not shifted by the taskbar.
-        maximizedFrame
-        |> Option.iter(fun frame ->
+        if this.isMaximized then
+            let restored = frame()
             let workspaceOffset =
                 match Mon.fromHwnd hwnd with
                 | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
                 | None -> Pt()
             let wp = this.placement
+            NoTransition.suppress hwnd
             this.setPlacement { wp with showCmd = int ShowWindowCommands.SW_SHOWNOACTIVATE
                                         flags = 0
-                                        rcNormalPosition = Rect(frame.location.sub(workspaceOffset), frame.size) })
-        let rect = this.dragFollowRect ptScreen (this.dragSize ptScreen (normalSize |> Option.orElse (Some normalRect.size)))
+                                        rcNormalPosition = Rect(restored.location.sub(workspaceOffset), restored.size) }
+        // Measured again once restored: a maximized frame's invisible borders are not a restored one's,
+        // so the move below can still shift the window a few pixels, but never resizes it again.
+        let rect = frame()
         // One move, however far it is. A change of size used to be stepped over several frames, but
         // repainting a large window costs about 20 ms a frame, so the steps were few, uneven and
         // visibly separate: the window appeared to jump two or three times. The move itself is the

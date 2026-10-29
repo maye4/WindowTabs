@@ -265,6 +265,11 @@ module FollowerPlacement =
                 let place value =
                     if valid() then
                         positioned <- true
+                        // Maximizing a window into the group, or restoring it out of a maximized one,
+                        // lands at once instead of growing or shrinking through the system animation.
+                        let minimized = ShowWindowCommands.SW_SHOWMINIMIZED
+                        if value.showCmd<>minimized && actual.showCmd<>minimized && value.showCmd<>actual.showCmd then
+                            NoTransition.suppress hwnd
                         window.setPlacement(value)
                 // MoveWindow preserves the visible bounds of an Aero snapped window.
                 if wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL && actual.showCmd=ShowWindowCommands.SW_SHOWNORMAL then
@@ -278,10 +283,17 @@ module FollowerPlacement =
                     place {wp with showCmd=ShowWindowCommands.SW_SHOWNOACTIVATE}
                     move()
                 elif actual.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED && wp.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED then
-                    // Cross-monitor maximization requires moving before restoring placement.
-                    if actual<>wp || window.bounds<>target() then
+                    // Cross-monitor maximization requires moving before restoring placement. A
+                    // maximized frame never equals the work-area rect the group keeps, so comparing
+                    // the two moved and re-placed every maximized follower on each of the top
+                    // window's location changes, including every step of its own maximize. Only
+                    // another monitor or another restore rect is work to do.
+                    let frame = target()
+                    let elsewhere = Mon.fromHwnd hwnd <> Mon.fromPoint(Pt(frame.x+frame.width/2,frame.y+frame.height/2))
+                    if elsewhere then
                         move()
                         place wp
+                    elif actual.rcNormalPosition<>wp.rcNormalPosition then place wp
                 elif actual<>wp then place wp
                 if valid() && window.needsMinimizeAnchor then positioned <- true
                 window.prepareMinimizeAnchor(valid)
@@ -293,8 +305,9 @@ module FollowerPlacement =
                 // follower comes back larger than the group's frame and shows outside it until
                 // something places it again. One more move, after that handler has run, is what
                 // puts it back in the frame; it is not repeated, so an application that refuses the
-                // size keeps its own and no move loop starts.
-                if positioned && valid() && not window.isMinimized && window.bounds<>target() then
+                // size keeps its own and no move loop starts. A maximized window's frame is the
+                // system's, larger than the work area by its borders, and refuses a move anyway.
+                if positioned && valid() && not window.isMinimized && not window.isMaximized && window.bounds<>target() then
                     let refused = window.bounds
                     window.move(target())
                     let want = target()

@@ -240,12 +240,61 @@ type DragCapturedState(info:DragCapturedStateInfo) =
                 info.onDragOut(ptScreen)
         member this.dispose() = ()
 
+/// Moves the dragged window off the drag's thread. A move waits for the app to lay itself out, which
+/// for a large window or a slow app is longer than a pointer move, so the tab and the pointer stalled
+/// with it. Only the newest frame matters: one asked for while a move runs replaces any still waiting.
+type DragWindowMover(window:Window, ?moveWindow:Pt * Sz -> unit) =
+    let gate = obj()
+    let mutable wanted : (Pt * Sz) option = None
+    let mutable running = false
+    let mutable disposed = false
+    let mutable settled : (unit -> unit) option = None
+    let moveWindow = defaultArg moveWindow (fun (visibleAt,size) -> window.followDragTo visibleAt size)
+    let rec run () =
+        let next,after = lock gate (fun () ->
+            let next = wanted
+            wanted <- None
+            if next.IsNone then
+                running <- false
+                let after = settled
+                settled <- None
+                next,after
+            else next,None)
+        match next with
+        | Some(visibleAt,size) ->
+            (try if WinUserApi.IsWindow window.hwnd then moveWindow(visibleAt,size)
+             with error -> Diagnostics.Trace.TraceWarning("Drag move failed: {0}",error.Message))
+            run()
+        | None -> after |> Option.iter(fun action -> action())
+    /// Ask for the window to show at this frame; returns at once.
+    member this.request (visibleAt:Pt) (size:Sz) =
+        lock gate (fun () ->
+            if not disposed then
+                settled <- None
+                wanted <- Some(visibleAt,size)
+                if not running then
+                    running <- true
+                    Threading.ThreadPool.QueueUserWorkItem(fun _ -> run()) |> ignore)
+    /// Finish the in-flight native call before handing the window over, without blocking the UI.
+    member this.settle (after:unit -> unit) =
+        let now = lock gate (fun () ->
+            wanted <- None
+            if running then settled <- Some after; false
+            else true)
+        if now then after()
+    interface IDisposable with
+        member this.Dispose() = lock gate (fun () ->
+            disposed <- true
+            wanted <- None
+            settled <- None)
+
 type DragFloatingStateInfo = {
     targets: Map2<IntPtr, IDragDropTarget>
     /// The tab dragged out of a group leaves its window showing under the pointer, at its real
     /// size, until it is dropped or dragged back in.
     window : Window
     normalSize : Sz option
+    mover : DragWindowMover
     /// The tab that left the strip, drawn over the window for as long as it floats.
     tab : FloatingTab option
     onDragIn: (IntPtr * Pt) -> unit
@@ -254,8 +303,17 @@ type DragFloatingStateInfo = {
 type DragFloatingState(info:DragFloatingStateInfo) =
     let os = OS()
     member this.follow(ptScreen) =
-        info.window.followDrag(ptScreen) info.normalSize
-        info.tab |> Option.iter(fun tab -> tab.follow ptScreen info.window.visibleBounds)
+        // Worked out here, where the drag's DPI is, and handed to the mover. The tab sits on the frame
+        // asked for rather than the one the window has reached, so it follows the pointer even while
+        // the app is still laying itself out.
+        let window = info.window
+        let size = window.dragSize ptScreen (info.normalSize |> Option.orElse (Some window.placement.rcNormalPosition.size))
+        let visibleAt = window.dragVisibleAt ptScreen size
+        info.mover.request visibleAt size
+        // What is seen of that frame is smaller than the window by its invisible borders.
+        let bounds,visible = window.bounds,window.visibleBounds
+        let seen = Sz(size.width - (bounds.width - visible.width), size.height - (bounds.height - visible.height))
+        info.tab |> Option.iter(fun tab -> tab.follow ptScreen (Rect(visibleAt,seen)))
     interface IDragState with
         member this.mouseMove(ptScreen) =
             // The dragged window stays shown all the way to a target strip: hiding it when
@@ -293,6 +351,11 @@ type DragAction(info:DragActionInfo) =
     // A tab dragged out of a group shows its window under the pointer instead of a
     // shrunk drag image: the same window is moved back into a group, never parked.
     let dragWindowCell = Cell.create(None:Option<Window * Sz option>)
+    let mutable mover : DragWindowMover option = None
+    let invoker = InvokerService.invoker
+    let mutable handoff = 0L
+    let mutable awaitingMoves = false
+    let mutable pendingEnter : (IntPtr * Pt * bool) option = None
     let floatingTabCell = Cell.create(None:Option<FloatingTab>)
     let timer = new Timer()
     /// The end of the drag happens once, however many of the timer, the mouse-leave and the
@@ -304,7 +367,17 @@ type DragAction(info:DragActionInfo) =
 
     /// The drag has been released and its work is done. A flight that never arrived would otherwise
     /// hold the drag action for the life of the process, and no further drag could start.
-    member this.isSettled = ended
+    member this.isSettled = ended && not awaitingMoves
+
+    /// A queued handoff belongs to this pointer frame only; a later move or release replaces it.
+    member private this.afterMoves(action:unit -> unit) =
+        handoff <- handoff + 1L
+        let version = handoff
+        let complete () = if handoff=version then action()
+        match mover with
+        | Some mover -> mover.settle(fun () ->
+            if invoker.invokeRequired then invoker.asyncInvoke complete else complete())
+        | None -> complete()
 
     member this.setNextState(newState:obj) =
         let newState = unbox<IDragState>(newState)
@@ -327,52 +400,66 @@ type DragAction(info:DragActionInfo) =
             captureWindowCell.set None
             captureWindow |> Option.iter(fun window -> (window :?> IDisposable).Dispose())
             timer.Dispose()
-            let state = dragStateCell.value
-            dragStateCell.set None
-            state |> Option.iter(fun s -> s.dispose())
-            // The tab the hand let go of outlives the capture when a strip has taken it: that picture
-            // is what has to be seen arriving in the slot, and it is disposed when it gets there.
-            let tab = floatingTabCell.value
-            floatingTabCell.set None
-            // Asked before the drop commits: the strip's order already holds the tab in the slot its
-            // preview chose, and the shade drawn for it is still there to measure the slot against.
-            let landing, landingTarget =
-                // Reading the slot talks to the destination's thread, and that group can be gone by
-                // now (its last window closed during the drag). A throw here would skip the commit,
-                // leave the drag action uncleared — no further drag could start — and strand the
-                // overlay on screen.
+            awaitingMoves <- true
+            this.afterMoves(fun () ->
                 try
-                  match state with
-                  | Some(:? DragCapturedState as captured) -> captured.landing, Some captured.target
-                  | _ -> None, None
-                with _ -> None, None
-            // The sprite is built on mouse-down, before this drag proves to be one: a click that never
-            // moves would otherwise keep the tab's copied icon for the life of the process.
-            info.tab.release()
-            match state with
-            | Some(:? DragDetectingState) ->
-                this.land tab landing landingTarget info.onCancel
-            | Some(:? DragCapturedState) ->
-                info.targets.values.iter <| fun target -> target.dragEnd()
-                info.notifications.items.iter <| fun n -> n.dragEnd()
-                // Ending the drag is what lets discovery run, and discovery destroys a group that
-                // lost its last window - the very group whose thread is flying this picture. The
-                // flight is a timer on that thread, so it would die with it and the tab would cut
-                // instead of landing. The desktop hears the drag is over when the tab has arrived.
-                this.land tab landing landingTarget info.onEnd
-            | Some(:? DragFloatingState) ->
-                info.targets.values.iter <| fun target -> target.dragEnd()
-                info.notifications.items.iter <| fun n -> n.dragEnd()
-                // The drop places the same window made visible under the pointer; it is the
-                // user's window now, so nothing hides it afterwards.
-                info.onDrop(ptScreen)
-                // Nothing took the tab into a row: it was dropped on the desktop, so there is no slot
-                // to fly to and the picture goes at once.
-                this.land tab None None info.onEnd
-            | _ -> this.land tab None None ignore
-            // After the previews were told to clear: every strip that took one holds its own copy,
-            // and the drag's copy has no reader left.
-            DragIcon.release()
+                    try pendingEnter |> Option.iter(fun (hwnd,point,initial) -> this.enterTarget(hwnd,point,initial))
+                    with error -> Diagnostics.Trace.TraceWarning("Drag handoff failed: {0}",error.Message)
+                finally
+                    pendingEnter <- None
+                    this.finishCapture(ptScreen))
+
+    member private this.finishCapture(ptScreen) =
+        awaitingMoves <- false
+        let state = dragStateCell.value
+        dragStateCell.set None
+        state |> Option.iter(fun s -> s.dispose())
+        // The drop places the window where the last move was heading; nothing moves it after that.
+        mover |> Option.iter(fun mover -> (mover :> IDisposable).Dispose())
+        mover <- None
+        // The tab the hand let go of outlives the capture when a strip has taken it: that picture
+        // is what has to be seen arriving in the slot, and it is disposed when it gets there.
+        let tab = floatingTabCell.value
+        floatingTabCell.set None
+        // Asked before the drop commits: the strip's order already holds the tab in the slot its
+        // preview chose, and the shade drawn for it is still there to measure the slot against.
+        let landing, landingTarget =
+            // Reading the slot talks to the destination's thread, and that group can be gone by
+            // now (its last window closed during the drag). A throw here would skip the commit,
+            // leave the drag action uncleared — no further drag could start — and strand the
+            // overlay on screen.
+            try
+              match state with
+              | Some(:? DragCapturedState as captured) -> captured.landing, Some captured.target
+              | _ -> None, None
+            with _ -> None, None
+        // The sprite is built on mouse-down, before this drag proves to be one: a click that never
+        // moves would otherwise keep the tab's copied icon for the life of the process.
+        info.tab.release()
+        match state with
+        | Some(:? DragDetectingState) ->
+            this.land tab landing landingTarget info.onCancel
+        | Some(:? DragCapturedState) ->
+            info.targets.values.iter <| fun target -> target.dragEnd()
+            info.notifications.items.iter <| fun n -> n.dragEnd()
+            // Ending the drag is what lets discovery run, and discovery destroys a group that
+            // lost its last window - the very group whose thread is flying this picture. The
+            // flight is a timer on that thread, so it would die with it and the tab would cut
+            // instead of landing. The desktop hears the drag is over when the tab has arrived.
+            this.land tab landing landingTarget info.onEnd
+        | Some(:? DragFloatingState) ->
+            info.targets.values.iter <| fun target -> target.dragEnd()
+            info.notifications.items.iter <| fun n -> n.dragEnd()
+            // The drop places the same window made visible under the pointer; it is the
+            // user's window now, so nothing hides it afterwards.
+            info.onDrop(ptScreen)
+            // Nothing took the tab into a row: it was dropped on the desktop, so there is no slot
+            // to fly to and the picture goes at once.
+            this.land tab None None info.onEnd
+        | _ -> this.land tab None None ignore
+        // After the previews were told to clear: every strip that took one holds its own copy,
+        // and the drag's copy has no reader left.
+        DragIcon.release()
 
     /// Show the tab arriving: the picture the hand let go of flies from where it was drawn to the slot
     /// the strip marked, and the strip stops shading the slot once it is there. Only the arrival moves
@@ -430,6 +517,8 @@ type DragAction(info:DragActionInfo) =
             ptScreen
         match msg.msg with
         | WindowMessages.WM_MOUSEMOVE when not ended ->
+            handoff <- handoff + 1L
+            pendingEnter <- None
             // Moves queued behind the release are not part of the drag: acting on one re-opens a
             // preview in a strip that has already handled its end, and the shade it draws then has
             // no drop left to clear it.
@@ -443,26 +532,42 @@ type DragAction(info:DragActionInfo) =
         | _ -> ()
         msg.def()
 
-    /// A tab strip is dragged on its group's thread, which also owns the tab's window, so the
-    /// calls stay on that thread: going through an invoker would queue the moves behind the
-    /// captures this mouse hook holds. The source strip's handle names the dragged window.
+    /// The source strip's handle names the dragged window until its tab data has been captured.
     member private this.draggedWindow =
         dragWindowCell.value |> Option.map(fst) |> Option.defaultValue (os.windowFromHwnd(info.initialHwnd))
 
     member this.dragFloat(ptScreen) =
+        let window = this.draggedWindow
+        let windowMover =
+            match mover with
+            | Some existing -> existing
+            | None ->
+                let created = new DragWindowMover(window)
+                mover <- Some created
+                created
         let state = DragFloatingState({
             targets = info.targets
-            window = this.draggedWindow
+            window = window
             normalSize = dragWindowCell.value |> Option.map snd |> Option.flatten
+            mover = windowMover
             tab = floatingTabCell.value
             onDragIn = fun (targetHwnd, ptScreen) ->
                 this.dragEnter(targetHwnd, ptScreen, false)
         })
         this.setNextState state
         // The transition itself must show both pieces, even if the mouse stops here.
-        state.follow(ptScreen)
+        if not ended then state.follow(ptScreen)
 
     member this.dragEnter(targetHwnd, ptScreen, isInitial) =
+        pendingEnter <- Some(targetHwnd,ptScreen,isInitial)
+        // The strip places the window as soon as it takes the tab: a float move still on its way would
+        // land after that and pull the window back out of the group's frame.
+        this.afterMoves(fun () ->
+            if not ended then
+                pendingEnter <- None
+                this.enterTarget(targetHwnd,ptScreen,isInitial))
+
+    member private this.enterTarget(targetHwnd, ptScreen, isInitial) =
         let target = info.targets.find(targetHwnd)
         let targetWindow = os.windowFromHwnd(targetHwnd)
         let ptTarget = targetWindow.ptToClient(ptScreen)
@@ -481,7 +586,7 @@ type DragAction(info:DragActionInfo) =
             // The captured state holds the tab by the pointer; doing it now keeps the hand and the
             // picture in agreement from this frame on, instead of at the next mouse move.
             floatingTabCell.value |> Option.iter(fun tab -> tab.holdBy ptScreen)
-        else 
+        else
             if isInitial then target.dragExit()
             this.dragFloat(ptScreen)
 

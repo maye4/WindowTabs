@@ -19,6 +19,15 @@ let pumpUntil description predicate =
         satisfied <- predicate()
     check satisfied description
 
+/// Counts the position changes a window is asked for, refused ones included.
+type WindowPosCounter(hwnd:IntPtr) as this =
+    inherit NativeWindow()
+    do this.AssignHandle(hwnd)
+    member val count = 0 with get,set
+    override this.WndProc(m) =
+        if m.Msg = 0x0046 then this.count <- this.count + 1
+        base.WndProc(&m)
+
 let main() =
     // Explorer windows 1 and 3 are on desktop 1, window 4 on desktop 2; window 5's desktop is unknown.
     let desk1, desk2 = Guid.NewGuid(), Guid.NewGuid()
@@ -207,6 +216,18 @@ let main() =
             check followerWindow.isMaximized "A follower did not maximize"
             check (sourceWindow.zorder<followerWindow.zorder) "A maximized follower covered the originating tab"
             check (WinUserApi.GetActiveWindow()=snapSource.Handle) "Maximizing a follower changed the active tab"
+            // A follower already maximized on the group's monitor is left alone: re-placing it on every
+            // location change of a maximized top window cost two calls into its app each time.
+            do
+                let counter = WindowPosCounter(snapFollower.Handle)
+                try
+                    FollowerPlacement.queue.submit(snapQueueOwner,snapFollower.Handle,
+                        FollowerPlacement.alignBelowRequest snapFollower.Handle sourceWindow.bounds sourceWindow.placement snapSource.Handle)
+                    pumpUntil "Repeated maximized follower placement did not finish" (fun () -> FollowerPlacement.queue.isIdle(snapQueueOwner))
+                    Application.DoEvents()
+                    check (counter.count = 0)
+                          (sprintf "A maximized follower already in place was moved or re-placed %d times" counter.count)
+                finally counter.ReleaseHandle()
             // Combined Peek uses one preview owner per tab, below a common taskbar root.
             use sourcePreview = new Form(ShowInTaskbar=false)
             use followerPreview = new Form(ShowInTaskbar=false)
@@ -995,6 +1016,143 @@ let main() =
                 floatingSprite.release()
                 (floatingGroup :> IGroup).destroy()
                 pumpUntil "Floating-drag fixture group did not exit" (fun () -> floatingGroup.isExited)
+            // A maximized window dragged out is restored straight onto the frame the drag holds it at:
+            // one resize, no frame in between, and still under the pointer once its borders change.
+            do
+                use maximizedForm = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                             Bounds=Drawing.Rectangle(160,160,640,480))
+                maximizedForm.Show()
+                maximizedForm.WindowState <- FormWindowState.Maximized
+                let window = OS().windowFromHwnd maximizedForm.Handle
+                pumpUntil "Maximized-drag fixture did not maximize" (fun () -> window.isMaximized)
+                let sizes = Collections.Generic.List<Drawing.Size>()
+                maximizedForm.SizeChanged.Add(fun _ -> sizes.Add maximizedForm.Size)
+                let pointer = Pt(700,500)
+                window.followDrag pointer (Some(Sz(640,480)))
+                check (not window.isMaximized && window.bounds.size=Sz(640,480))
+                      "A maximized window dragged out did not come back at its own size"
+                check (sizes |> Seq.forall(fun size -> size=Drawing.Size(640,480)))
+                      (sprintf "A maximized window dragged out passed through other sizes: %A" (List.ofSeq sizes))
+                check (window.visibleBounds.y = pointer.y + Dpi.scale 12)
+                      "A maximized window dragged out does not sit a tab's middle below the pointer"
+            // A one-shot Timer can run before the Stopwatch deadline. Force that path without
+            // relying on the clocks disagreeing during this run; it must schedule its remaining time.
+            do
+                use form = new Form(ShowInTaskbar=false)
+                let hwnd = form.Handle
+                let moduleType = typeof<OS>.Assembly.GetType("Bemo.NoTransition")
+                let flags = Reflection.BindingFlags.Static ||| Reflection.BindingFlags.NonPublic ||| Reflection.BindingFlags.Public
+                let gate = moduleType.GetProperty("gate",flags).GetValue(null,null)
+                let restoring = moduleType.GetProperty("restoring",flags).GetValue(null,null)
+                                :?> Collections.Generic.Dictionary<IntPtr,Threading.Timer * int64>
+                NoTransition.suppress hwnd
+                lock gate (fun () ->
+                    let timer,_ = restoring.[hwnd]
+                    timer.Change(Timeout.Infinite,Timeout.Infinite) |> ignore
+                    moduleType.GetMethod("restore",flags).Invoke(null,[|box hwnd|]) |> ignore
+                    check (restoring.ContainsKey hwnd) "An early callback restored animations before their deadline")
+                pumpUntil "An early timer callback left window animations suppressed" (fun () ->
+                    lock gate (fun () -> not(restoring.ContainsKey hwnd)))
+            // The drag moves its window off the drag thread, newest frame only, and settles before a
+            // strip or the drop places it: after the settle the window is where the last request said.
+            do
+                use movedForm = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                         Bounds=Drawing.Rectangle(180,180,500,360))
+                movedForm.Show()
+                let window = OS().windowFromHwnd movedForm.Handle
+                let mover = new DragWindowMover(window)
+                for x in [200;260;320] do mover.request (Pt(x,240)) (Sz(520,380))
+                // The worker's moves are sent to this thread, which owns the form; pump until they land.
+                pumpUntil "The drag mover did not reach the last frame it was asked for" (fun () ->
+                    window.visibleBounds.location = Pt(320,240) && window.bounds.size = Sz(520,380))
+                let mutable settled = false
+                mover.settle(fun () -> Volatile.Write(&settled,true))
+                pumpUntil "The drag mover did not settle" (fun () -> Volatile.Read(&settled))
+                (mover :> IDisposable).Dispose()
+                (mover :> IDisposable).Dispose()
+                Application.DoEvents()
+                check (window.visibleBounds.location = Pt(320,240)) "A settled drag mover moved the window again"
+            // A slow move can last beyond the former 500 ms timeout. The UI does not wait for it,
+            // but neither a new group nor the desktop may place the window until it has returned.
+            do
+                use form = new Form(ShowInTaskbar=false)
+                let window = OS().windowFromHwnd form.Handle
+                use entered = new ManualResetEventSlim(false)
+                use resume = new ManualResetEventSlim(false)
+                use finished = new ManualResetEventSlim(false)
+                let applied = Collections.Concurrent.ConcurrentQueue<Pt>()
+                let callbacks = Collections.Concurrent.ConcurrentQueue<int>()
+                use mover = new DragWindowMover(window, moveWindow=(fun (point,_) ->
+                    entered.Set()
+                    resume.Wait()
+                    applied.Enqueue point))
+                try
+                    mover.request (Pt(10,10)) (Sz(100,100))
+                    check (entered.Wait(5000)) "The slow drag move did not start"
+                    mover.request (Pt(20,20)) (Sz(100,100))
+                    let clock = Diagnostics.Stopwatch.StartNew()
+                    mover.settle(fun () -> callbacks.Enqueue 1)
+                    check (clock.ElapsedMilliseconds < 250L) "Settling a drag blocked its UI thread"
+                    mover.settle(fun () ->
+                        callbacks.Enqueue 2
+                        applied.Enqueue(Pt(30,30))
+                        finished.Set())
+                    check (not(finished.Wait(600))) "A drag handed off while its old move was still running"
+                    resume.Set()
+                    check (finished.Wait(5000)) "The slow drag never handed its window over"
+                    check (callbacks.ToArray() = [|2|]) "A superseded drag handoff still ran"
+                    check (applied.ToArray() = [|Pt(10,10);Pt(30,30)|]) "A queued drag frame landed after the handoff"
+                finally
+                    resume.Set()
+                    finished.Wait(5000) |> ignore
+            // Releasing while a strip entry waits for that move must still commit into the strip,
+            // or fall back to a desktop drop if it refuses, never forget the pending destination.
+            for accepts in [true;false] do
+                use form = new Form(ShowInTaskbar=false)
+                let hwnd = form.Handle
+                use entered = new ManualResetEventSlim(false)
+                use resume = new ManualResetEventSlim(false)
+                use returned = new ManualResetEventSlim(false)
+                use mover = new DragWindowMover(OS().windowFromHwnd hwnd, moveWindow=(fun _ ->
+                    entered.Set()
+                    resume.Wait()
+                    returned.Set()))
+                let mutable joined,ended,dropped = 0,0,0
+                let target = { new IDragDropTarget with
+                    member _.dragBegin() = ()
+                    member _.dragEnd() = ()
+                    member _.dragEnter _ _ =
+                        check returned.IsSet "A strip took a drag before its native move finished"
+                        joined <- joined+1
+                        accepts
+                    member _.dragMove _ = ()
+                    member _.dragExit() = ()
+                    member _.dropLanding() = None
+                    member _.dragLanded() = ()
+                    member _.dropSettled() = () }
+                let action = DragAction({
+                    targets=Map2(List2([hwnd,target])); notifications=Set2(); initialHwnd=hwnd; initialPt=Pt()
+                    data=box (); tab={frame=(fun _ _ -> failwith "No overlay is needed for the handoff fixture");release=ignore}
+                    onCancel=ignore; onBegin=ignore; onDrop=(fun _ -> dropped <- dropped+1); onEnd=(fun () -> ended <- ended+1) })
+                let field = typeof<DragAction>.GetFields(Reflection.BindingFlags.NonPublic ||| Reflection.BindingFlags.Instance)
+                            |> Array.find(fun field -> field.FieldType=typeof<DragWindowMover option>)
+                field.SetValue(action,Some mover)
+                action.start()
+                try
+                    action.dragFloat(Pt(100,100))
+                    check (entered.Wait(5000)) "The deferred-drop move did not start"
+                    action.dragEnter(hwnd,Pt(120,120),false)
+                    action.captureEnded(Pt(120,120))
+                    check (joined=0 && ended=0 && not action.isSettled) "A released drag skipped its pending move"
+                    resume.Set()
+                    pumpUntil "A deferred drop did not finish" (fun () -> ended=1)
+                    check (joined=1 && action.isSettled) "Releasing a drag lost or repeated its pending strip entry"
+                    check (dropped=(if accepts then 0 else 1)) "A deferred strip drop chose the wrong destination"
+                finally
+                    resume.Set()
+                    returned.Wait(5000) |> ignore
+                    action.captureEnded(Pt(120,120))
+                    Application.DoEvents()
             printfn "PASS: real HWND grouping, duplicate add, reorder, cross-STA transfer, six cross-orientation drags, a floating drag out to the desktop, destroyed-window removal, ungrouping, taskbar recovery and taskbar icon rebuilds."
         finally
             let rest = desktopApi.groups.list |> List.map(fun g -> g :?> GroupInfo)
