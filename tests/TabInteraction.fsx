@@ -794,14 +794,32 @@ let main() =
                 let nudges = typeof<TabStrip>.GetField("nudges",nudgeFlags).GetValue(strip) :?> Collections.Generic.Dictionary<Tab,float*float*float>
                 check (nudges.ContainsKey joining && (let _,across,_ = nudges.[joining] in abs across >= 1.0))
                       "A tab joining the strip appeared without rising into its slot"
+                let fades = typeof<TabStrip>.GetField("fades",nudgeFlags).GetValue(strip) :?> Collections.Generic.Dictionary<Tab,float>
+                check (fades.ContainsKey joining) "A tab joining the strip appeared without fading in"
+                let fadeStarted = fades.[joining]
+                strip.previewDrop(Pt(0,size.height/2))
+                check (fades.ContainsKey joining && fades.[joining]=fadeStarted)
+                      "Moving a joining preview to another slot cancelled or restarted its fade"
+                strip.previewDrop far
                 Threading.Thread.Sleep(int TabNudge.duration+50)
                 strip.previewDrop far
                 check (nudges.Count = 0 && (strip.lorder.list |> List.last) = joining) "A joining tab never settled in its slot"
+                // The fade outlasts the slide; pointer moves must finish it even when no timer can run.
+                let fadeWasActive = fades.Count > 0
+                Threading.Thread.Sleep(int TabFade.duration+50)
+                let beforeFadeFinish = frames strip
+                strip.previewDrop far
+                check (fades.Count = 0) "A joining tab's fade never finished"
+                check (frames strip=beforeFadeFinish+(if fadeWasActive then 1L else 0L))
+                      "A pointer move did not paint the completed fade"
                 // A previewed tab leaving the strip lets the tabs it pushed aside slide back.
                 strip.previewDrop(Pt(0,size.height/2), false)
                 let pushedBack = strip.lorder.list |> List.item 1
+                let leavingNow() =
+                    typeof<TabStrip>.GetField("leaving",nudgeFlags).GetValue(strip) :?> (Img * Pt * float) option
                 strip.leavePreview joining
                 check (not (strip.tabs.contains joining) && strip.ghostTab.IsNone) "A leaving preview stayed in the strip"
+                check (Option.isSome (leavingNow())) "A preview tab that left the strip vanished instead of fading off it"
                 check (nudges.ContainsKey pushedBack && (let along,_,_ = nudges.[pushedBack] in along >= 1.0))
                       "The tabs a leaving preview had pushed aside jumped back instead of sliding"
                 let settle = Diagnostics.Stopwatch.StartNew()
@@ -809,6 +827,32 @@ let main() =
                     Application.DoEvents()
                     Threading.Thread.Sleep(2)
                 check (nudges.Count = 0) "The tabs a leaving preview had pushed aside never settled"
+                let shadeSettle = Diagnostics.Stopwatch.StartNew()
+                while Option.isSome (leavingNow()) && shadeSettle.ElapsedMilliseconds < 1000L do
+                    Application.DoEvents()
+                    Threading.Thread.Sleep(2)
+                check (Option.isNone (leavingNow())) "A leaving preview's shade never faded off the strip"
+                // Leaving during a fade must keep the opacity already drawn, not flash a solid shade.
+                strip.ghostTab <- Some(SystemIcons.Application.Clone() :?> Icon, joining)
+                strip.joinPreview(joining, far)
+                let nudgeClock = typeof<TabStrip>.GetField("nudgeClock",nudgeFlags).GetValue(strip) :?> Diagnostics.Stopwatch
+                nudgeClock.Stop()
+                let elapsed = nudgeClock.Elapsed.TotalMilliseconds
+                let opacity = 0.25f
+                let age = TabFade.duration*(1.0-Math.Pow(1.0-float opacity,1.0/3.0))
+                fades.[joining] <- elapsed-age
+                nudges.Clear()
+                strip.leavePreview joining
+                let shade,_,_ = leavingNow() |> Option.get
+                let maxAlpha =
+                    seq { for y in 0..shade.height-1 do for x in 0..shade.width-1 do yield int(shade.bitmap.GetPixel(x,y).A) }
+                    |> Seq.max
+                check (maxAlpha>0 && maxAlpha<=int(Math.Ceiling(float opacity*255.0)))
+                      "A preview leaving partway through its fade jumped to full opacity"
+                // A resize invalidates a departing picture just as it invalidates a slide.
+                strip.setPlacement(placement start (Sz(size.width+Dpi.scale 1,size.height)) false)
+                check (Option.isNone (leavingNow())) "A resized strip kept drawing a stale leaving preview"
+                strip.setPlacement(placement start size false)
                 strip.addTab joining
                 strip.setTabInfo(joining, joiningInfo)
                 // A growing side column moves its HWND when centred or bottom-aligned. Existing
@@ -836,10 +880,17 @@ let main() =
                         let along,across,_ = nudges.[staying]
                         check (int along=before.y-after.y && int across=before.x-after.x)
                               "A joining tab's nudge ignored the side column's changed screen origin"
-                        Threading.Thread.Sleep(int TabNudge.duration+50)
+                        Threading.Thread.Sleep(int(max TabNudge.duration TabFade.duration)+50)
                         strip.previewDrop endPoint
-                        check (nudges.Count=0) "A growing side column never settled"
-                        strip.ghostTab <- None
+                        check (nudges.Count=0 && fades.Count=0) "A growing side column never settled"
+                        let beforeLeave = strip.bounds.location.add(strip.tabLocation joining)
+                        strip.leavePreview joining
+                        match leavingNow() with
+                        | Some(_,at,_) ->
+                            check (strip.bounds.location.add(at)=beforeLeave)
+                                  "A leaving preview ignored the side column's changed screen origin"
+                        | None -> failwith "A side-column preview vanished instead of fading out"
+                        strip.addTab joining
                         strip.setTabInfo(joining,joiningInfo)
                 TabReveal.forced <- Some false
                 // Real popup HWNDs cover the strip; coordinate polling must respect their hit test.

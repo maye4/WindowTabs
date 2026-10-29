@@ -115,6 +115,15 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let nudgeClock = Diagnostics.Stopwatch()
     let nudgeTimer = new Timer(Interval=15)
     let mutable lastNudgeFrame = 0.0
+    /// Previews fading into the row after a join, and when each fade started on nudgeClock. A fade
+    /// is presentation state like a nudge: it only changes the frames this strip paints.
+    let fades = Collections.Generic.Dictionary<Tab,float>(HashIdentity.Structural)
+    /// The row the fades were started against; against any other row they mean nothing.
+    let mutable fadeKey : (Tab list * (float*float) * Sz * TabDock * TabDirection * int * int) option = None
+    /// The shade a leaving preview took out of the row, with where it was drawn and when its fade
+    /// started: drawn over the row while it fades, because the tab itself has already left.
+    let mutable leaving : (Img * Pt * float) option = None
+    let mutable leavingKey : (Tab list * (float*float) * Sz * TabDock * TabDirection * int * int) option = None
     /// Rebuilding the tab shadow is the most expensive part of a paint: it scans the whole strip bitmap
     /// for its mask and blurs it into a second layered window. A paint that follows another one closely
     /// only moves the shadow; the rebuild happens once the row has stopped changing.
@@ -509,7 +518,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 this.window.update(image, this.location.add(this.renderedShift), 255uy))
             // A burst of paints - a join, a slide, a resize - would rebuild the mask on every frame.
             let recent = paintClock.Elapsed.TotalMilliseconds - lastPaintAt < 40.0
-            let skip = (not shadowRefreshing) && (nudges.Count > 0 || shadowPending)
+            let animating = nudges.Count > 0 || fades.Count > 0 || leaving.IsSome
+            let skip = (not shadowRefreshing) && (animating || shadowPending)
             StartupTrace.measure "strip.paint.shadow" (fun () ->
               shadowWindow |> Option.iter (fun shadow ->
                 if reveal<1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
@@ -517,7 +527,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 else shadow.update(image, 255uy, this.direction)))
             // Only a paint that came hot on the heels of another arms the deferred rebuild: a lone paint
             // has already drawn the shadow it needs.
-            if recent && not skip && not shadowRefreshing && shadowWindow.IsSome && nudges.Count = 0 then
+            if recent && not skip && not shadowRefreshing && shadowWindow.IsSome && not animating then
                 shadowPending <- true
                 shadowTimer.Stop()
                 shadowTimer.Start()
@@ -529,7 +539,12 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
     member private this.renderAt collapsed : Img =
         try
-            let image = if collapsed then this.ts.renderCollapsed else this.ts.renderWith (this.nudgeShift())
+            let image =
+                if collapsed then this.ts.renderCollapsed
+                else
+                    let image = this.ts.renderWith (this.nudgeShift()) (this.fadeAlpha())
+                    this.drawLeaving image
+                    image
             if dimmedCell.value && not SystemInformation.HighContrast then
                 try Img(TabDimming.render this.appearance.tabNormalBgColor image.bitmap)
                 finally image.bitmap.Dispose()
@@ -850,7 +865,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             | Some at when at = index ->
                 // A move inside one slot changes nothing, but a slide may still be running and the
                 // drag starves the strip's timer, so the pointer path advances it here.
-                if nudges.Count > 0 then this.stepNudge()
+                this.stepNudge()
             | _ -> this.nudgeTo (current.move((=) ghost, index)) animate
         | None -> ()
 
@@ -859,14 +874,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member private this.nudgeRowKey (strip:TabStripSprite<Tab>) (order:Tab list) =
         (order, strip.layout, strip.size, strip.dock, strip.direction, strip.scrollOffset, Dpi.value())
 
+    /// Whether this strip draws frames an animation can show: on screen, fully open, and with
+    /// Windows' own animation effects left on.
+    member private this.animates =
+        TabReveal.enabled() && renderedFrames>0L && this.visible && reveal>=1.0 && not this.isShrunk
+
     /// How far each pushed tab is drawn from its settled slot right now. The zero shift costs one test.
     member private this.nudgeShift() : Tab -> Pt =
         if nudges.Count = 0 then (fun _ -> Pt.empty)
         elif nudgeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
-            nudges.Clear()
-            nudgeKey <- None
-            nudgeTimer.Stop()
-            nudgeClock.Stop()
+            this.stopAnimations()
             (fun _ -> Pt.empty)
         else
             let elapsed = nudgeClock.Elapsed.TotalMilliseconds
@@ -881,6 +898,54 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                     if vertical then Pt(across,along) else Pt(along,across)
                 | _ -> Pt.empty
 
+    /// How solid each tab is drawn: a tab a join preview has just put in the row fades in over a few
+    /// frames instead of standing solid in the first one.
+    member private this.fadeAlpha() : Tab -> float32 =
+        if fades.Count = 0 then (fun _ -> 1.0f)
+        elif fadeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
+            // The row changed under the fades: their times belong to tabs that are not where they were.
+            fades.Clear()
+            fadeKey <- None
+            (fun _ -> 1.0f)
+        else
+            let elapsed = nudgeClock.Elapsed.TotalMilliseconds
+            fun (tab:Tab) ->
+                match fades.TryGetValue tab with
+                | true,start -> float32(TabFade.progress (elapsed - start))
+                | _ -> 1.0f
+
+    /// A preview tab that has left the row is drawn off it, fading, instead of vanishing in the frame
+    /// the drag carried it away. It is drawn before the row is dimmed, so it dims with the row.
+    member private this.drawLeaving (image:Img) =
+        if leaving.IsSome && leavingKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
+            this.dropLeaving()
+        match leaving with
+        | Some(shade, at, start) ->
+            let alpha = float32(1.0 - TabFade.progress (nudgeClock.Elapsed.TotalMilliseconds - start))
+            if alpha > 0.0f then
+                use graphics = image.graphics
+                use attributes = new ImageAttributes()
+                attributes.SetColorMatrix(ColorMatrix(Matrix33 = alpha))
+                graphics.DrawImage(shade.bitmap,Rectangle(at.Point,shade.size.Size),0,0,shade.width,shade.height,GraphicsUnit.Pixel,attributes)
+        | None -> ()
+
+    member private this.dropLeaving() =
+        leaving |> Option.iter(fun (shade,_,_) -> shade.bitmap.Dispose())
+        leaving <- None
+        leavingKey <- None
+
+    /// Every preview animation and the picture it owns, for a row that changed under them or a strip
+    /// that is going away.
+    member private this.stopAnimations() =
+        nudges.Clear()
+        fades.Clear()
+        nudgeKey <- None
+        fadeKey <- None
+        this.dropLeaving()
+        nudgeTimer.Stop()
+        nudgeClock.Stop()
+        lastOffsets <- [||]
+
     /// A tab another group's drag brings in rises into its slot from the window edge while the tabs
     /// it makes room for slide aside, instead of the whole row re-laying in one frame.
     member this.joinPreview (tab:Tab, pt:Pt) =
@@ -891,6 +956,13 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             match ghostTabCell.value with
             | Some(_, ghost) when ghost = tab ->
                 this.nudgeFrom before origin (lorderCell.value.move((=) ghost, this.dropIndex pt)) (Some tab) true
+                if this.animates then
+                    // A new preview takes over from the shade the last one left.
+                    this.dropLeaving()
+                    if not nudgeClock.IsRunning then nudgeClock.Restart()
+                    fades.[tab] <- nudgeClock.Elapsed.TotalMilliseconds
+                    fadeKey <- Some(this.nudgeRowKey this.ts lorderCell.value.list)
+                    if not nudgeTimer.Enabled then nudgeTimer.Start()
             | _ -> ())
 
     /// The drag carries its tab away again: the preview goes, and the tabs it pushed aside slide back
@@ -898,11 +970,39 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.leavePreview (tab:Tab) =
         let before = this.ts
         let origin = this.location
+        // Caught while the row still holds the tab: it is the shade that row would have drawn.
+        let shade =
+            if this.animates && before.tabs.contains tab then
+                let shift = this.nudgeShift()
+                let alpha = this.fadeAlpha() tab
+                before.tabSprites.list
+                |> List.tryFind(fun (_,sprite) -> sprite.id = tab)
+                |> Option.bind(fun (location,sprite) ->
+                    try
+                        let drawn = if alpha < 1.0f then (FadedSprite(sprite, alpha) :> ISprite).render else sprite.render
+                        Some(drawn, origin.add(location).add(shift tab))
+                    with _ -> None)
+            else None
         this.withUpdate(fun () ->
             this.ghostTab <- None
             if this.tabs.contains tab then
                 this.removeTab tab
-                this.nudgeFrom before origin lorderCell.value None true)
+                match shade with
+                | Some(image, at) -> this.startLeaving image (at.sub(this.location))
+                | None -> ()
+                this.nudgeFrom before origin lorderCell.value None true
+            else shade |> Option.iter(fun (image,_) -> image.bitmap.Dispose()))
+        if leaving.IsSome && not nudgeTimer.Enabled then nudgeTimer.Start()
+
+    /// Draw the shade a leaving preview took out over the row while it fades off it.
+    member private this.startLeaving (image:Img) (at:Pt) =
+        this.dropLeaving()
+        if not nudgeClock.IsRunning then nudgeClock.Restart()
+        leaving <- Some(image, at, nudgeClock.Elapsed.TotalMilliseconds)
+        leavingKey <- Some(this.nudgeRowKey this.ts lorderCell.value.list)
+        // The order change paints this frame synchronously; counting it keeps the first tick from
+        // painting the same shade again a millisecond later.
+        lastNudgeFrame <- nudgeClock.Elapsed.TotalMilliseconds
 
     /// Record where the tabs are drawn now, before the order changes, so the ones the new order
     /// displaces slide into place instead of jumping. A tab pushed again starts from where it is
@@ -911,18 +1011,23 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
     /// `before` is the row as last drawn, which a joining tab is not part of yet; `rising` is that tab.
     member private this.nudgeFrom (before:TabStripSprite<Tab>) (origin:Pt) (next:List2<Tab>) (rising:Tab option) (animate:bool) =
-        let drawable =
-            animate && TabReveal.enabled() && renderedFrames>0L && this.visible &&
-            reveal>=1.0 && not this.isShrunk
+        let drawable = animate && this.animates
         if not drawable then
-            nudges.Clear()
-            nudgeKey <- None
-            nudgeTimer.Stop()
+            // Nothing this strip paints can show an animation: drop what the last one left behind
+            // rather than leave it waiting on a clock that is stopped.
+            this.stopAnimations()
         else
             let after = { this.ts with lorder = next }
-            if nudgeKey.IsSome && nudgeKey <> Some(this.nudgeRowKey before before.lorder.list) then
+            let beforeKey = Some(this.nudgeRowKey before before.lorder.list)
+            if nudgeKey.IsSome && nudgeKey <> beforeKey then
                 // The row changed under the slides: their offsets belong to a row that is gone.
                 nudges.Clear()
+            if fadeKey.IsSome && fadeKey <> beforeKey then
+                fades.Clear()
+            // A preview moving to another slot keeps its fade age; only unrelated row changes cancel it.
+            fades.Keys |> Seq.filter(fun tab -> not(after.tabs.contains tab)) |> List.ofSeq
+                       |> List.iter(fun tab -> fades.Remove tab |> ignore)
+            fadeKey <- if fades.Count > 0 then Some(this.nudgeRowKey after next.list) else None
             let along (pt:Pt) = if this.isVertical then pt.y else pt.x
             let across (pt:Pt) = if this.isVertical then pt.x else pt.y
             // Growing a centred or bottom-aligned side column moves the strip's origin too.
@@ -958,6 +1063,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                         if abs from >= 1.0 || abs fromAcross >= 1.0 then Some(tab, from, fromAcross) else None
                     | None when rising = Some tab -> Some(tab, 0.0, rise sprite)
                     | None -> None)
+            nudges.Clear()
+            nudgeKey <- None
             if pushed.Length > 0 then
                 if not nudgeClock.IsRunning then nudgeClock.Restart()
                 let startedAt = elapsed()
@@ -969,41 +1076,57 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         if nudges.Count > 0 then lastNudgeFrame <- nudgeClock.Elapsed.TotalMilliseconds
         lorderCell.set next
 
-    /// Advance the slides. Progress is read from the clock, never from tick counts: a tick that
-    /// arrives late must not stretch or shorten the motion.
+    /// Advance the slides and the fades. Progress is read from the clock, never from tick counts: a
+    /// tick that arrives late must not stretch or shorten the motion.
     member private this.stepNudge () =
-        if nudges.Count > 0 then
+        let active() = nudges.Count > 0 || fades.Count > 0 || leaving.IsSome
+        if active() then
             let nowMs = nudgeClock.Elapsed.TotalMilliseconds
             let settled =
                 nudges |> Seq.filter(fun entry -> let _,_,start = entry.Value in nowMs - start >= TabNudge.duration)
                        |> Seq.map(fun entry -> entry.Key) |> List.ofSeq
             settled |> List.iter(fun tab -> nudges.Remove tab |> ignore)
+            fades |> Seq.filter(fun entry -> nowMs - entry.Value >= TabFade.duration)
+                  |> Seq.map(fun entry -> entry.Key) |> List.ofSeq
+                  |> List.iter(fun tab -> fades.Remove tab |> ignore)
+            match leaving with
+            | Some(_,_,start) when nowMs - start >= TabFade.duration -> this.dropLeaving()
+            | _ -> ()
+            let running = active()
             // Every producer of a frame - the order change, the pointer, the timer - shares this one
             // deadline, so a burst of pointer moves cannot repaint the row several times over.
-            let due = nowMs - lastNudgeFrame >= 12.0 || nudges.Count = 0
-            // A frame whose rounded offsets are the ones already drawn changes nothing on screen.
+            let due = nowMs - lastNudgeFrame >= 12.0 || not running
+            // A frame whose rounded offsets and opacities are the ones already drawn changes nothing
+            // on screen.
             let offsets =
-                if due then nudges |> Seq.collect(fun entry ->
-                                            let along,across,start = entry.Value
-                                            [ int(Math.Round(TabNudge.offset along (nowMs - start)))
-                                              int(Math.Round(TabNudge.offset across (nowMs - start))) ])
-                                        |> Array.ofSeq |> Array.sort
+                if due then
+                    let slides =
+                        nudges |> Seq.collect(fun entry ->
+                                    let along,across,start = entry.Value
+                                    [ int(Math.Round(TabNudge.offset along (nowMs - start)))
+                                      int(Math.Round(TabNudge.offset across (nowMs - start))) ])
+                               |> Array.ofSeq |> Array.sort
+                    let opacities =
+                        fades |> Seq.map(fun entry -> int(Math.Round(TabFade.progress (nowMs - entry.Value) * 64.0)))
+                              |> Array.ofSeq |> Array.sort
+                    let shade =
+                        leaving |> Option.map(fun (_,_,start) -> int(Math.Round((1.0 - TabFade.progress (nowMs - start)) * 64.0)))
+                                |> Option.toArray
+                    Array.concat [slides; opacities; shade]
                 else [||]
-            // The frame a slide ends on always paints: the frames before it only moved the shadow, and
-            // this is the one that draws the shadow the row settles with. A slide that ran out between
-            // two frames would otherwise compare its empty offsets with the empty ones it started from.
-            let changed = nudges.Count = 0 || not(lastOffsets = offsets)
+            // The frame an animation ends on always paints: the frames before it only moved the shadow,
+            // and this is the one that draws the shadow the row settles with. An animation that ran out
+            // between two frames would otherwise compare its empty offsets with the ones it started from.
+            let changed = not running || not(lastOffsets = offsets)
             if due && changed then
-                if nudgeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
-                    nudges.Clear()
-                    nudgeKey <- None
-                    nudgeTimer.Stop()
-                    nudgeClock.Stop()
+                let rowKey = Some(this.nudgeRowKey this.ts lorderCell.value.list)
+                if (nudges.Count > 0 && nudgeKey <> rowKey) || (fades.Count > 0 && fadeKey <> rowKey) then
+                    this.stopAnimations()
                 else
                     lastNudgeFrame <- nowMs
                     lastOffsets <- offsets
-                    DragTrace.write(sprintf "NUDGE frame tabs=%d elapsed=%d" nudges.Count (int nowMs))
-                if nudges.Count = 0 then
+                    DragTrace.write(sprintf "NUDGE frame tabs=%d fades=%d elapsed=%d" nudges.Count fades.Count (int nowMs))
+                if not (active()) then
                     // A drag can starve the deferred timer too; finish its shadow in this paint.
                     shadowTimer.Stop()
                     shadowPending <- false
@@ -1012,11 +1135,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                     finally shadowRefreshing <- false
                 elif this.visible then this.paint()
             elif due then lastNudgeFrame <- nowMs
-            if nudges.Count = 0 then
-                nudgeTimer.Stop()
-                nudgeClock.Stop()
-                nudgeKey <- None
-                lastOffsets <- [||]
+        if not (active()) then this.stopAnimations()
     
     /// The tab a floating drag carries: where a strip that holds only this tab puts it, and how that
     /// strip draws it. That strip is the floating window's own, and not the one the drag started in —
@@ -1161,6 +1280,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         // A strip can be destroyed while a drag is previewing in it: that copy belongs to the strip,
         // and once the strip is gone nothing else can reach it.
         this.ghostTab <- None
+        this.stopAnimations()
+        nudgeTimer.Dispose()
         dragScrollTimer.Dispose()
         destroyingEvent.Trigger()
         revealTimer.Dispose()

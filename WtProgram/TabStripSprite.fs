@@ -122,6 +122,27 @@ type GhostTabSprite(body:unit -> Img, parts:List2<Pt * ISprite>) =
                 image.bitmap.Dispose()
         member this.children = List2()
 
+/// A tab drawn at part of its opacity, for a preview fading in or out of the row. The picture is
+/// rendered whole and then blended, so its icon and close button fade with the body.
+type FadedSprite(inner:ISprite, alpha:float32) =
+    interface ISprite with
+        member this.image =
+            let image = inner.render
+            try
+                let faded = Img(image.size)
+                try
+                    use graphics = faded.graphics
+                    use attributes = new ImageAttributes()
+                    attributes.SetColorMatrix(ColorMatrix(Matrix33 = alpha))
+                    graphics.DrawImage(image.bitmap,Rectangle(Point.Empty,image.size.Size),0,0,image.width,image.height,GraphicsUnit.Pixel,attributes)
+                    faded
+                with ex ->
+                    faded.bitmap.Dispose()
+                    raise ex
+            finally
+                image.bitmap.Dispose()
+        member this.children = List2()
+
 type IconSprite = {
     icon: Icon
     size: Sz
@@ -343,6 +364,15 @@ module TabNudge =
     /// ease the strip's own reveal uses, so the row settles the way the rest of it moves.
     let offset (from:float) (elapsed:float) =
         from*(1.0-TabReveal.ease(min 1.0 (max 0.0 (elapsed/duration))))
+
+/// A preview tab fading into the row, or the one a leaving preview took out fading off it. Longer
+/// than a nudge: a change of opacity reads as slower than the same amount of movement, and the
+/// ease settles most of it in the first half.
+module TabFade =
+    let duration = 250.0
+    /// How much of a fade has run `elapsed` ms after it started, eased as the nudges are.
+    let progress (elapsed:float) =
+        TabReveal.ease(min 1.0 (max 0.0 (elapsed/duration)))
 
 type TabDisplayInfo = {
     tint: Color option
@@ -1086,9 +1116,10 @@ type TabStripSprite<'id> when 'id : equality = {
 
     member private this.feet = this.feetWith (fun _ -> Pt.empty)
 
-    /// The row as it is drawn, with each tab shifted by `shift`: a drag preview pushing tabs aside
-    /// animates the pixels only, so every position query elsewhere stays settled.
-    member private this.spriteWith (shift:'id -> Pt) =
+    /// The row as it is drawn, with each tab shifted by `shift` and drawn at `fade` of its opacity:
+    /// a drag preview pushes and fades tabs by animating the pixels only, so every position query
+    /// elsewhere stays settled.
+    member private this.spriteWith (shift:'id -> Pt) (fade:'id -> float32) =
         {
             new ISprite with
             member x.image = this.bgImage
@@ -1099,15 +1130,19 @@ type TabStripSprite<'id> when 'id : equality = {
                     |> List.map(fun (location,sprite) -> location.add(shift sprite.id), sprite)
                     |> List.filter(fun (location,sprite) ->
                         not this.isVertical || (location.y<this.size.height && location.y+sprite.size.height>0))
-                List2(this.feetWith shift @ (tabs |> List.map(fun (location,sprite) -> location,sprite :> ISprite)))
+                    |> List.map(fun (location,sprite) ->
+                        let alpha = fade sprite.id
+                        if alpha<1.0f then location, (FadedSprite(sprite, alpha) :> ISprite)
+                        else location, (sprite :> ISprite))
+                List2(this.feetWith shift @ tabs)
         }
 
-    member this.sprite = this.spriteWith (fun _ -> Pt.empty)
+    member this.sprite = this.spriteWith (fun _ -> Pt.empty) (fun _ -> 1.0f)
 
     member this.renderTab tab = this.tabSprite(tab).render
 
-    member this.renderWith (shift:'id -> Pt) =
-        let image = (this.spriteWith shift).render
+    member this.renderWith (shift:'id -> Pt) (fade:'id -> float32) =
+        let image = (this.spriteWith shift fade).render
         if this.isVertical then
             use graphics = image.graphics
             use outline = this.columnOutline
@@ -1117,7 +1152,7 @@ type TabStripSprite<'id> when 'id : equality = {
             graphics.FillRectangle(clear,Rectangle(Point.Empty,image.size.Size))
         image
 
-    member this.render = this.renderWith (fun _ -> Pt.empty)
+    member this.render = this.renderWith (fun _ -> Pt.empty) (fun _ -> 1.0f)
 
     member this.collapsedHeight = max 1 (min this.size.height (Dpi.scale 4))
 
