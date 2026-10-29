@@ -144,14 +144,14 @@ type TabStripDecorator(group:WindowGroup) as this =
 
     /// Where this strip goes over a window whose visible frame is this, so a floating drag can ask
     /// the same question about the window it is carrying.
-    member private this.placementFor (visible:Rect) (maximized:bool) =
+    member private this.placementWith (appearance:TabAppearanceInfo) (visible:Rect) (maximized:bool) =
         let decorator =  {
             windowBounds = visible
             monitorBounds = Monitors.all().map(fun m -> m.workRect)
-            decoratorHeight = group.tabAppearance.tabHeight
-            decoratorHeightOffset = group.tabAppearance.tabHeightOffset
-            decoratorIndentFlipped = group.tabAppearance.tabIndentFlipped
-            decoratorIndentNormal = group.tabAppearance.tabIndentNormal
+            decoratorHeight = appearance.tabHeight
+            decoratorHeightOffset = appearance.tabHeightOffset
+            decoratorIndentFlipped = appearance.tabIndentFlipped
+            decoratorIndentNormal = appearance.tabIndentNormal
         }
         if this.ts.isVertical then
             let width = Dpi.scale (if this.ts.isIconOnly then 48 else this.ts.columnWidth)
@@ -159,6 +159,10 @@ type TabStripDecorator(group:WindowGroup) as this =
                                     alignment=this.ts.getAlignment TabUp,maximized=maximized)
         else
             { showInside=decorator.shouldShowInside; bounds=decorator.bounds }
+
+    /// Where this strip goes over a window whose visible frame is this, for this group's own scale.
+    member private this.placementFor (visible:Rect) (maximized:bool) =
+        this.placementWith group.tabAppearance visible maximized
 
     member this.placement = this.placementFor (group.bounds.value.def(Rect())) group.isMaximized.value
 
@@ -619,7 +623,9 @@ type TabStripDecorator(group:WindowGroup) as this =
                         // window alone puts it, which is the strip the drop leaves it with.
                         // Built now, not lazily: the tab is read while the strip still holds it, and
                         // the closures only carry what was read.
-                        let floatingTab = this.ts.floatingTab tab group.tabAppearance
+                        // Scaled per frame, inside the override that sets the monitor's scale: the
+                        // picture is drawn for the monitor the hand is over, not the one this drag began on.
+                        let floatingTab = this.ts.floatingTab tab (fun () -> group.logicalTabAppearance.scaled)
                         // The tab in the hand is always drawn as a floating window's tab: outside the
                         // frame, corners up. The source's own shape is the wrong thing to keep — a
                         // fullscreen or maximized window wears its row inside the title bar, and holding
@@ -631,12 +637,17 @@ type TabStripDecorator(group:WindowGroup) as this =
                         Services.dragDrop.beginDrag(this.ts.hwnd, ptScreen, dragInfo, {
                             // One placement per frame: it decides the picture, the slot, and the key that
                             // says whether the picture has to be drawn again at all.
-                            frame = fun (visible:Rect) ->
-                                let placement = { this.placementFor visible false with showInside = false }
-                                let offset = floatingTab.location placement.showInside placement.bounds.size
-                                box (placement.showInside, placement.bounds.size),
-                                floatingTab.image placement.showInside placement.bounds.size,
-                                Pt(placement.bounds.x + offset.x, placement.bounds.y + offset.y)
+                            frame = fun (dpi:int) (visible:Rect) ->
+                                // Laid for that monitor as well: the row's height and indents are its
+                                // scale's, so the picture sits on the window edge there too.
+                                let placement =
+                                    Dpi.withValue dpi (fun () ->
+                                        { this.placementWith group.logicalTabAppearance.scaled visible false with
+                                            showInside = false })
+                                let offset = floatingTab.location dpi placement.showInside placement.bounds.size
+                                box (dpi, placement.showInside, placement.bounds.size),
+                                Pt(placement.bounds.x + offset.x, placement.bounds.y + offset.y),
+                                (fun () -> floatingTab.image dpi placement.showInside placement.bounds.size)
                             release = floatingTab.release
                             })
                 | MouseMiddle ->

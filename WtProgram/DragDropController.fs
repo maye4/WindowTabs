@@ -65,15 +65,35 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// Where the picture's top-left corner is now. Tracked where the picture is placed, so the flight
     /// into a slot starts from what the hand can see rather than from where the pointer is.
     let mutable position = Pt()
+    /// The monitor whose scale the picture is drawn for, and its rect: read again only when the
+    /// pointer leaves that rect, which is once per crossing rather than once per move.
+    let mutable monitorRect = Rect()
+    let mutable dpi = Dpi.value()
+    /// The frame the picture was last laid over, so the captured phase can redraw without being
+    /// handed the window again.
+    let mutable lastVisible = Rect()
     /// The flight into a slot, if one is running. It belongs to the drag and goes with it.
     let mutable flight : Timer option = None
     let stopFlight () =
         flight |> Option.iter(fun timer -> timer.Stop(); timer.Dispose())
         flight <- None
-    let place (visible:Rect) =
-        let key, image, location = sprite.frame visible
+    /// The scale the picture is drawn for: the monitor the pointer is over. A pointer in the gap
+    /// between monitors keeps the last one, so the tab never falls back to the source monitor's size.
+    let dpiAt (pt:Pt) =
+        if monitorRect.containsPoint pt then dpi
+        else
+            (match Monitors.all().list |> List.tryFind(fun mon -> mon.displayRect.containsPoint pt) with
+             | Some mon -> monitorRect <- mon.displayRect
+             | None -> ())
+            dpi <- Dpi.forMonitorPoint pt
+            dpi
+    let place (pt:Pt) (visible:Rect) =
+        lastVisible <- visible
+        let key, location, render = sprite.frame (dpiAt pt) visible
         if not(obj.Equals(drawnFor, key)) then
+            let image = render()
             window.setImage(image)
+            DragTrace.write(sprintf "RESCALE dpi=%d size=%dx%d" dpi image.size.width image.size.height)
             // The grab point scales with the picture: a redraw of the same size leaves it alone, while
             // a strip that draws the tab wider or narrower moves the point with it.
             if isNull drawnFor || anchorSize <> image.size then anchor <- grabOffset image.size
@@ -84,7 +104,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// frame, so it always sits flush on the window's edge. Holding it by the grabbed point instead left
     /// a gap or an overlap between the two, by wherever the hand happened to close on the tab.
     member this.follow(ptScreen:Pt) (visible:Rect) =
-        let location = place visible
+        let location = place ptScreen visible
         position <- location
         window.setLocation(location)
         window.setIsVisible(true)
@@ -94,10 +114,15 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// first frame of a drag: the picture has to exist, but the tab belongs under the cursor, not at
     /// the row position of the window it was taken from.
     member this.takeHold(ptScreen:Pt) (visible:Rect) =
-        place visible |> ignore
+        place ptScreen visible |> ignore
         this.holdAt(ptScreen.sub(anchor))
-    /// Hold the tab at a screen point, keeping the picture it already has: over a strip the window
-    /// belongs to the group, so only the tab the user is holding follows the pointer.
+    /// Hold the tab by the grabbed point, redrawn for the monitor the hand is over. Over a strip the
+    /// window belongs to the group, so only the tab the user is holding follows the pointer - but it
+    /// still has to be the size of the monitor it is over, not of the one the drag began on.
+    member this.holdBy(ptScreen:Pt) =
+        if not lastVisible.size.isEmptyArea then place ptScreen lastVisible |> ignore
+        this.holdAt(ptScreen.sub(anchor))
+    /// Hold the tab at a screen point, keeping the picture it already has.
     member this.holdAt(location:Pt) =
         position <- location
         window.setLocation(location)
@@ -157,7 +182,6 @@ type DragCapturedStateInfo = {
     /// The tab the user is holding. The strip shows where it would land, and this keeps the tab
     /// itself under the pointer, so it does not escape the mouse the moment the group forms.
     tab : FloatingTab option
-    tabOffset : Pt
     onDragOut : Pt -> unit
     }
 
@@ -174,7 +198,7 @@ type DragCapturedState(info:DragCapturedStateInfo) =
             let dragBounds = info.targetWindow.bounds.inflate(dragOutDistance, dragOutDistance)
             if dragBounds.containsPoint(ptScreen) then
                 info.target.dragMove(info.targetWindow.ptToClient(ptScreen))
-                info.tab |> Option.iter(fun tab -> tab.holdAt(ptScreen.sub(info.tabOffset)))
+                info.tab |> Option.iter(fun tab -> tab.holdBy ptScreen)
             else
                 info.target.dragExit()
                 info.onDragOut(ptScreen)
@@ -407,19 +431,11 @@ type DragAction(info:DragActionInfo) =
         let targetWindow = os.windowFromHwnd(targetHwnd)
         let ptTarget = targetWindow.ptToClient(ptScreen)
         if target.dragEnter info.data ptTarget then
-            let tabOffset =
-                match floatingTabCell.value with
-                | Some tab -> tab.anchorOffset
-                | None ->
-                    match info.data with
-                    | :? TabDragInfo as dragInfo -> dragInfo.tabOffset
-                    | _ -> Pt()
             this.setNextState <| DragCapturedState({
                 target = target
                 targetHwnd = targetHwnd
                 targetWindow = targetWindow
                 tab = floatingTabCell.value
-                tabOffset = tabOffset
                 onDragOut = fun(ptScreen) -> 
                     let targetHwnd = os.windowAtPt(ptScreen).hwnd
                     match info.targets.tryFind(targetHwnd) with
@@ -428,7 +444,7 @@ type DragAction(info:DragActionInfo) =
             })
             // The captured state holds the tab by the pointer; doing it now keeps the hand and the
             // picture in agreement from this frame on, instead of at the next mouse move.
-            floatingTabCell.value |> Option.iter(fun tab -> tab.holdAt(ptScreen.sub(tabOffset)))
+            floatingTabCell.value |> Option.iter(fun tab -> tab.holdBy ptScreen)
         else 
             if isInitial then target.dragExit()
             this.dragFloat(ptScreen)

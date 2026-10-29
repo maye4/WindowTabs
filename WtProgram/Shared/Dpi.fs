@@ -20,6 +20,13 @@ module Dpi =
     /// GDI sizes point fonts at this DPI whatever the monitor.
     let system() = systemDpi.Value
     let set value = current.Value <- max 48 (min 768 value)
+    /// Draw for another monitor on this thread. The thread's own scale comes back whatever the
+    /// drawing throws, and nothing inside may Send to another thread: the override is the thread's,
+    /// not the call's.
+    let withValue dpi f =
+        let previous = current.Value
+        current.Value <- max 48 (min 768 dpi)
+        try f() finally current.Value <- previous
     let currentFactor() = float(value()) / 96.0
     let scaleAt dpi (value:int) = int(Math.Round(float value * float dpi / 96.0))
     let scale value = scaleAt (current.Value) value

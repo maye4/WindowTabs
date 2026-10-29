@@ -476,6 +476,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     // .scaled converts the stored logical pixels to physical ones. The stored
     // record stays logical because Settings writes it back to the settings file.
     member this.tabAppearance = appearanceSnapshot
+
+    /// The appearance before any scale was applied: a picture drawn for another monitor scales this
+    /// one, never the snapshot that is already scaled for this group's own. Read on the group's thread.
+    member this.logicalTabAppearance = logicalAppearance
     member this.geometryChanged = geometryChangedEvent.Publish
 
     member private this.withUpdate<'a> (f:unit -> 'a) : 'a =

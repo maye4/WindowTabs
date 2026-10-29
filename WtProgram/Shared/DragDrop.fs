@@ -29,10 +29,11 @@ type IDragDropTarget =
 /// under the pointer, so the tab has to come along: without it the window loses the chrome the
 /// strip drew for it the moment the pointer leaves.
 type DragTabSprite = {
-    /// The floating tab for a window whose visible frame is this: a key that changes exactly when the
-    /// picture or the slot has to change, the picture itself, and where it goes. One call per frame,
-    /// so the strip is asked for the placement once rather than once per part.
-    frame : Rect -> obj * Img * Pt
+    /// The floating tab for a window whose visible frame is this, drawn for the monitor whose scale is
+    /// given: a key that changes exactly when the picture or the slot has to change, where it goes, and
+    /// a thunk that draws it only when the key says the picture is not the one already held. One call
+    /// per frame, so the strip is asked for the placement once rather than once per part.
+    frame : int -> Rect -> obj * Pt * (unit -> Img)
     /// Frees what the picture needed while the drag ran: the tab's icon, which the group gives up
     /// with the tab and the drag had to copy.
     release : unit -> unit

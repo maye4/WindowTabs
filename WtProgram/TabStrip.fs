@@ -19,8 +19,10 @@ type ITabStripMonitor =
 /// What a floating drag carries: where the strip the drop leaves puts the tab, how that strip draws
 /// it, and the release that lets go of what the drag had to keep for the picture.
 type FloatingTabSprite = {
-    location : bool -> Sz -> Pt
-    image : bool -> Sz -> Img
+    /// Both take the scale of the monitor the picture is drawn for: the drag crosses monitors while
+    /// the strip that drew the tab never does.
+    location : int -> bool -> Sz -> Pt
+    image : int -> bool -> Sz -> Img
     release : unit -> unit
     }
 
@@ -808,7 +810,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     /// a maximized window's strip is as wide as the screen, keeps room for the caption buttons and
     /// draws its row inside the title bar, which runs the other way round. Laid out and drawn for the
     /// strip it left, a centred tab landed at the far right of the screen with the corners flipped.
-    member this.floatingTab (tab:Tab) (appearance:TabAppearanceInfo) : FloatingTabSprite =
+    member this.floatingTab (tab:Tab) (appearanceAt:unit -> TabAppearanceInfo) : FloatingTabSprite =
         let strip = this.tsBase this.direction
         // Read once, here, while the strip still holds the tab: the drag gives it up as soon as it
         // leaves, and with it the display info both the slot and the picture are read from. The icon
@@ -816,20 +818,30 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         // still to be drawn for the window that floats — so the drag keeps a copy of its own.
         let display = strip.tabs.find(tab)
         let icon = display.icon.Clone() :?> Icon
-        let solo =
+        let style = display.textFont.Style
+        // One font per monitor this drag is drawn for. The strip's own fonts belong to the strip's
+        // scale, and a picture drawn for another monitor must not borrow them - they are also the
+        // fonts a DPI change on that strip replaces.
+        let fonts = Collections.Generic.Dictionary<int,Font>()
+        let fontAt dpi (appearance:TabAppearanceInfo) =
+            match fonts.TryGetValue dpi with
+            | true, font -> font
+            | _ ->
+                let font = TabMetrics.font appearance.tabHeight style
+                fonts.[dpi] <- font
+                font
+        let at dpi (appearance:TabAppearanceInfo) showInside size =
+            let direction = if showInside then TabDown else TabUp
             { strip with
                 appearance = appearance
-                tabs = Map2(List2([tab, { display with icon = icon }]))
+                tabs = Map2(List2([tab, { display with icon = icon; textFont = fontAt dpi appearance }]))
                 lorder = List2([tab])
                 zorder = List2([tab])
                 slide = None
                 held = None
                 hover = None
                 captured = None
-                scrollOffset = 0 }
-        let at showInside size =
-            let direction = if showInside then TabDown else TabUp
-            { solo with
+                scrollOffset = 0
                 size = size
                 direction = direction
                 // Alignment is a per-direction setting: carried into the other direction unchanged, the
@@ -838,9 +850,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 centerShift =
                     if showInside then float(appearance.tabIndentFlipped - appearance.tabIndentNormal) / 2.0
                     else 0.0 }
-        { location = (fun showInside size -> (at showInside size).tabLocation tab)
-          image = (fun showInside size -> (at showInside size).renderTab tab)
-          release = (fun () -> icon.Dispose()) }
+        // Everything inside the override reads that monitor's scale: the appearance, the row the tab
+        // is laid in, and the cache key the body is stored under.
+        let forDpi dpi showInside size =
+            Dpi.withValue dpi (fun () -> at dpi (appearanceAt()) showInside size)
+        { location = (fun dpi showInside size -> (forDpi dpi showInside size).tabLocation tab)
+          image = (fun dpi showInside size -> (forDpi dpi showInside size).renderTab tab)
+          release = (fun () ->
+                        icon.Dispose()
+                        fonts.Values |> Seq.iter(fun font -> font.Dispose())
+                        fonts.Clear()) }
 
     member this.setTabBgColor((tab, color)) =
         if tabBgColor.value.tryFind(tab) <> color then
