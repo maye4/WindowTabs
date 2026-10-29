@@ -28,6 +28,14 @@ type WindowPosCounter(hwnd:IntPtr) as this =
         if m.Msg = 0x0046 then this.count <- this.count + 1
         base.WndProc(&m)
 
+/// A slow application starts its maximize well after the group submitted its placement.
+type SlowMaximizeForm() =
+    inherit Form()
+    member val delay = 0 with get,set
+    override this.WndProc(m) =
+        if m.Msg=0x0005 && m.WParam=IntPtr(2) && this.delay>0 then Thread.Sleep(this.delay)
+        base.WndProc(&m)
+
 let main() =
     // Explorer windows 1 and 3 are on desktop 1, window 4 on desktop 2; window 5's desktop is unknown.
     let desk1, desk2 = Guid.NewGuid(), Guid.NewGuid()
@@ -684,6 +692,62 @@ let main() =
                 check (side<64 || span>=side/2)
                       (sprintf "A minimized tab's thumbnail icon spans %d of %d pixels, not about %d" span stand.Width side)
             WinUserApi.ShowWindow(d, ShowWindowCommands.SW_SHOWNOACTIVATE) |> ignore
+            // A window joining a maximized group grows into the frame through the system's expand
+            // animation, which draws over the strip until it ends: the strip is held above it and
+            // returns over the group's top window afterwards.
+            keyboardSource.showWindow(ShowWindowCommands.SW_SHOWMAXIMIZED)
+            pumpUntil "A maximized group did not settle before a join" (fun () ->
+                onGroup combined (fun group -> group.isPlacementIdle) &&
+                [a;b;d] |> List.forall(fun hwnd -> OS().windowFromHwnd(hwnd).isMaximized))
+            let stripWindow() = OS().windowFromHwnd(onGroup combined (fun group -> group.ts.hwnd))
+            use arriving = new SlowMaximizeForm(Text="Arriving", ShowInTaskbar=false, StartPosition=FormStartPosition.Manual,
+                                                Bounds=Drawing.Rectangle(120,120,640,480))
+            arriving.Show()
+            let e = arriving.Handle
+            OS().windowFromHwnd(e).showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            arriving.delay <- 450
+            onGroup combined (fun group -> group.addWindow(e,false))
+            check (stripWindow().isTopMost) "A joining member's expand animation covered the strip"
+            pumpUntil "A joining member did not take the maximized frame" (fun () ->
+                onGroup combined (fun group -> group.isPlacementIdle) && OS().windowFromHwnd(e).isMaximized)
+            let settled = Diagnostics.Stopwatch.StartNew()
+            while settled.ElapsedMilliseconds<150L do
+                Application.DoEvents()
+                check (stripWindow().isTopMost) "A slow placement released the strip before its animation settled"
+                Thread.Sleep(5)
+            pumpUntil "The strip did not return over its group after the expand animation" (fun () ->
+                let strip = stripWindow()
+                let top = OS().windowFromHwnd(onGroup combined (fun group -> group.topWindow))
+                not strip.isTopMost && strip.isVisible && strip.zorder<top.zorder)
+            // The tab a drag carries is topmost too: a held strip sits directly under it, where the
+            // hand can still see the tab it is holding, and stays above the frame changing size.
+            use carried = new Form(Text="Carried", ShowInTaskbar=false, TopMost=true,
+                                   StartPosition=FormStartPosition.Manual, Bounds=Drawing.Rectangle(200,200,160,40))
+            use carrying = new Form(Text="Carrying", ShowInTaskbar=false,
+                                    StartPosition=FormStartPosition.Manual, Bounds=Drawing.Rectangle(240,240,640,480))
+            carried.Show()
+            carrying.Show()
+            let f = carrying.Handle
+            OS().windowFromHwnd(f).showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            DragTabWindow.set carried.Handle
+            try
+                onGroup combined (fun group -> group.addWindow(f,false))
+                let heldStrip = stripWindow()
+                let carriedWindow = OS().windowFromHwnd(carried.Handle)
+                let top = OS().windowFromHwnd(onGroup combined (fun group -> group.topWindow))
+                check (heldStrip.isTopMost && carriedWindow.zorder<heldStrip.zorder && heldStrip.zorder<top.zorder)
+                      (sprintf "A held strip did not sit under the tab a drag carries: carried=%d strip=%d top=%d"
+                               carriedWindow.zorder heldStrip.zorder top.zorder)
+                onGroup combined (fun group -> group.removeWindow f)
+                pumpUntil "A member added during a drag stayed in its group" (fun () ->
+                    not(nativeOrder combined |> List.contains f))
+            finally DragTabWindow.clear carried.Handle
+            pumpUntil "The strip stayed topmost after the drag ended" (fun () -> not(stripWindow().isTopMost))
+            arriving.Dispose()
+            onGroup combined (fun group -> group.removeWindow e)
+            check (not(stripWindow().isTopMost)) "Closing a tab raised the maximized group's strip over other applications"
+            pumpUntil "A member leaving a maximized group stayed in it" (fun () ->
+                nativeOrder combined = [a;b;d] && onGroup combined (fun group -> group.isPlacementIdle))
             onGroup combined (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
             pumpUntil "Taskbar proxies outlived their combined taskbar button" (fun () -> not(TaskbarProxies.contains proxy.Head))
             check ([a;b;d] |> List.forall WinUserApi.IsWindow) "Removing Peek proxies destroyed application windows"

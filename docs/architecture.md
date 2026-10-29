@@ -53,7 +53,12 @@ a one-second deadline per acknowledgement. It stops once those acknowledgements
 are resolved or expire, even if a native call remains blocked.
 Reconciliation also puts the strip immediately above its owner even when neither
 the owner nor the group's tab order changed: native visibility alone does not
-mean the strip is above restored windows. Placement completion also reconciles
+mean the strip is above restored windows. A placement that grows or shrinks a member
+through the system's maximize or restore animation holds the strip at the top of the
+z-order for that animation — held for 350 ms after the placement queue becomes idle,
+capped at 1.5 seconds from the first request — directly under the window holding
+the tab a drag carries, which is topmost itself, and then puts it back above the
+owner. Placement completion also reconciles
 the strip after maximize/snap, preserving its auto-hide state and
 keeping its collapsed hover area above its owner. This does not activate the group.
 Maximized cross-monitor positioning still moves before applying

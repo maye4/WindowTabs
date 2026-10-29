@@ -284,6 +284,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     let mutable reconcilePlacementState = false
     /// The tab the group was last minimized from, which comes back first.
     let mutable minimizedFrom : IntPtr option = None
+    /// A window taking the group's maximized frame, or giving it back, grows or shrinks through the
+    /// system's animation, which draws over the strip that shares the frame. The strip goes to the top
+    /// of the z-order for that time and returns over the top window when it is over.
+    let stripHoldMillis = 350L
+    let stripHoldLimitMillis = 1500L
+    let stripHoldTimer = new System.Windows.Forms.Timer(Interval=25)
+    let mutable stripHoldDue = 0L
+    let mutable stripHoldLimit = 0L
     let transitionClock = Stopwatch.StartNew()
     let iconCache = new WindowIconCache(invoker :> IDispatcher,fun hwnd ->
         Cell.beginUpdate()
@@ -317,6 +325,41 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         with get() = System.Threading.Volatile.Read(&token)
         and set value = System.Threading.Volatile.Write(&token,value)
 
+    /// Raises the strip out of the animation's way. The tab a drag carries is topmost too, and the
+    /// strip moving above it would cover the tab in the hand for as long as the hold lasts.
+    member private this.raiseHeldStrip(strip:Window) =
+        if not strip.isTopMost then strip.makeTopMost()
+        let dragged = DragTabWindow.current()
+        if dragged<>IntPtr.Zero && dragged<>strip.hwnd && WinUserApi.IsWindow dragged then
+            strip.insertAfter(dragged)
+
+    /// Call before a placement that grows or shrinks a member through the system's animation: nothing
+    /// below the animating frame is seen until it ends, the strip included.
+    member private this.holdStripOverAnimation() =
+        if not isDestroyed.value then
+            let now = transitionClock.ElapsedMilliseconds
+            if stripHoldLimit=0L then stripHoldLimit <- now + stripHoldLimitMillis
+            // An application that refuses the state asked for would otherwise keep the strip above the
+            // desktop; the last placement settles it long before the limit.
+            if now < stripHoldLimit then
+                this.raiseHeldStrip(this.os.windowFromHwnd(this.ts.hwnd))
+                stripHoldDue <- now + stripHoldMillis
+                stripHoldTimer.Start()
+
+    /// Puts a held strip back over the group's top window, and never before the animation it was held
+    /// for has had its time.
+    member private this.releaseStripHold() =
+        if stripHoldLimit>0L && not isDestroyed.value then
+            let now = transitionClock.ElapsedMilliseconds
+            let placed = FollowerPlacement.queue.isIdle(placementOwner) && not reconcilePlacementState
+            if (now >= stripHoldDue && placed) || now >= stripHoldLimit then
+                stripHoldTimer.Stop()
+                stripHoldDue <- 0L
+                stripHoldLimit <- 0L
+                let strip = this.os.windowFromHwnd(this.ts.hwnd)
+                if strip.isTopMost then strip.makeNotTopMost()
+                if not this.isEmpty then this.setTsParent(this.topWindow)
+
     member private this.finishPlacementReconciliation() =
         if not isDestroyed.value then
             // WinEvents report the start of restoration, before ShowWindow and its
@@ -347,6 +390,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                 if not this.isEmpty then this.setTsParent(this.topWindow)
             if reconcilePlacementState && FollowerPlacement.queue.isIdle(placementOwner) then
                 reconcilePlacementState <- false
+                // A queued or slow native placement may start its animation long after submission.
+                // Give its last frame time to settle too, within the original hard deadline.
+                if stripHoldLimit>0L then stripHoldDue <- transitionClock.ElapsedMilliseconds + stripHoldMillis
                 this.withUpdate(fun () -> this.updateIsVisible())
                 if not this.isEmpty then this.setTsParent(this.topWindow)
             if pendingMinimizeStates.Count=0 then minimizeStateTimer.Stop()
@@ -364,6 +410,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     pendingMinimizeStates.Remove(hwnd) |> ignore
                     this.main(hwnd,if minimized then WinEvent.EVENT_SYSTEM_MINIMIZESTART else WinEvent.EVENT_SYSTEM_MINIMIZEEND)
             this.finishPlacementReconciliation())
+        stripHoldTimer.Tick.Add(fun _ -> this.releaseStripHold())
 
         winEventHandler.set(Some(
             _os.setSingleWinEvent WinEvent.EVENT_SYSTEM_FOREGROUND <| fun(hwnd) -> 
@@ -701,8 +748,12 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         // Restore can leave an owned popup visible but behind its unchanged owner.
         // Keep it adjacent to that window without activating or raising the group.
         if parentHwnd<>IntPtr.Zero && not parent.isMinimized then
-            let previous = parent.prevZorder
-            if previous.hwnd<>strip.hwnd then strip.insertAfter(previous)
+            // Inserting the strip after a plain window would drop a held strip out of the top band,
+            // where the animating frame it is held over still draws beneath it.
+            if stripHoldLimit>0L then this.raiseHeldStrip(strip)
+            else
+                let previous = parent.prevZorder
+                if previous.hwnd<>strip.hwnd then strip.insertAfter(previous)
         this.ts.refreshShadow()
         
     member this.isIconOnly 
@@ -826,6 +877,11 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             | _ -> false
         if placement.value.IsSome && not changingMinimizeState then
             let bounds,wp,visible = placement.value.Value
+            let window = this.os.windowFromHwnd(hwnd)
+            // A member joining the group's maximized frame, or giving it up, animates into or out of
+            // it; the strip is held over that animation rather than left under it.
+            if not window.isMinimized && (wp.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED) <> window.isMaximized then
+                this.holdStripOverAnimation()
             let below = zorderCell.value.tryHead |> Option.filter((<>) hwnd)
             let request =
                 if MoveHidden.holds hwnd then FollowerPlacement.alignHiddenFrameRequest hwnd bounds visible wp below
@@ -1184,6 +1240,11 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             let foreground = this.os.foreground.hwnd
             let next = TabNavigation.closeTarget this.lorder.list isOpen hwnd foreground lastActiveTab opener (this.leftOnClose hwnd)
             if opener |> Option.exists(fun (tab,owner) -> tab=hwnd || owner=hwnd) then opener <- None
+            // Only a live tab leaving in a drag restores its frame. Closing or regrouping a tab
+            // must not raise a background group's strip over the foreground application.
+            if DragTabWindow.current()<>IntPtr.Zero && isOpen hwnd && not(isMinimized hwnd) &&
+               (placement.value |> Option.exists(fun(_,wp,_) -> wp.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED)) then
+                this.holdStripOverAnimation()
             FollowerPlacement.queue.release(placementOwner,hwnd)
             //CASE 777 - chrome windows can close when you merge a single chrome tab
             //into another chrome group, need to exit the move/size and restore windows on screen in this case
@@ -1298,6 +1359,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                         else window.showCurrentStateNoActivate()
                     MoveHidden.release hwnd |> ignore)
             lock locationGate (fun () -> pendingLocations.Clear())
+            stripHoldTimer.Stop()
+            stripHoldTimer.Dispose()
+            stripHoldDue <- 0L
+            stripHoldLimit <- 0L
             minimizeStateTimer.Dispose()
             pendingMinimizeStates.Clear()
             requestedMinimizeStates.Clear()

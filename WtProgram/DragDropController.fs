@@ -27,6 +27,17 @@ module DragIcon =
             held |> Option.iter(fun previous -> previous.Dispose())
             held <- None)
 
+/// The window the drag draws the tab it carries in. It is topmost, so a strip raised over a window's
+/// maximize or restore animation goes directly under it: the strip is topmost too, and moving above
+/// this window would cover the tab in the hand until that hold ends. One drag runs at a time, so one
+/// slot is enough, as with DragIcon.
+module DragTabWindow =
+    let private gate = obj()
+    let mutable private held = IntPtr.Zero
+    let set (hwnd:IntPtr) = lock gate (fun() -> held <- hwnd)
+    let clear (hwnd:IntPtr) = lock gate (fun() -> if held=hwnd then held <- IntPtr.Zero)
+    let current () = lock gate (fun() -> held)
+
 type IDragState =
     abstract member mouseMove : Pt -> unit
     abstract member dispose : unit -> unit
@@ -53,6 +64,9 @@ type DragDetectingState(info:DragDetectingStateInfo) =
 type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     let window = AnimationWindow(os)
     do  window.setAlpha(byte 0xFF)
+        // From the first frame: a strip can be asked to hold itself over an animation before the
+        // hand has even left the group it started in.
+        DragTabWindow.set window.hwnd
     /// The grabbed point inside the picture as drawn now. The picture is redrawn for the frame it
     /// hangs over, so the point moves with it, and the tab keeps the cursor on the same spot.
     let mutable anchor = Pt()
@@ -209,6 +223,9 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
         // A flight still in progress is stopped first: its timer must not step a disposed window.
         member this.Dispose() =
             stopFlight()
+            // The slot outlives this object if it is not cleared here, and a stale handle is what a
+            // strip holding itself over the next animation would try to go under.
+            DragTabWindow.clear window.hwnd
             window.Dispose()
 
 type DragCapturedStateInfo = {
