@@ -91,17 +91,36 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
                  dpi <- Dpi.forMonitorPoint pt
              | None -> ())
             dpi
+    /// The tab casts the shadow it casts in a strip, so picking it up does not take the shadow away.
+    /// The shadow is drawn into the picture, which makes the window larger than the tab by this much
+    /// above and beside it; everything else here speaks of the tab, and only the window is offset.
+    let shadowRenderer = TabShadow.Renderer()
+    let mutable shadowOffset = Pt()
+    let withShadow (image:Img) =
+        try
+            let padding = Dpi.withValue dpi TabShadow.padding
+            let shadow = shadowRenderer.Render(image.width, image.height, TabShadow.silhouette image.bitmap, padding, TabUp)
+            try
+                use g = Graphics.FromImage(shadow)
+                g.DrawImageUnscaled(image.bitmap, padding, padding)
+                shadowOffset <- Pt(padding, padding)
+                Img(shadow)
+            with _ ->
+                shadow.Dispose()
+                reraise()
+        finally image.bitmap.Dispose()
+    let setLocation (tabAt:Pt) = window.setLocation(tabAt.sub(shadowOffset))
     let place (pt:Pt) (visible:Rect) =
         lastVisible <- visible
         let key, location, render = sprite.frame (dpiAt pt) visible
         if not(obj.Equals(drawnFor, key)) then
             let image = render()
-            window.setImage(image)
             DragTrace.write(sprintf "RESCALE dpi=%d size=%dx%d" dpi image.size.width image.size.height)
             // The grab point scales with the picture: a redraw of the same size leaves it alone, while
             // a strip that draws the tab wider or narrower moves the point with it.
             if isNull drawnFor || anchorSize <> image.size then anchor <- grabOffset image.size
             anchorSize <- image.size
+            window.setImage(withShadow image)
             drawnFor <- key
         location
     /// Wear the window it moves: the tab is drawn at the row position the strip gives a window of this
@@ -110,7 +129,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     member this.follow(ptScreen:Pt) (visible:Rect) =
         let location = place ptScreen visible
         position <- location
-        window.setLocation(location)
+        setLocation(location)
         window.setIsVisible(true)
     /// The grabbed point inside the picture, for a strip taking the tab over to hold it by.
     member this.anchorOffset = anchor
@@ -129,7 +148,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// Hold the tab at a screen point, keeping the picture it already has.
     member this.holdAt(location:Pt) =
         position <- location
-        window.setLocation(location)
+        setLocation(location)
         window.setIsVisible(true)
     /// Where the picture is drawn now: where the flight to a slot starts, and what the trace reports.
     member this.topLeft = position
@@ -151,7 +170,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
                     finished.Value <- true
                     stopFlight()
                     position <- target
-                    window.setLocation(target)
+                    setLocation(target)
                     DragTrace.write(sprintf "FLIGHT end elapsed=%dms frames=%d" clock.ElapsedMilliseconds frames.Value)
                     arrived()
                 else
@@ -162,7 +181,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
                     let at = Pt(from.x + int (Math.Round(eased * float (target.x - from.x))),
                                 from.y + int (Math.Round(eased * float (target.y - from.y))))
                     position <- at
-                    window.setLocation(at)
+                    setLocation(at)
         let timer = new Timer(Interval = 16)
         timer.Tick.Add <| fun _ -> step()
         flight <- Some timer

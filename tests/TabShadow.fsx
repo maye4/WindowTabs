@@ -418,6 +418,33 @@ let main () =
 
     // Real HWNDs outside the desktop: ownership, flags, move/hide/restore and cleanup.
     let os = OS()
+    // The tab a drag carries casts the shadow it cast in its strip: the window grows by the shadow
+    // above and beside the tab, and the tab itself stays where the drag puts it.
+    do
+        let at = Pt(-9000,-9000)
+        let mutable rendered : Bitmap option = None
+        let render () =
+            let bitmap = new Bitmap(tabImage.bitmap)
+            rendered <- Some bitmap
+            Img(bitmap)
+        let sprite = { frame = (fun _ _ -> box 0, at, render)
+                       release = ignore }
+        use floating = new FloatingTab(os, sprite, fun size -> Pt(size.width/2,size.height/2))
+        floating.follow at (Rect(at,Sz(400,300)))
+        let window = os.windowFromHwnd(floating.hwnd)
+        let padding = TabShadow.padding()
+        check (floating.topLeft = at) "The dragged tab moved to make room for its shadow"
+        check (window.bounds.location = at.sub(Pt(padding,padding)) &&
+               window.bounds.size = Sz(tabImage.width+padding*2,tabImage.height+padding))
+              (sprintf "The dragged tab carries no shadow: window %A for a %A tab" window.bounds.size tabImage.size)
+        check (rendered |> Option.exists(fun bitmap ->
+                    try bitmap.GetPixel(0,0) |> ignore; false
+                    with :? ArgumentException -> true)) "The shadow kept the original tab bitmap alive"
+        check (floating.anchorOffset=Pt(tabImage.width/2,tabImage.height/2)) "The shadow moved the tab's grab point"
+        let held = at.add(Pt(80,40))
+        floating.holdAt held
+        check (floating.topLeft=held && window.bounds.location=held.sub(Pt(padding,padding)))
+              "Holding a shadowed tab lost its position or shadow offset"
     let mutable helper : TabShadowWindow option = None
     let handler (msg:Win32Message) =
         let result = msg.def()

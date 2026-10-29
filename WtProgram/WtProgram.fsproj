@@ -84,9 +84,9 @@
     <Compile Include="Shared\Model.fs" />
     <Compile Include="Shared\UIHelper.fs" />
     <Compile Include="HotKeyManager.fs" />
+    <Compile Include="TabShadow.fs" />
     <Compile Include="DragDropController.fs" />
     <Compile Include="TabStripSprite.fs" />
-    <Compile Include="TabShadow.fs" />
     <Compile Include="TabTitleTip.fs" />
     <Compile Include="TabStrip.fs" />
     <Compile Include="AppearanceJson.fs" />

@@ -758,6 +758,34 @@ let main() =
                         send WindowMessages.WM_MOUSELEAVE Pt.empty
                         TabReveal.forced <- Some false
                 strip.dock <- TabDockTop
+                // A slide that runs out between two frames still paints the frame it ends on: the
+                // frames before it only moved the shadow, and that one draws the shadow the row ends
+                // with. A drag starves the strip's timer, so the slide is stepped by the pointer alone.
+                strip.isShrunk <- false
+                strip.setPlacement(placement start size false)
+                TabReveal.forced <- Some true
+                let ghost = strip.lorder.head
+                strip.ghostTab <- Some(SystemIcons.Application.Clone() :?> Icon, ghost)
+                let far = Pt(size.width-1,size.height/2)
+                let beforeSlide = frames strip
+                strip.previewDrop far
+                check ((strip.lorder.list |> List.last) = ghost && frames strip=beforeSlide+1L) "A drop preview did not move its tab"
+                // A deferred shadow from the preceding paints must not suppress the final refresh.
+                let nudgeFlags = BindingFlags.Instance ||| BindingFlags.NonPublic
+                let shadowPending = typeof<TabStrip>.GetField("shadowPending",nudgeFlags)
+                let shadowTimer = typeof<TabStrip>.GetField("shadowTimer",nudgeFlags).GetValue(strip) :?> Timer
+                shadowPending.SetValue(strip,true)
+                shadowTimer.Start()
+                Threading.Thread.Sleep(int TabNudge.duration+50)
+                strip.previewDrop far
+                check (frames strip=beforeSlide+2L) "A slide that ended between frames never painted the shadow it ends with"
+                check (not (shadowPending.GetValue(strip) :?> bool) && not shadowTimer.Enabled)
+                      "A finished slide still waits on the starved shadow timer"
+                strip.previewDrop far
+                check (frames strip=beforeSlide+2L) "A settled drop preview repainted"
+                strip.ghostTab <- None
+                strip.moveTab(ghost,0)
+                TabReveal.forced <- Some false
                 // Real popup HWNDs cover the strip; coordinate polling must respect their hit test.
                 TabReveal.forced <- Some false
                 strip.dock <- TabDockLeft

@@ -945,7 +945,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                                             int(Math.Round(TabNudge.offset from (nowMs - start))))
                                         |> Array.ofSeq |> Array.sort
                 else [||]
-            let changed = not(lastOffsets = offsets)
+            // The frame a slide ends on always paints: the frames before it only moved the shadow, and
+            // this is the one that draws the shadow the row settles with. A slide that ran out between
+            // two frames would otherwise compare its empty offsets with the empty ones it started from.
+            let changed = nudges.Count = 0 || not(lastOffsets = offsets)
             if due && changed then
                 if nudgeKey <> Some(this.nudgeRowKey this.ts lorderCell.value.list) then
                     nudges.Clear()
@@ -955,8 +958,15 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                 else
                     lastNudgeFrame <- nowMs
                     lastOffsets <- offsets
-                    if this.visible then this.paint()
                     DragTrace.write(sprintf "NUDGE frame tabs=%d elapsed=%d" nudges.Count (int nowMs))
+                if nudges.Count = 0 then
+                    // A drag can starve the deferred timer too; finish its shadow in this paint.
+                    shadowTimer.Stop()
+                    shadowPending <- false
+                    shadowRefreshing <- true
+                    try if this.visible then this.paint()
+                    finally shadowRefreshing <- false
+                elif this.visible then this.paint()
             elif due then lastNudgeFrame <- nowMs
             if nudges.Count = 0 then
                 nudgeTimer.Stop()

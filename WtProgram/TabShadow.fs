@@ -8,6 +8,9 @@ open Bemo.Win32.Forms
 
 /// An exterior alpha mask, independent of tab colour and text.
 module TabShadow =
+    /// How far the shadow reaches past the tabs, at the current scale.
+    let padding () = max 3 (Dpi.scale 15)
+
     let silhouette (bitmap:Bitmap) =
         let rect = Rectangle(0, 0, bitmap.Width, bitmap.Height)
         let data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb)
@@ -101,7 +104,7 @@ module TabShadow =
 /// with the tab strip, without making it globally topmost or changing tab bounds.
 type TabShadowWindow(os:OS, owner:IntPtr) =
     let renderer = TabShadow.Renderer()
-    let mutable padding = max 3 (Dpi.scale 15)
+    let mutable padding = TabShadow.padding()
     let helper =
         os.createWindow (fun msg -> msg.def()) WindowsStyles.WS_POPUP
             (WindowsExtendedStyles.WS_EX_LAYERED |||
@@ -143,7 +146,7 @@ type TabShadowWindow(os:OS, owner:IntPtr) =
         else window.hide()
 
     member this.update(image:Img, alpha:byte, newDirection:TabDirection) =
-        let nextPadding = max 3 (Dpi.scale 15)
+        let nextPadding = TabShadow.padding()
         if nextPadding <> padding then
             cached |> Option.iter(fun (_,_,_,_,bitmap) -> bitmap.Dispose())
             cached <- None
