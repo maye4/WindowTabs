@@ -30,6 +30,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ./tests/Run-Tests.ps1 
   Monthly coverage (`.github/workflows/coverage.yml`) enforces
   coverage floors (50% lines / 50% branches); release CI runs without coverage.
 
+## Review routine
+
+- Review all staged and unstaged changes for defects and regressions, then fix any
+  findings. Preserve the existing index; leave review fixes and guidance updates
+  unstaged. Do not commit unless asked.
+- Do not run automated tests during this routine unless explicitly requested. Add
+  regression assertions for fixes where appropriate, but leave them unrun.
+- After fixes, build `WindowTabs.sln -c Debug` and launch
+  `WtProgram\bin\Debug\WindowTabs.exe`. Confirm the new process stays running.
+- From WSL, use Windows `dotnet` through `powershell.exe` and set the launch working
+  directory explicitly. Preserve an existing instance's working directory if known.
+- Report findings first, then the build and launch result, and note that tests
+  were not run.
+
 ## Layout
 
 - `WtProgram/WtProgram.fsproj` lists every source file in compile order. F# needs a

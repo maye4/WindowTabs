@@ -441,10 +441,34 @@ let main () =
                     try bitmap.GetPixel(0,0) |> ignore; false
                     with :? ArgumentException -> true)) "The shadow kept the original tab bitmap alive"
         check (floating.anchorOffset=Pt(tabImage.width/2,tabImage.height/2)) "The shadow moved the tab's grab point"
+        // A strip takes the floating tab over where it is, not at the grab point: snapping to that
+        // point made the tab jump as the drop preview appeared.
+        let hand = at.add(Pt(150,-20))
+        floating.holdBy hand
+        check (floating.topLeft = at) (sprintf "The tab jumped to %A from %A when a strip took it" floating.topLeft at)
+        floating.holdBy(hand.add(Pt(7,3)))
+        check (floating.topLeft = at.add(Pt(7,3))) "A tab a strip holds stopped following the hand"
         let held = at.add(Pt(80,40))
         floating.holdAt held
         check (floating.topLeft=held && window.bounds.location=held.sub(Pt(padding,padding)))
               "Holding a shadowed tab lost its position or shadow offset"
+    // A size round trip must recover the original grip, including offsets that round to zero.
+    do
+        let at = Pt(-9000,-9000)
+        let mutable size = Sz(160,26)
+        let sprite = { frame = (fun _ _ -> box size, at, fun () -> Img(new Bitmap(size.width,size.height)))
+                       release = ignore }
+        use floating = new FloatingTab(os, sprite, fun size -> Pt(size.width/2,size.height/2))
+        floating.follow at (Rect(at,Sz(400,300)))
+        let hand = at.add(Pt(1,-1))
+        floating.holdBy hand
+        for _ in 1..3 do
+            size <- Sz(80,13)
+            floating.holdBy hand
+            check (floating.topLeft = hand) "The held grip did not scale with the tab"
+            size <- Sz(160,26)
+            floating.holdBy hand
+            check (floating.topLeft = at) "Resizing a held tab back to its original size moved the grip"
     let mutable helper : TabShadowWindow option = None
     let handler (msg:Win32Message) =
         let result = msg.def()

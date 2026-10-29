@@ -65,6 +65,9 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// Where the picture's top-left corner is now. Tracked where the picture is placed, so the flight
     /// into a slot starts from what the hand can see rather than from where the pointer is.
     let mutable position = Pt()
+    /// Keep the original grip and picture size: rounding each rescale moves the grip a pixel at a
+    /// time when the hand crosses between monitors. None while the tab follows its window's edge.
+    let mutable grip : (Pt * Sz) option = None
     /// The monitor whose scale the picture is drawn for, and its rect: read again only when the
     /// pointer leaves that rect, which is once per crossing rather than once per move.
     let mutable monitorRect = Rect()
@@ -128,6 +131,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// a gap or an overlap between the two, by wherever the hand happened to close on the tab.
     member this.follow(ptScreen:Pt) (visible:Rect) =
         let location = place ptScreen visible
+        grip <- None
         position <- location
         setLocation(location)
         window.setIsVisible(true)
@@ -142,9 +146,18 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     /// Hold the tab by the grabbed point, redrawn for the monitor the hand is over. Over a strip the
     /// window belongs to the group, so only the tab the user is holding follows the pointer - but it
     /// still has to be the size of the monitor it is over, not of the one the drag began on.
+    /// A strip takes the tab over where the hand already holds it: a floating tab sits on its window's
+    /// edge rather than at the grab point, and snapping to that point made the tab jump as the preview
+    /// appeared.
     member this.holdBy(ptScreen:Pt) =
+        let held, heldSize = grip |> Option.defaultWith(fun () -> ptScreen.sub(position), anchorSize)
         if not lastVisible.size.isEmptyArea then place ptScreen lastVisible |> ignore
-        this.holdAt(ptScreen.sub(anchor))
+        grip <- Some(held, heldSize)
+        let scaleBy offset source target = int(Math.Round(float offset * float target / float(max 1 source)))
+        let held =
+            if anchorSize = heldSize then held
+            else Pt(scaleBy held.x heldSize.width anchorSize.width, scaleBy held.y heldSize.height anchorSize.height)
+        this.holdAt(ptScreen.sub(held))
     /// Hold the tab at a screen point, keeping the picture it already has.
     member this.holdAt(location:Pt) =
         position <- location
