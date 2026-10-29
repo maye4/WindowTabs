@@ -1,3 +1,5 @@
+This repo (`origin`): [maye4/WindowTabs](https://github.com/maye4/WindowTabs) — forked from (`upstream`) [leafOfTree/WindowTabs](https://github.com/leafOfTree/WindowTabs)
+
 <img src="docs/images/logo.svg" width="60" height="60" alt="WindowTabs icon" align="left"/>
 
 # WindowTabs
