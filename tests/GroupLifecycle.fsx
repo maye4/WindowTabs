@@ -953,9 +953,11 @@ let main() =
                     {tab=tab;tabSize=sprite.size;tabOffset=Pt(sprite.size.width/2,sprite.size.height/2)
                      tabInfo=group.ts.tabInfo tab;lastNormalSize=group.dragSizeOf draggedHwnd})
                 // The picture and place the drag carries are drawn while the tab is still the strip's.
-                let floatingSprite = onGroup floatingGroup (fun group -> group.ts.floatingTab tab appearance)
-                let tabImage = floatingSprite.image false stripSize
-                let tabOffset = floatingSprite.location false stripSize
+                // The picture is drawn for a monitor's scale, which the drag decides: here the group's own.
+                let floatingSprite = onGroup floatingGroup (fun group -> group.ts.floatingTab tab (fun () -> appearance))
+                let dpi = onGroup floatingGroup (fun _ -> Dpi.value())
+                let tabImage = floatingSprite.image dpi false stripSize
+                let tabOffset = floatingSprite.location dpi false stripSize
                 let grabbed = onGroup floatingGroup (fun group -> group.ts.tabLocation(tab).add(data.tabOffset))
                 let dragSource = onGroup floatingGroup (fun group -> dragTargetFor group.ts.hwnd)
                 dragSource.dragBegin()

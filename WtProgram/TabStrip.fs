@@ -822,13 +822,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         // One font per monitor this drag is drawn for. The strip's own fonts belong to the strip's
         // scale, and a picture drawn for another monitor must not borrow them - they are also the
         // fonts a DPI change on that strip replaces.
-        let fonts = Collections.Generic.Dictionary<int,Font>()
+        let fonts = Collections.Generic.Dictionary<int * int,Font>()
         let fontAt dpi (appearance:TabAppearanceInfo) =
-            match fonts.TryGetValue dpi with
+            // The row height can change while the drag runs (the appearance is read live), and a font
+            // made for the old height would clip the name in the new row.
+            let key = dpi, appearance.tabHeight
+            match fonts.TryGetValue key with
             | true, font -> font
             | _ ->
                 let font = TabMetrics.font appearance.tabHeight style
-                fonts.[dpi] <- font
+                fonts.[key] <- font
                 font
         let at dpi (appearance:TabAppearanceInfo) showInside size =
             let direction = if showInside then TabDown else TabUp
@@ -851,11 +854,13 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                     if showInside then float(appearance.tabIndentFlipped - appearance.tabIndentNormal) / 2.0
                     else 0.0 }
         // Everything inside the override reads that monitor's scale: the appearance, the row the tab
-        // is laid in, and the cache key the body is stored under.
-        let forDpi dpi showInside size =
-            Dpi.withValue dpi (fun () -> at dpi (appearanceAt()) showInside size)
-        { location = (fun dpi showInside size -> (forDpi dpi showInside size).tabLocation tab)
-          image = (fun dpi showInside size -> (forDpi dpi showInside size).renderTab tab)
+        // is laid in, the font, and the cache key the body is stored under. The override has to wrap
+        // the layout and the drawing themselves, not the record that describes them - building the
+        // record and then reading it outside the override leaves every length at the thread's scale.
+        let forDpi dpi showInside size (apply:TabStripSprite<Tab> -> 'a) =
+            Dpi.withValue dpi (fun () -> apply (at dpi (appearanceAt()) showInside size))
+        { location = (fun dpi showInside size -> forDpi dpi showInside size (fun strip -> strip.tabLocation tab))
+          image = (fun dpi showInside size -> forDpi dpi showInside size (fun strip -> strip.renderTab tab))
           release = (fun () ->
                         icon.Dispose()
                         fonts.Values |> Seq.iter(fun font -> font.Dispose())

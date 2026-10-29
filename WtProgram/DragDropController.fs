@@ -82,10 +82,14 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
     let dpiAt (pt:Pt) =
         if monitorRect.containsPoint pt then dpi
         else
+            // Both together or neither: Dpi.forMonitorPoint answers for the nearest monitor, so a point
+            // in a gap beside another monitor would store that monitor's scale next to this one's rect,
+            // and the picture would keep the wrong scale on the way back.
             (match Monitors.all().list |> List.tryFind(fun mon -> mon.displayRect.containsPoint pt) with
-             | Some mon -> monitorRect <- mon.displayRect
+             | Some mon ->
+                 monitorRect <- mon.displayRect
+                 dpi <- Dpi.forMonitorPoint pt
              | None -> ())
-            dpi <- Dpi.forMonitorPoint pt
             dpi
     let place (pt:Pt) (visible:Rect) =
         lastVisible <- visible
