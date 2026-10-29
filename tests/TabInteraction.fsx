@@ -785,6 +785,62 @@ let main() =
                 check (frames strip=beforeSlide+2L) "A settled drop preview repainted"
                 strip.ghostTab <- None
                 strip.moveTab(ghost,0)
+                // A tab joining from another group rises into its slot instead of appearing in one frame.
+                let joining = strip.lorder.list |> List.last
+                let joiningInfo = strip.tabInfo joining
+                strip.removeTab joining
+                strip.ghostTab <- Some(SystemIcons.Application.Clone() :?> Icon, joining)
+                strip.joinPreview(joining, far)
+                let nudges = typeof<TabStrip>.GetField("nudges",nudgeFlags).GetValue(strip) :?> Collections.Generic.Dictionary<Tab,float*float*float>
+                check (nudges.ContainsKey joining && (let _,across,_ = nudges.[joining] in abs across >= 1.0))
+                      "A tab joining the strip appeared without rising into its slot"
+                Threading.Thread.Sleep(int TabNudge.duration+50)
+                strip.previewDrop far
+                check (nudges.Count = 0 && (strip.lorder.list |> List.last) = joining) "A joining tab never settled in its slot"
+                // A previewed tab leaving the strip lets the tabs it pushed aside slide back.
+                strip.previewDrop(Pt(0,size.height/2), false)
+                let pushedBack = strip.lorder.list |> List.item 1
+                strip.leavePreview joining
+                check (not (strip.tabs.contains joining) && strip.ghostTab.IsNone) "A leaving preview stayed in the strip"
+                check (nudges.ContainsKey pushedBack && (let along,_,_ = nudges.[pushedBack] in along >= 1.0))
+                      "The tabs a leaving preview had pushed aside jumped back instead of sliding"
+                let settle = Diagnostics.Stopwatch.StartNew()
+                while nudges.Count > 0 && settle.ElapsedMilliseconds < 1000L do
+                    Application.DoEvents()
+                    Threading.Thread.Sleep(2)
+                check (nudges.Count = 0) "The tabs a leaving preview had pushed aside never settled"
+                strip.addTab joining
+                strip.setTabInfo(joining, joiningInfo)
+                // A growing side column moves its HWND when centred or bottom-aligned. Existing
+                // rows must start at their old screen positions, not their old local coordinates.
+                for dock in [TabDockLeft;TabDockRight] do
+                    for alignment in [TabCenter;TabRight] do
+                        strip.dock <- dock
+                        let height = Dpi.scale 600
+                        let columnPlacement() =
+                            let content = strip.columnContentHeight
+                            let spare = height-content
+                            let y = start.y+(if alignment=TabCenter then spare/2 else spare)
+                            placement (Pt(start.x,y)) (Sz(Dpi.scale 220,content)) false
+                        strip.setPlacement(columnPlacement())
+                        use placementWatch = strip.dockChanged.Subscribe(fun () -> strip.setPlacement(columnPlacement()))
+                        strip.removeTab joining
+                        let staying = strip.lorder.head
+                        let before = strip.bounds.location.add(strip.tabLocation staying)
+                        strip.ghostTab <- Some(SystemIcons.Application.Clone() :?> Icon, joining)
+                        let endPoint = Pt(Dpi.scale 50,height)
+                        strip.joinPreview(joining,endPoint)
+                        let after = strip.bounds.location.add(strip.tabLocation staying)
+                        check (before<>after && nudges.ContainsKey staying)
+                              "A growing side column jumped its existing rows instead of sliding them"
+                        let along,across,_ = nudges.[staying]
+                        check (int along=before.y-after.y && int across=before.x-after.x)
+                              "A joining tab's nudge ignored the side column's changed screen origin"
+                        Threading.Thread.Sleep(int TabNudge.duration+50)
+                        strip.previewDrop endPoint
+                        check (nudges.Count=0) "A growing side column never settled"
+                        strip.ghostTab <- None
+                        strip.setTabInfo(joining,joiningInfo)
                 TabReveal.forced <- Some false
                 // Real popup HWNDs cover the strip; coordinate polling must respect their hit test.
                 TabReveal.forced <- Some false

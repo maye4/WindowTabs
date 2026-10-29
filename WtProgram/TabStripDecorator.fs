@@ -727,10 +727,7 @@ type TabStripDecorator(group:WindowGroup) as this =
                         match DragIcon.current() with
                         | Some source -> this.ts.ghostTab <- Some(new Icon(source, source.Width, source.Height), dragInfo.tab)
                         | None -> ()
-                        this.ts.addTab dragInfo.tab
-                        // Entering a strip re-lays the whole row at once; animating that reads worse
-                        // than a clean snap, so only a move within the strip slides.
-                        this.ts.previewDrop(pt, false)
+                        this.ts.joinPreview(dragInfo.tab, pt)
                         // The destination group owns its cached icons. Drag data
                         // can outlive the source group's membership and cache.
                         group.addWindow(hwnd, false)
@@ -755,12 +752,12 @@ type TabStripDecorator(group:WindowGroup) as this =
                 match dragInfoCell.value with
                 | Some(dragInfo) ->
                     let tab = dragInfo.tab
+                    let present = this.ts.tabs.contains(tab)
                     // Cleared whether or not the tab is still here: a window that closed mid-drag has
                     // already taken it, and the preview must not outlive the drag.
-                    this.ts.ghostTab <- None
+                    this.ts.leavePreview tab
                     dragInfoCell.set(None)
-                    if this.ts.tabs.contains(tab) then
-                        this.ts.removeTab(tab)
+                    if present then
                         let (Tab(hwnd)) = tab
                         // The tab and its window leave this group while the drag is on the
                         // desktop: the drop decides where they go, the group must not follow the
