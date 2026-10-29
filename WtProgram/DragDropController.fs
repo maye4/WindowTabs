@@ -114,6 +114,7 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
         let duration = float (max 1 milliseconds)
         let clock = Diagnostics.Stopwatch.StartNew()
         let finished = ref false
+        let frames = ref 0
         let step () =
             if not finished.Value then
                 let progress = min 1.0 (float clock.ElapsedMilliseconds / duration)
@@ -122,8 +123,11 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
                     stopFlight()
                     position <- target
                     window.setLocation(target)
+                    DragTrace.write(sprintf "FLIGHT end elapsed=%dms frames=%d" clock.ElapsedMilliseconds frames.Value)
                     arrived()
                 else
+                    frames := !frames + 1
+                    DragTrace.write(sprintf "FLIGHT frame %d elapsed=%dms" frames.Value clock.ElapsedMilliseconds)
                     // Cubic ease-out: most of the distance in the first frames, no overshoot.
                     let eased = 1.0 - pown (1.0 - progress) 3
                     let at = Pt(from.x + int (Math.Round(eased * float (target.x - from.x))),
@@ -133,6 +137,9 @@ type FloatingTab(os:OS, sprite:DragTabSprite, grabOffset:Sz -> Pt) =
         let timer = new Timer(Interval = 16)
         timer.Tick.Add <| fun _ -> step()
         flight <- Some timer
+        DragTrace.write(sprintf "FLIGHT begin from=%d,%d to=%d,%d ms=%d thread=%d"
+                            from.x from.y target.x target.y milliseconds
+                            System.Threading.Thread.CurrentThread.ManagedThreadId)
         // The first step now rather than at the first tick: waiting 16 ms shows as a pause on release.
         step()
         if not finished.Value then timer.Start()
@@ -235,6 +242,10 @@ type DragAction(info:DragActionInfo) =
     /// tab landing, short enough not to hold up the next gesture.
     let landMilliseconds = 175
 
+    /// The drag has been released and its work is done. A flight that never arrived would otherwise
+    /// hold the drag action for the life of the process, and no further drag could start.
+    member this.isSettled = ended
+
     member this.setNextState(newState:obj) =
         let newState = unbox<IDragState>(newState)
         dragStateCell.value.iter <| fun state -> state.dispose()
@@ -280,24 +291,25 @@ type DragAction(info:DragActionInfo) =
             info.tab.release()
             match state with
             | Some(:? DragDetectingState) ->
-                this.land tab landing landingTarget
-                info.onCancel()
+                this.land tab landing landingTarget info.onCancel
             | Some(:? DragCapturedState) ->
                 info.targets.values.iter <| fun target -> target.dragEnd()
                 info.notifications.items.iter <| fun n -> n.dragEnd()
-                info.onEnd()
-                this.land tab landing landingTarget
+                // Ending the drag is what lets discovery run, and discovery destroys a group that
+                // lost its last window - the very group whose thread is flying this picture. The
+                // flight is a timer on that thread, so it would die with it and the tab would cut
+                // instead of landing. The desktop hears the drag is over when the tab has arrived.
+                this.land tab landing landingTarget info.onEnd
             | Some(:? DragFloatingState) ->
                 info.targets.values.iter <| fun target -> target.dragEnd()
                 info.notifications.items.iter <| fun n -> n.dragEnd()
                 // The drop places the same window made visible under the pointer; it is the
                 // user's window now, so nothing hides it afterwards.
                 info.onDrop(ptScreen)
-                info.onEnd()
                 // Nothing took the tab into a row: it was dropped on the desktop, so there is no slot
                 // to fly to and the picture goes at once.
-                this.land tab None None
-            | _ -> this.land tab None None
+                this.land tab None None info.onEnd
+            | _ -> this.land tab None None ignore
             // After the previews were told to clear: every strip that took one holds its own copy,
             // and the drag's copy has no reader left.
             DragIcon.release()
@@ -306,8 +318,16 @@ type DragAction(info:DragActionInfo) =
     /// the strip marked, and the strip stops shading the slot once it is there. Only the arrival moves
     /// — what the drop committed was committed before this runs, so a flight cut short changes
     /// nothing. With no slot to fly to, the overlay goes at once, as it always has.
-    member private this.land (tab:FloatingTab option) (landing:Rect option) (target:IDragDropTarget option) =
+    member private this.land (tab:FloatingTab option) (landing:Rect option) (target:IDragDropTarget option)
+                              (after: unit -> unit) =
         let dispose () = tab |> Option.iter(fun tab -> (tab :> IDisposable).Dispose())
+        // Exactly once, on every path out of here: an arrival that never comes must not leave the
+        // drag action held, and a flight that throws must not skip the end of the drag.
+        let settled = ref false
+        let finish () =
+            if not settled.Value then
+                settled.Value <- true
+                (try after() with _ -> ())
         match tab, target, landing with
         | Some(tab), Some(target), Some(landing) ->
             let finished = ref false
@@ -319,6 +339,7 @@ type DragAction(info:DragActionInfo) =
                     (try dispose() with _ -> ())
                     (try target.dragLanded() with _ -> ())
                     DragTrace.write(sprintf "LANDED cancelled=%b" cancelled)
+                    finish()
             DragTrace.write(sprintf "LAND from=%d,%d to=%s ms=%d"
                                 tab.topLeft.x tab.topLeft.y (DragTrace.rect landing) landMilliseconds)
             try tab.animateTo landing.location landMilliseconds (fun() -> arrived false)
@@ -328,9 +349,18 @@ type DragAction(info:DragActionInfo) =
         // left the strip shading the tab for good.
         | _ ->
             dispose()
-            target |> Option.iter(fun target ->
-                try target.dropSettled() with _ -> ())
-            if target.IsSome then DragTrace.write(sprintf "LANDED nocrect")
+            match target with
+            | Some target ->
+                (try target.dropSettled() with _ -> ())
+                DragTrace.write(sprintf "LANDED nocrect")
+            | None ->
+                // Nothing took the drop: the release happened while the picture was over no strip at
+                // all (another monitor, the desktop). Every strip that shaded a slot drew it for this
+                // drag, so every one of them has to hear that the drag is over.
+                info.targets.values.iter(fun target ->
+                    try target.dropSettled() with _ -> ())
+                DragTrace.write(sprintf "LANDED notarget settled=%d" info.targets.values.count)
+            finish()
 
     member this.wndProc (msg:Win32Message) =
         let ptScreen() =             
@@ -339,8 +369,14 @@ type DragAction(info:DragActionInfo) =
             ptScreenCell.set(ptScreen)
             ptScreen
         match msg.msg with
-        | WindowMessages.WM_MOUSEMOVE -> 
-            dragStateCell.value.Value.mouseMove(ptScreen())
+        | WindowMessages.WM_MOUSEMOVE when not ended ->
+            // Moves queued behind the release are not part of the drag: acting on one re-opens a
+            // preview in a strip that has already handled its end, and the shade it draws then has
+            // no drop left to clear it.
+            match dragStateCell.value with
+            | Some state -> state.mouseMove(ptScreen())
+            | None -> ()
+        | WindowMessages.WM_MOUSEMOVE -> ()
         | WindowMessages.WM_MOUSELEAVE
         | WindowMessages.WM_LBUTTONUP -> 
             this.captureEnded(ptScreen())
@@ -454,6 +490,10 @@ type DragDropController(parent:IDragDropParent) =
         member x.unregisterTarget(hwnd) = withLock <| fun() ->
             targetsCell.map(fun targets -> targets.remove hwnd)
         member x.beginDrag((initialHwnd, initialPt, data, tab)) = withLock <| fun() ->
+            // A released drag that never finished its work is not this drag's problem.
+            match dragActionCell.value with
+            | Some(previous:DragAction) when previous.isSettled -> dragActionCell.set None
+            | _ -> ()
             if dragActionCell.value.IsNone then 
                 let dragAction = DragAction({
                     targets = targetsCell.value

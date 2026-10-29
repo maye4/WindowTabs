@@ -119,6 +119,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let destroyingEvent = Event<unit>()
     let makeFont = TabMetrics.font
     let mutable fontKey = Dpi.value(),0
+    /// Fonts a DPI or height change replaced. A sprite built before the change still draws with the
+    /// font it captured, so disposing one here would make that draw fail - and a cross-monitor drag
+    /// changes the DPI while the tab is in the air. They are released with the strip instead.
+    let retiredFonts = Collections.Generic.List<Font>()
     let mutable normalFont = makeFont 0 FontStyle.Regular
     let mutable renamedFont = makeFont 0 FontStyle.Italic
 
@@ -849,8 +853,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member this.setTabAppearance(appearance:TabAppearanceInfo) =
         let key = Dpi.value(),appearance.tabHeight
         if fontKey <> key then
-            normalFont.Dispose()
-            renamedFont.Dispose()
+            retiredFonts.Add normalFont
+            retiredFonts.Add renamedFont
             normalFont <- makeFont appearance.tabHeight FontStyle.Regular
             renamedFont <- makeFont appearance.tabHeight FontStyle.Italic
             fontKey <- key
@@ -930,6 +934,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         dropRevealImages()
         normalFont.Dispose()
         renamedFont.Dispose()
+        retiredFonts |> Seq.iter(fun font -> font.Dispose())
+        retiredFonts.Clear()
         shadowWindow |> Option.iter (fun shadow -> (shadow :> IDisposable).Dispose())
         shadowWindow <- None
         eventHandlersCell.value.items.iter(fun d -> d.Dispose())

@@ -15,6 +15,17 @@ type TabStripDecorator(group:WindowGroup) as this =
     /// The tab the last drop committed here. Its slot stays shaded until the picture of the tab,
     /// still flying in from the pointer, has arrived.
     let mutable landedTab : Tab option = None
+    /// A shade is cleared when the tab is seen arriving in it, and that arrival is a timer on the
+    /// thread of the group the drag started from - a thread that ends when that group does: dragging
+    /// the last window out of a group destroys the group, and destroying a group ends its thread. The
+    /// strip that drew the shade owns clearing it, so it owns a deadline too: if nothing has arrived
+    /// by then the shade goes anyway, and only the animation is lost.
+    let landingWatchdog = new System.Windows.Forms.Timer(Interval = 400)
+    do
+        // Fires on this strip's own thread, whatever became of the drag's source.
+        landingWatchdog.Tick.Add(fun _ ->
+            landingWatchdog.Stop()
+            if not isDraggingCell.value then this.clearLandedShade("deadline"))
     let dragPtCell = Cell.create(Pt.empty)
     let dropTarget = Cell.create(None)
     let mouseEvent = Event<_>()
@@ -646,29 +657,40 @@ type TabStripDecorator(group:WindowGroup) as this =
             
     /// Clears the shade this drop recorded. The commit is queued, so a caller that runs before it
     /// (the no-flight path) must come through `dropSettled` instead, which waits for it.
-    member private this.clearLandedShade() =
+    member private this.clearLandedShade(reason:string) =
         // Only the shade this drop put there: a newer drag's preview is not this one's to clear.
         match landedTab, this.ts.ghostTab with
         | Some(tab), Some(_, ghost) when ghost = tab ->
             this.ts.ghostTab <- None
             this.updateTsSlide()
             landedTab <- None
-        // Nothing is recorded and no drag is running: a shade left from an earlier drop is not a
-        // preview of anything and would otherwise stay for good.
-        | None, Some _ when dragInfoCell.value.IsNone ->
+            landingWatchdog.Stop()
+            DragTrace.write(sprintf "GHOST %d cleared=%s" (this.ts.hwnd.ToInt64()) reason)
+        // No drag is running in this strip, so a shade here is not a preview of anything: it is what
+        // an earlier drop left, whether or not it still matches the tab that drop recorded (a drop
+        // that ended over no strip at all records nothing here, and a shade nobody clears is a tab
+        // that cannot be used).
+        | _, Some _ when not isDraggingCell.value ->
             this.ts.ghostTab <- None
             this.updateTsSlide()
-            DragTrace.write(sprintf "GHOST %d cleared=stale" (this.ts.hwnd.ToInt64()))
+            landedTab <- None
+            landingWatchdog.Stop()
+            DragTrace.write(sprintf "GHOST %d cleared=%s" (this.ts.hwnd.ToInt64()) reason)
         | _ -> ()
 
     interface IDragDropTarget with
         member this.dragBegin() =
             this.invokeAsync <| fun() -> 
+                // A deadline left by an earlier drop is not this drag's business: firing it here
+                // would clear the shade this drag is about to draw.
+                landingWatchdog.Stop()
                 // A drag starting is the moment to drop a shade an earlier drop left behind: nothing
                 // previews in this strip until its own dragEnter sets one, and a shade with no record
                 // behind it would keep the tab dimmed and unslidable for good.
                 landedTab <- None
-                if this.ts.ghostTab.IsSome then
+                // This runs after the drag's first enter, which is sent and has already drawn the
+                // shade for the tab it previews: only a shade no drag is using is a leftover.
+                if dragInfoCell.value.IsNone && this.ts.ghostTab.IsSome then
                     this.ts.ghostTab <- None
                     DragTrace.write(sprintf "GHOST %d cleared=begin" (this.ts.hwnd.ToInt64()))
                 isDraggingCell.value <- true
@@ -755,6 +777,9 @@ type TabStripDecorator(group:WindowGroup) as this =
                 // The shade stays until the tab is seen arriving in it: the picture is still in the
                 // air, and drawing the tab here as well would show it twice. Cleared in dragLanded.
                 landedTab <- this.ts.ghostTab |> Option.map(fun (_, tab) -> tab)
+                // The tab is in the air now. Whatever thread is flying it, this strip will not stay
+                // shaded past the deadline if that arrival never comes.
+                if landedTab.IsSome then landingWatchdog.Start()
                 joinedByDrag <- false
                 dragInfoCell.set(None)
                 this.updateTsSlide()
@@ -774,11 +799,11 @@ type TabStripDecorator(group:WindowGroup) as this =
 
         member this.dragLanded() =
             this.invokeSync <| fun() ->
-                this.clearLandedShade()
+                this.clearLandedShade("landed")
 
         member this.dropSettled() =
             // Posted, not sent: this drop's commit is a queued call, and before it runs nothing is
             // recorded to clear. Queued behind it, the shade and its record are both there.
             this.invokeAsync <| fun() ->
-                this.clearLandedShade()
+                this.clearLandedShade("settled")
                 DragTrace.write(sprintf "GHOST %d settled" (this.ts.hwnd.ToInt64()))

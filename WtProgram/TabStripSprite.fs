@@ -640,7 +640,12 @@ type TabSprite<'id> = {
 
     /// The body, drawn once for a sprite that does not change and copied out on every frame after.
     member private this.body =
-        TabImageCache.adopt (TabImageCache.key (box this)) (fun () -> this.draw)
+        try TabImageCache.adopt (TabImageCache.key (box this)) (fun () -> this.draw)
+        with ex ->
+            // A tab that cannot be drawn is not worth the process: the strip keeps working with a
+            // plain tab in its place, and the reason is in the trace.
+            DragTrace.write(sprintf "DRAW-FAIL %s %s" (ex.GetType().Name) ex.Message)
+            Img(this.size)
 
     member private this.draw =
         let img = Img(this.size)
