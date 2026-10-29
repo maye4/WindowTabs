@@ -265,11 +265,6 @@ module FollowerPlacement =
                 let place value =
                     if valid() then
                         positioned <- true
-                        // Maximizing a window into the group, or restoring it out of a maximized one,
-                        // lands at once instead of growing or shrinking through the system animation.
-                        let minimized = ShowWindowCommands.SW_SHOWMINIMIZED
-                        if value.showCmd<>minimized && actual.showCmd<>minimized && value.showCmd<>actual.showCmd then
-                            NoTransition.suppress hwnd
                         window.setPlacement(value)
                 // MoveWindow preserves the visible bounds of an Aero snapped window.
                 if wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL && actual.showCmd=ShowWindowCommands.SW_SHOWNORMAL then

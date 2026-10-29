@@ -1035,24 +1035,6 @@ let main() =
                       (sprintf "A maximized window dragged out passed through other sizes: %A" (List.ofSeq sizes))
                 check (window.visibleBounds.y = pointer.y + Dpi.scale 12)
                       "A maximized window dragged out does not sit a tab's middle below the pointer"
-            // A one-shot Timer can run before the Stopwatch deadline. Force that path without
-            // relying on the clocks disagreeing during this run; it must schedule its remaining time.
-            do
-                use form = new Form(ShowInTaskbar=false)
-                let hwnd = form.Handle
-                let moduleType = typeof<OS>.Assembly.GetType("Bemo.NoTransition")
-                let flags = Reflection.BindingFlags.Static ||| Reflection.BindingFlags.NonPublic ||| Reflection.BindingFlags.Public
-                let gate = moduleType.GetProperty("gate",flags).GetValue(null,null)
-                let restoring = moduleType.GetProperty("restoring",flags).GetValue(null,null)
-                                :?> Collections.Generic.Dictionary<IntPtr,Threading.Timer * int64>
-                NoTransition.suppress hwnd
-                lock gate (fun () ->
-                    let timer,_ = restoring.[hwnd]
-                    timer.Change(Timeout.Infinite,Timeout.Infinite) |> ignore
-                    moduleType.GetMethod("restore",flags).Invoke(null,[|box hwnd|]) |> ignore
-                    check (restoring.ContainsKey hwnd) "An early callback restored animations before their deadline")
-                pumpUntil "An early timer callback left window animations suppressed" (fun () ->
-                    lock gate (fun () -> not(restoring.ContainsKey hwnd)))
             // The drag moves its window off the drag thread, newest frame only, and settles before a
             // strip or the drop places it: after the settle the window is where the last request said.
             do

@@ -121,50 +121,6 @@ module MoveHidden =
                     WinUserApi.ShowWindow(hwnd,cmd) |> ignore
                 WinUserApi.RemoveProp(hwnd,key) |> ignore
 
-/// A window WindowTabs maximizes into a group or restores out of one jumps to its new frame instead
-/// of playing the system's min/max animation: that animation grows or shrinks a large window over a
-/// few hundred milliseconds while the app repaints behind it, which reads as lag. DWM takes the
-/// setting from another process, and the window gets its animations back a moment later, once the
-/// change has been composed.
-module NoTransition =
-    let private settle = 1000L
-    let private gate = obj()
-    let private clock = Diagnostics.Stopwatch.StartNew()
-    /// Each window's timer and when its animations come back.
-    let private restoring = Collections.Generic.Dictionary<IntPtr,Threading.Timer * int64>()
-    let private set (hwnd:IntPtr) (disabled:bool) =
-        let mutable value = if disabled then 1 else 0
-        try DwmApi.DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE.DWMWA_TRANSITIONS_FORCEDISABLED, &value, sizeof<int>) |> ignore
-        with :? DllNotFoundException -> ()
-    let private restore (state:obj) =
-        let hwnd = state :?> IntPtr
-        lock gate (fun () ->
-            match restoring.TryGetValue hwnd with
-            // A suppress that came while this callback was queued has moved the time on.
-            | true,(timer,due) when clock.ElapsedMilliseconds >= due ->
-                restoring.Remove hwnd |> ignore
-                timer.Dispose()
-                if WinUserApi.IsWindow hwnd then set hwnd false
-            | true,(timer,due) ->
-                // Timer uses the coarse system clock, not Stopwatch. An early one-shot callback
-                // still needs another turn, or this window keeps transitions disabled forever.
-                timer.Change(max 1L (due-clock.ElapsedMilliseconds),int64 Threading.Timeout.Infinite) |> ignore
-            | _ -> ())
-
-    /// Call before the state change; repeated calls keep the animation off until the last one settles.
-    let suppress (hwnd:IntPtr) =
-        lock gate (fun () ->
-            set hwnd true
-            let due = clock.ElapsedMilliseconds + settle
-            match restoring.TryGetValue hwnd with
-            | true,(timer,_) ->
-                restoring.[hwnd] <- (timer,due)
-                timer.Change(settle,int64 Threading.Timeout.Infinite) |> ignore
-            | _ ->
-                let timer = new Threading.Timer(Threading.TimerCallback restore, box hwnd, Threading.Timeout.Infinite, Threading.Timeout.Infinite)
-                restoring.[hwnd] <- (timer,due)
-                timer.Change(settle,int64 Threading.Timeout.Infinite) |> ignore)
-
 type IWindow =
     abstract member hwnd : IntPtr
 
@@ -806,7 +762,7 @@ and
         // around that smaller frame is background: measured 3866x2186 to 3236x1991 in one step, which
         // was the size the drag was already heading for, so the drag flashed. The restore lands on the
         // frame the drag is heading for instead, so the app lays itself out once rather than once for
-        // the restore and again for the move, and without the restore animation it arrives in one frame.
+        // the restore and again for the move, so it arrives in one step either way.
         //
         // rcNormalPosition is in workspace coordinates while bounds are on the screen: a window on a
         // monitor whose work area starts below or right of its display area is restored to the same
@@ -818,7 +774,6 @@ and
                 | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
                 | None -> Pt()
             let wp = this.placement
-            NoTransition.suppress hwnd
             this.setPlacement { wp with showCmd = int ShowWindowCommands.SW_SHOWNOACTIVATE
                                         flags = 0
                                         rcNormalPosition = Rect(restored.location.sub(workspaceOffset), restored.size) }

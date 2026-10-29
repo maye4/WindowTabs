@@ -44,9 +44,8 @@ behind that call, while its UI remains responsive. Releasing a group does not wa
 for native calls and releases queue entries when outstanding work ends.
 
 Minimize/restore uses the same stream and acknowledges its own WinEvents to avoid
-feeding an older transition back into the group. Maximize/normal changes temporarily
-disable DWM transitions per window, restoring them after the last change settles;
-minimize animations and global animation preferences stay unchanged. The placement
+feeding an older transition back into the group. Native animation settings are
+left unchanged. The placement
 queue publishes completion outside its lock; the owning group posts reconciliation
 to its STA without requiring another foreground
 event. A 16 ms timer only acknowledges pending native minimize/restore events, with
