@@ -726,7 +726,9 @@ type TabStripDecorator(group:WindowGroup) as this =
                         | Some source -> this.ts.ghostTab <- Some(new Icon(source, source.Width, source.Height), dragInfo.tab)
                         | None -> ()
                         this.ts.addTab dragInfo.tab
-                        this.ts.previewDrop pt
+                        // Entering a strip re-lays the whole row at once; animating that reads worse
+                        // than a clean snap, so only a move within the strip slides.
+                        this.ts.previewDrop(pt, false)
                         // The destination group owns its cached icons. Drag data
                         // can outlive the source group's membership and cache.
                         group.addWindow(hwnd, false)

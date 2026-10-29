@@ -336,6 +336,14 @@ module TabImageCache =
                     | _ -> drawn.bitmap.Dispose())
                 raise ex
 
+/// A tab a drag preview pushed aside slides into its new slot instead of jumping there.
+module TabNudge =
+    let duration = 150.0
+    /// How far from its slot a tab pushed `from` pixels away is drawn `elapsed` ms later: the same
+    /// ease the strip's own reveal uses, so the row settles the way the rest of it moves.
+    let offset (from:float) (elapsed:float) =
+        from*(1.0-TabReveal.ease(min 1.0 (max 0.0 (elapsed/duration))))
+
 type TabDisplayInfo = {
     tint: Color option
     colorStyle: string
@@ -1058,12 +1066,12 @@ type TabStripSprite<'id> when 'id : equality = {
 
     /// Folder style: feet run the active tab into the bar on each side where a tab adjoins it.
     /// Tabs set apart by a gap have no bar between them to run into.
-    member private this.feet =
+    member private this.feetWith (shift:'id -> Pt) =
         match this.appearance.tabStyle, this.zorder.tryHead with
         | FolderTabs, Some(top) when this.tabOverlap >= 0.0 && not this.isVertical ->
             let slot = this.slotsOf this.adjustedLorder
             let tab = this.tabSpriteWith slot (this.slotsOf this.lorder) top
-            let location = this.tabLocationWith slot top
+            let location = (this.tabLocationWith slot top).add(shift top)
             let index = slot top
             let radius = tab.footRadius
             let y = if this.direction = TabUp then location.y + tab.size.height - radius else location.y
@@ -1076,21 +1084,30 @@ type TabStripSprite<'id> when 'id : equality = {
               if plainAt 1 then yield Pt(location.x + tab.size.width, y), foot false ]
         | _ -> []
 
-    member this.sprite =
+    member private this.feet = this.feetWith (fun _ -> Pt.empty)
+
+    /// The row as it is drawn, with each tab shifted by `shift`: a drag preview pushing tabs aside
+    /// animates the pixels only, so every position query elsewhere stays settled.
+    member private this.spriteWith (shift:'id -> Pt) =
         {
             new ISprite with
             member x.image = this.bgImage
             // The feet come first so they are drawn over the tabs they reach into.
             member x.children =
-                let tabs = this.tabSprites.list |> List.filter(fun (location,tab) ->
-                    not this.isVertical || (location.y<this.size.height && location.y+tab.size.height>0))
-                List2(this.feet @ (tabs |> List.map(fun (location,tab) -> location,tab :> ISprite)))
+                let tabs =
+                    this.tabSprites.list
+                    |> List.map(fun (location,sprite) -> location.add(shift sprite.id), sprite)
+                    |> List.filter(fun (location,sprite) ->
+                        not this.isVertical || (location.y<this.size.height && location.y+sprite.size.height>0))
+                List2(this.feetWith shift @ (tabs |> List.map(fun (location,sprite) -> location,sprite :> ISprite)))
         }
+
+    member this.sprite = this.spriteWith (fun _ -> Pt.empty)
 
     member this.renderTab tab = this.tabSprite(tab).render
 
-    member this.render =
-        let image = this.sprite.render
+    member this.renderWith (shift:'id -> Pt) =
+        let image = (this.spriteWith shift).render
         if this.isVertical then
             use graphics = image.graphics
             use outline = this.columnOutline
@@ -1099,6 +1116,8 @@ type TabStripSprite<'id> when 'id : equality = {
             use clear = new SolidBrush(Color.Transparent)
             graphics.FillRectangle(clear,Rectangle(Point.Empty,image.size.Size))
         image
+
+    member this.render = this.renderWith (fun _ -> Pt.empty)
 
     member this.collapsedHeight = max 1 (min this.size.height (Dpi.scale 4))
 
