@@ -556,8 +556,18 @@ let main() =
                 let larger = Sz(size.width+Dpi.scale 40,size.height)
                 strip.setPlacement(placement moved larger false)
                 check (frames strip=count+1L && strip.bounds.size=larger) "Resize did not repaint once"
+                let shadowPending = typeof<TabStrip>.GetField("shadowPending",Reflection.BindingFlags.Instance ||| Reflection.BindingFlags.NonPublic)
+                shadowPending.SetValue(strip,true)
                 strip.setPlacement(placement moved larger true)
                 check (frames strip=count+2L && shadow.location.y=moved.y) "Direction change did not repaint or reposition shadow"
+                strip.refreshShadow()
+                Application.DoEvents()
+                check (shadow.location.y=moved.y) "Deferred activation refresh reverted the shadow direction"
+                let afterRefresh = frames strip
+                let downMoved = moved.add(Pt(5,5))
+                strip.setPlacement(placement downMoved larger true)
+                check (frames strip=afterRefresh && shadow.location=downMoved.sub(Pt(Dpi.scale 15,0)))
+                      "Moving after a deferred direction change used the old shadow offset"
                 strip.setPlacement(placement moved larger false)
                 strip.isShrunk <- true
                 let count = frames strip

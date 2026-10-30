@@ -167,10 +167,12 @@ let main() =
                 onGroup info (fun group -> group.addWindow(first.Handle,false))
                 let expected = onGroup info (fun group -> group.placementBounds)
                 let mutable selected = false
+                let mutable foregrounded = false
                 joining.SizeChanged.Add(fun _ ->
                     if not selected then
                         selected <- true
                         arrived.setForeground(false)
+                        foregrounded <- WinUserApi.GetForegroundWindow()=joining.Handle
                         info.invokeGroup(fun () -> info.group.main(joining.Handle,WinEvent.EVENT_SYSTEM_FOREGROUND)))
                 original.setForeground(false)
                 DragTabWindow.set carried.Handle
@@ -179,7 +181,6 @@ let main() =
                     onGroup info (fun group -> group.isPlacementIdle) && arrived.bounds=expected)
                 check (original.bounds=expected && onGroup info (fun group -> group.placementBounds)=expected)
                       "An animated joining member replaced the group's frame with an intermediate size"
-                let foregrounded = WinUserApi.GetForegroundWindow()=joining.Handle
                 check (selected && (not foregrounded || onGroup info (fun group -> group.topWindow)=joining.Handle))
                       "An animated join lost a foreground selection Windows accepted"
             finally
@@ -773,7 +774,7 @@ let main() =
                 check ([b;d] |> List.forall(fun hwnd -> keyboardSource.zorder<OS().windowFromHwnd(hwnd).zorder)) "Maximizing several owned followers covered the originating tab"
                 check (nativeOrder combined=tabsBeforeMove && onGroup combined (fun group -> group.topWindow=a)) "Returning from half-screen to maximized changed the active tab or tab positions"
                 let foreground,active = WinUserApi.GetForegroundWindow(),WinUserApi.GetActiveWindow()
-                check (not(List.contains foreground [a;b;d]) || active=a)
+                check (not(List.contains active [b;d]) && (not(List.contains foreground [a;b;d]) || active=a))
                       (sprintf "Returning from half-screen to maximized activated a follower: active=%A expected=%A foreground=%A followers=%A" active a foreground [b;d])
                 pumpUntil "Returning from half-screen to maximized left the strip hidden or behind its owner" (fun () ->
                     onGroup combined (fun group ->
@@ -787,8 +788,9 @@ let main() =
                     [a;b;d] |> List.forall (fun hwnd -> OS().windowFromHwnd(hwnd).bounds=snapped))
                 check (nativeOrder combined=tabsBeforeMove) "Keyboard snapping changed the tab positions"
                 check (onGroup combined (fun group -> group.topWindow=a)) "Keyboard snapping displaced the originating tab"
-                let foreground = WinUserApi.GetForegroundWindow()
-                check (not(List.contains foreground [a;b;d]) || WinUserApi.GetActiveWindow()=a) "Keyboard snapping activated a follower"
+                let foreground,active = WinUserApi.GetForegroundWindow(),WinUserApi.GetActiveWindow()
+                check (not(List.contains active [b;d]) && (not(List.contains foreground [a;b;d]) || active=a))
+                      "Keyboard snapping activated a follower"
                 check (onGroup combined (fun group ->
                     let strip = OS().windowFromHwnd(group.hwnd)
                     strip.isVisible && strip.zorder<keyboardSource.zorder)) "Keyboard snapping left the strip hidden behind its window"

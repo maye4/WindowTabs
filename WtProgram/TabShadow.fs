@@ -198,18 +198,24 @@ type TabShadowWindow(os:OS, owner:IntPtr) =
         enabled <- false
         window.hide()
 
-    member private this.moveForDirection(newDirection:TabDirection, showIfCached) =
+    member private this.move(showIfCached) =
         let parent = os.windowFromHwnd(owner)
         let show = enabled || (showIfCached && cached.IsSome)
         if parent.isVisible && show then
             enabled <- show
-            window.updateLocation(this.locationFor newDirection)
+            window.updateLocation(this.location)
             if not window.isVisible then window.showNoActivate()
         else window.hide()
 
-    member this.showForDirection(newDirection:TabDirection) = this.moveForDirection(newDirection, true)
-    member this.moveForDirection(newDirection:TabDirection) = this.moveForDirection(newDirection, false)
-    member this.move() = this.moveForDirection(direction)
+    member this.showForDirection(image:Img, newDirection:TabDirection) =
+        // A deferred bitmap may lag changing tab content, never its geometry or orientation.
+        match cached with
+        | Some(w, h, _, previousDirection, _) when w = image.width && h = image.height &&
+                                                  previousDirection = newDirection && padding = TabShadow.padding() ->
+            this.move(true)
+        | _ -> this.update(image, opacity, newDirection)
+
+    member this.move() = this.move(false)
 
     member this.update(image:Img, alpha:byte, newDirection:TabDirection) =
         let nextPadding = TabShadow.padding()

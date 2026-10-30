@@ -497,7 +497,7 @@ let main () =
         helper <- Some layer
         try
             ownerWindow.update(tabImage, Pt(-10000,-10000), 255uy)
-            layer.update(tabImage, 255uy, TabUp)
+            layer.showForDirection(tabImage, TabUp)
             let owned = os.windowsInZorder.list |> List.find (fun w -> w.parent.hwnd = owner.hwnd)
             let hwnd = owned.hwnd
             check owned.isVisible "Shadow not shown"
@@ -533,10 +533,23 @@ let main () =
             layer.update(tabImage, 128uy, TabUp)
             check (owned.location.x = -9700-distance && owned.location.y = -9600-distance) "Layered update did not follow"
             check (os.foreground.hwnd = foreground) "Shadow changed foreground"
-            layer.update(tabImage, 255uy, TabDown)
+            layer.showForDirection(tabImage, TabDown)
             check (owned.location.y = -9600) "Down shadow offset is wrong"
+            layer.sync()
+            check (owned.location.y = -9600) "Activation sync reverted a deferred shadow's direction"
             move -9600 -9500
             check (owned.location.y = -9500) "Down shadow did not follow"
+            layer.move()
+            check (owned.location.y = -9500) "A move reverted a deferred shadow's direction"
+            layer.hide()
+            layer.showForDirection(tabImage, TabDown)
+            layer.sync()
+            check (owned.isVisible && owned.location.y = -9500) "A deferred cached shadow did not stay restored"
+            use resized = new Bitmap(tabImage.width + 20, tabImage.height + 10)
+            let resizedImage = Img(resized)
+            layer.showForDirection(resizedImage, TabDown)
+            check (owned.bounds.size = Sz(resized.Width + distance * 2, resized.Height + distance))
+                  "A deferred resize reused the old shadow dimensions"
             layer.update(tabImage, 255uy, TabUp)
             check (owned.location.y = -9500-distance) "Restore did not reset shadow direction"
             (layer :> IDisposable).Dispose()
