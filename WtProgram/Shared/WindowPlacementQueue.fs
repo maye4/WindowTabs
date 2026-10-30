@@ -9,7 +9,7 @@ type private PlacementEntry<'a>(hwnd:IntPtr) =
     member val owner : obj option = None with get,set
     member val version = 0L with get,set
     member val pending : 'a option = None with get,set
-    member val current : 'a option = None with get,set
+    member val current : ('a * int64) option = None with get,set
     member val running = false with get,set
     member val node : LinkedListNode<PlacementEntry<'a>> option = None with get,set
     member this.queued = this.node.IsSome
@@ -44,7 +44,7 @@ type WindowPlacementQueue<'a>(apply:IntPtr -> 'a -> (unit -> bool) -> unit, ?wor
                 | Some value when entry.owner.IsSome ->
                     entry.pending <- None
                     entry.running <- true
-                    entry.current <- Some value
+                    entry.current <- Some(value,entry.version)
                     job <- Some(entry,value,entry.version)
                 | _ -> if entry.owner.IsNone then entries.Remove(entry.hwnd) |> ignore
             if job.IsNone then workers <- workers-1
@@ -96,7 +96,7 @@ type WindowPlacementQueue<'a>(apply:IntPtr -> 'a -> (unit -> bool) -> unit, ?wor
         let wasIdle = ownerIsIdle owner
         match entries.TryGetValue(hwnd) with
         | true,entry when owns owner entry ->
-            let latest = if entry.pending.IsSome then entry.pending else entry.current
+            let latest = if entry.pending.IsSome then entry.pending else entry.current |> Option.map fst
             if latest |> Option.exists(defaultArg whenValue (fun _ -> true)) then
                 entry.version <- entry.version+1L
                 entry.pending <- None
@@ -124,13 +124,23 @@ type WindowPlacementQueue<'a>(apply:IntPtr -> 'a -> (unit -> bool) -> unit, ?wor
         | _ -> true)
     member _.isWindowBusyWith(owner,hwnd,predicate) = lock gate (fun () ->
         match entries.TryGetValue(hwnd) with
-        | true,entry when owns owner entry -> [entry.pending;entry.current] |> List.exists(Option.exists predicate)
+        | true,entry when owns owner entry -> [entry.pending;entry.current |> Option.map fst] |> List.exists(Option.exists predicate)
+        | _ -> false)
+    /// Only the newest valid request can promise a target; a superseded native call may still run.
+    member _.isWindowLatestWith(owner,hwnd,predicate) = lock gate (fun () ->
+        match entries.TryGetValue(hwnd) with
+        | true,entry when owns owner entry ->
+            let latest =
+                entry.pending |> Option.orElseWith(fun () ->
+                    entry.current |> Option.bind(fun (value,version) -> if version=entry.version then Some value else None))
+            latest |> Option.exists predicate
         | _ -> false)
     member _.retainedCount = lock gate (fun () -> entries.Count)
 
 type FollowerPlacementRequest =
     /// The source's window bounds and placement, the window to stay below, and the source's
-    /// visible frame when the follower should match that rather than the window bounds.
+    /// visible frame when the follower should match that rather than the window bounds, and
+    /// whether a normal-sized member joining in a drag should animate its frame change.
     | AlignWindow of Rect * OSWindowPlacement * IntPtr option * Rect option * bool
     /// A window restored without activation can still rise above the tab that asked for it;
     /// the handle it should stay below goes with the request.
@@ -173,6 +183,9 @@ module FollowerPlacement =
                     if valid() then window.showWindow(if minimized then ShowWindowCommands.SW_SHOWMINNOACTIVE else ShowWindowCommands.SW_SHOWNOACTIVATE)
                     below |> Option.iter(fun top -> if valid() && WinUserApi.IsWindow(top) then window.insertAfter(top))
             | AlignWindow(bounds,wp,below,visible,_) when MoveHidden.holds hwnd ->
+                if DragTrace.enabled then
+                    DragTrace.write(sprintf "RESIZE-HIDDEN hwnd=%d tid=%d target=%s"
+                                        (hwnd.ToInt64()) Thread.CurrentThread.ManagedThreadId (DragTrace.rect bounds))
                 // A follower this run hid for the move comes back here: set the group's frame while
                 // it is still off the screen, then show it. A window that is maximized cannot be
                 // moved, so it is placed instead, which also restores it onto that frame; the show
@@ -244,10 +257,16 @@ module FollowerPlacement =
                                         (hwnd.ToInt64()) (DragTrace.rect target) (DragTrace.rect window.bounds)
                                         window.isVisible (MoveHidden.holds hwnd) window.isMinimized
                                         (Dpi.forWindow hwnd))
-            | AlignWindow(bounds,wp,below,visible,_) ->
+            | AlignWindow(bounds,wp,below,visible,animate) ->
                 let actual = window.placement
+                if animate && DragTrace.enabled then
+                    DragTrace.write(sprintf "RESIZE-JOIN hwnd=%d tid=%d fromCmd=%d toCmd=%d enabled=%b visible=%b moving=%b start=%s target=%s below=%A foreground=%d"
+                                        (hwnd.ToInt64()) Thread.CurrentThread.ManagedThreadId actual.showCmd wp.showCmd
+                                        (WindowFrameAnimation.enabled()) window.isVisible window.isInMoveSize
+                                        (DragTrace.rect window.bounds) (DragTrace.rect bounds) below (WinUserApi.GetForegroundWindow().ToInt64()))
                 let previous = defaultArg below window.prevZorder.hwnd
                 let mutable positioned = false
+                let mutable interrupted = false
                 // Apps draw invisible resize borders of different widths (new Outlook 10px, most
                 // 7px at 125%). Matching window bounds left the visible frames a few pixels apart,
                 // so the tabs, which sit on the visible frame, shifted as the tabs were switched.
@@ -268,7 +287,18 @@ module FollowerPlacement =
                         window.setPlacement(value)
                 // MoveWindow preserves the visible bounds of an Aero snapped window.
                 if wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL && actual.showCmd=ShowWindowCommands.SW_SHOWNORMAL then
-                    if window.bounds<>target() then move()
+                    let start = window.bounds
+                    if animate && start<>target() && window.isVisible && WindowFrameAnimation.enabled() then
+                        let current() = valid() && window.isVisible && not window.isMinimized && not window.isMaximized && not window.isInMoveSize
+                        WindowFrameAnimation.run start target
+                            (fun frame -> if valid() then positioned <- true;window.move(frame))
+                            current
+                        interrupted <- not(current())
+                        if DragTrace.enabled then
+                            DragTrace.write(sprintf "RESIZE-JOIN-END hwnd=%d tid=%d interrupted=%b valid=%b visible=%b minimized=%b maximized=%b moving=%b actual=%s z=%d"
+                                                (hwnd.ToInt64()) Thread.CurrentThread.ManagedThreadId interrupted (valid()) window.isVisible
+                                                window.isMinimized window.isMaximized window.isInMoveSize (DragTrace.rect window.bounds) window.zorder)
+                    if not interrupted && window.bounds<>target() then move()
                 elif actual.showCmd=ShowWindowCommands.SW_SHOWMINIMIZED then
                     let minimized = {wp with showCmd=ShowWindowCommands.SW_SHOWMINIMIZED}
                     if actual<>minimized then place minimized
@@ -290,8 +320,9 @@ module FollowerPlacement =
                         place wp
                     elif actual.rcNormalPosition<>wp.rcNormalPosition then place wp
                 elif actual<>wp then place wp
-                if valid() && window.needsMinimizeAnchor then positioned <- true
-                window.prepareMinimizeAnchor(valid)
+                let complete() = valid() && not interrupted
+                if complete() && window.needsMinimizeAnchor then positioned <- true
+                window.prepareMinimizeAnchor(complete)
                 // Restoring can move again after SetWindowPlacement. Correct stacking
                 // after every native phase, using the source captured by the request.
                 // An application that has just been put on a monitor of another scale applies the
@@ -302,14 +333,15 @@ module FollowerPlacement =
                 // puts it back in the frame; it is not repeated, so an application that refuses the
                 // size keeps its own and no move loop starts. A maximized window's frame is the
                 // system's, larger than the work area by its borders, and refuses a move anyway.
-                if positioned && valid() && not window.isMinimized && not window.isMaximized && window.bounds<>target() then
+                if positioned && complete() && not window.isMinimized && not window.isMaximized && window.bounds<>target() then
                     let refused = window.bounds
                     window.move(target())
                     let want = target()
                     DragTrace.write(sprintf "CORRECT %d asked=%s refused=%s now=%s"
                                         (hwnd.ToInt64()) (DragTrace.rect want) (DragTrace.rect refused)
                                         (DragTrace.rect window.bounds))
-                if positioned && valid() && not window.isMinimized && previous<>IntPtr.Zero && WinUserApi.IsWindow(previous) then
+                if positioned && complete() && not window.isMinimized && previous<>IntPtr.Zero && WinUserApi.IsWindow(previous) &&
+                   not(animate && WinUserApi.GetForegroundWindow()=hwnd) then
                     window.insertAfter(previous)
                 DragTrace.write(sprintf "ALIGN %d want=%s got=%s cmd=%d dpi=%d"
                                     (hwnd.ToInt64()) (DragTrace.rect bounds) (DragTrace.rect window.bounds)
@@ -319,10 +351,12 @@ module FollowerPlacement =
     /// large group is not minimized or restored four windows at a time. The thread pool adds threads
     /// beyond the processor count only slowly, so the limit stays within it.
     let queue = WindowPlacementQueue(apply, workerLimit=(Environment.ProcessorCount |> min 16 |> max 4))
-    let request hwnd bounds placement = identity hwnd,AlignWindow(bounds,placement,None,None,true)
-    let alignBelowRequest hwnd bounds placement top = identity hwnd,AlignWindow(bounds,placement,Some top,None,true)
+    let request hwnd bounds placement = identity hwnd,AlignWindow(bounds,placement,None,None,false)
+    let alignBelowRequest hwnd bounds placement top = identity hwnd,AlignWindow(bounds,placement,Some top,None,false)
     /// As request and alignBelowRequest, matching the source's visible frame when restored.
-    let alignFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,true)
+    let alignFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,false)
+    /// Only membership changes animate; ordinary follower alignment must not lag a native resize.
+    let joinFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,true)
     /// As alignFrameRequest, for a follower this run hid for the move: the frame is applied by a
     /// move and the window is shown once it is in it.
     let alignHiddenFrameRequest hwnd bounds visible placement below = identity hwnd,AlignWindow(bounds,placement,below,Some visible,false)
@@ -330,5 +364,10 @@ module FollowerPlacement =
     let restoreBelowRequest hwnd top = identity hwnd,SetMinimized(false,Some top)
     let hideRequest hwnd = identity hwnd,HideForMove
     let prepareMinimizeRequest hwnd = identity hwnd,PrepareMinimizeAnchor
+    let isAnimating owner hwnd =
+        queue.isWindowBusyWith(owner,hwnd,fun (_,request) -> match request with AlignWindow(_,_,_,_,true) -> true | _ -> false)
+    let isAnimatingTo owner hwnd bounds placement visible =
+        queue.isWindowLatestWith(owner,hwnd,fun (_,request) ->
+            match request with AlignWindow(b,p,_,v,true) -> b=bounds && p=placement && v=Some visible | _ -> false)
     let isChangingMinimizeState owner hwnd =
         queue.isWindowBusyWith(owner,hwnd,fun (_,request) -> match request with SetMinimized _ -> true | _ -> false)

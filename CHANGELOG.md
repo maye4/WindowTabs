@@ -1,5 +1,26 @@
 # Changelog
 
+## v2026.10.30 — 2026-10-30
+
+Changes since v2026.10.17-beta.1.
+
+### Tabs and dragging
+
+- Drag tabs between groups with a preview that follows the pointer, slides the
+  destination into place and flies the released tab into its slot.
+- Animate normal-sized windows joining or leaving a group, including joins that
+  only change the window's position.
+- Keep the dragged window and the destination strip responsive while the window
+  changes groups, including across monitors with different scaling.
+- Keep a maximized group's strip over the expand and restore animations, without
+  covering the tab held by the pointer.
+
+### Performance and stability
+
+- Reuse tab rendering and shadow work instead of rebuilding it on every frame.
+- Keep grouped windows aligned through DPI changes, maximize, restore and snap.
+- Preserve drag ownership and cleanup when a drop target or group exits.
+
 ## v2026.10.17-beta.1 — 2026-10-17 (preview)
 
 Changes since v2026.10.10-beta.1, including those first shipped in v2026.10.13-beta.1.

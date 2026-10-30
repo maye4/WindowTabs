@@ -37,6 +37,33 @@ type SlowMaximizeForm() =
         base.WndProc(&m)
 
 let main() =
+    // Native maximize/restore does not animate a normal-to-normal size change. Its explicit
+    // transition must draw intermediate frames, end exactly, and never outlive its owner.
+    do
+        let small = Rect(Pt(-900,120),Sz(400,300))
+        let large = Rect(Pt(-700,60),Sz(1000,760))
+        for start,target in [small,large;large,small] do
+            check (WindowFrameAnimation.frame start target 0.0=start) "A resize transition did not start at its original frame"
+            let middle = WindowFrameAnimation.frame start target (WindowFrameAnimation.duration/2.0)
+            check (middle<>start && middle<>target) "A normal-sized expand/shrink transition jumped to its final frame"
+            check (WindowFrameAnimation.frame start target (WindowFrameAnimation.duration+50.0)=target)
+                  "A resize transition did not land exactly at its target"
+        let frames = Collections.Generic.List<Rect>()
+        let mutable current = true
+        WindowFrameAnimation.run small (fun () -> large) (fun frame -> frames.Add(frame);current <- false) (fun () -> current)
+        check (frames.Count=1) "A cancelled resize still applied another frame"
+        frames.Clear()
+        let mutable target = large
+        let latest = Rect(Pt(-550,180),Sz(800,600))
+        WindowFrameAnimation.run small (fun () -> target)
+            (fun frame ->
+                frames.Add(frame)
+                if frames.Count=1 then
+                    target <- latest
+                    Thread.Sleep(int WindowFrameAnimation.duration+30))
+            (fun () -> true)
+        check (frames.Count=2 && frames.[1]=latest)
+              "A slow resize replayed overdue frames or ignored its retargeted final frame"
     // Explorer windows 1 and 3 are on desktop 1, window 4 on desktop 2; window 5's desktop is unknown.
     let desk1, desk2 = Guid.NewGuid(), Guid.NewGuid()
     let pathOf (hwnd:IntPtr) = if hwnd = IntPtr(2) then "chrome.exe" else "explorer.exe"
@@ -123,6 +150,40 @@ let main() =
                 result <- Some(try Choice1Of2(action info.group) with error -> Choice2Of2 error))
             pumpUntil "Group dispatcher did not complete" (fun () -> result.IsSome)
             match result.Value with Choice1Of2 value -> value | Choice2Of2 error -> raise error
+        // Selecting the joining member must not cancel its remaining resize or save an intermediate
+        // frame as the group's size. Queue completion reconciles even without another location event.
+        do
+            use first = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                 Bounds=Drawing.Rectangle(80,80,900,660))
+            use joining = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                   Bounds=Drawing.Rectangle(120,120,400,300))
+            use carried = new Form(ShowInTaskbar=false)
+            first.Show()
+            joining.Show()
+            let info = desktopApi.createGroup(false) :?> GroupInfo
+            let original = OS().windowFromHwnd(first.Handle)
+            let arrived = OS().windowFromHwnd(joining.Handle)
+            try
+                onGroup info (fun group -> group.addWindow(first.Handle,false))
+                let expected = onGroup info (fun group -> group.placementBounds)
+                let mutable selected = false
+                joining.SizeChanged.Add(fun _ ->
+                    if not selected then
+                        selected <- true
+                        arrived.setForeground(false)
+                        info.invokeGroup(fun () -> info.group.main(joining.Handle,WinEvent.EVENT_SYSTEM_FOREGROUND)))
+                original.setForeground(false)
+                DragTabWindow.set carried.Handle
+                onGroup info (fun group -> group.addWindow(joining.Handle,false))
+                pumpUntil "Selecting an animated join did not finish at the group's frame" (fun () ->
+                    onGroup info (fun group -> group.isPlacementIdle) && arrived.bounds=expected)
+                check (original.bounds=expected && onGroup info (fun group -> group.placementBounds)=expected)
+                      "An animated joining member replaced the group's frame with an intermediate size"
+                check (selected && onGroup info (fun group -> group.topWindow)=joining.Handle)
+                      "An animated join lost its foreground selection"
+            finally
+                DragTabWindow.clear carried.Handle
+                onGroup info (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
         let nativeOrder info = onGroup info (fun group -> group.lorder.list)
         let publicOrder (info:GroupInfo) = (info :> IGroup).windows.list
         let checkStripOwner info =
@@ -206,6 +267,73 @@ let main() =
                 check (follower.visibleBounds=source.visibleBounds)
                       (sprintf "Windows with different borders were aligned by their window bounds: %A vs %A" follower.visibleBounds source.visibleBounds)
             finally FollowerPlacement.queue.release(frameOwner,narrow.Handle)
+        // A normal-sized drag join eases size and position changes through real native frames,
+        // while a regular reconciliation still aligns immediately. It must keep the originating
+        // tab active.
+        do
+            use source = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                  Bounds=Drawing.Rectangle(-20000,-20000,900,660))
+            use follower = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                    Bounds=Drawing.Rectangle(-19000,-19000,400,300))
+            let sourceWindow,followerWindow = OS().windowFromHwnd(source.Handle),OS().windowFromHwnd(follower.Handle)
+            for window in [sourceWindow;followerWindow] do window.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            let owner = obj()
+            let resized = Collections.Generic.List<Drawing.Size>()
+            let positions = Collections.Generic.List<Rect>()
+            follower.SizeChanged.Add(fun _ -> resized.Add follower.Size)
+            follower.LocationChanged.Add(fun _ -> positions.Add followerWindow.bounds)
+            let foreground = WinUserApi.GetForegroundWindow()
+            FollowerPlacement.queue.claim(owner,follower.Handle)
+            try
+                for size in [Sz(900,660);Sz(500,360)] do
+                    sourceWindow.move(Rect(sourceWindow.bounds.location,size))
+                    resized.Clear()
+                    let before = followerWindow.bounds.size
+                    FollowerPlacement.queue.submit(owner,follower.Handle,
+                        FollowerPlacement.joinFrameRequest follower.Handle sourceWindow.bounds sourceWindow.visibleBounds sourceWindow.placement (Some source.Handle))
+                    if FollowerPlacement.isAnimating owner follower.Handle then
+                        check (FollowerPlacement.isAnimatingTo owner follower.Handle sourceWindow.bounds sourceWindow.placement sourceWindow.visibleBounds)
+                              "An unchanged source frame would replace its active join animation"
+                        check (not(FollowerPlacement.isAnimatingTo owner follower.Handle (sourceWindow.bounds.move(1,0)) sourceWindow.placement sourceWindow.visibleBounds))
+                              "A changed source frame could not replace its active join animation"
+                    pumpUntil "A normal-sized animated join did not finish" (fun () -> FollowerPlacement.queue.isIdle(owner))
+                    check (followerWindow.visibleBounds=sourceWindow.visibleBounds) "An animated join did not reach the group's exact visible frame"
+                    if WindowFrameAnimation.enabled() then
+                        check (resized |> Seq.exists(fun frame -> frame<>before.Size && frame<>follower.Size))
+                              "A normal-sized drag join applied only its final size"
+                    check (WinUserApi.GetForegroundWindow()=foreground) "A normal-sized resize animation stole the foreground"
+                followerWindow.move(Rect(Pt(-19000,-19000),sourceWindow.bounds.size))
+                let start = followerWindow.bounds
+                positions.Clear()
+                FollowerPlacement.queue.submit(owner,follower.Handle,
+                    FollowerPlacement.joinFrameRequest follower.Handle sourceWindow.bounds sourceWindow.visibleBounds sourceWindow.placement (Some source.Handle))
+                pumpUntil "A position-only animated join did not finish" (fun () -> FollowerPlacement.queue.isIdle(owner))
+                check (followerWindow.visibleBounds=sourceWindow.visibleBounds)
+                      "A position-only join did not reach the group's exact visible frame"
+                if WindowFrameAnimation.enabled() then
+                    check (positions |> Seq.exists(fun frame ->
+                               frame.location<>start.location && frame.location<>sourceWindow.bounds.location))
+                          "A same-size drag join moved straight to its final position"
+                followerWindow.move(Rect(followerWindow.bounds.location,Sz(400,300)))
+                resized.Clear()
+                FollowerPlacement.queue.submit(owner,follower.Handle,
+                    FollowerPlacement.alignFrameRequest follower.Handle sourceWindow.bounds sourceWindow.visibleBounds sourceWindow.placement None)
+                pumpUntil "Ordinary follower alignment did not finish" (fun () -> FollowerPlacement.queue.isIdle(owner))
+                check (resized.Count=1 && followerWindow.visibleBounds=sourceWindow.visibleBounds)
+                      "Ordinary reconciliation animated instead of aligning immediately"
+                if WindowFrameAnimation.enabled() then
+                    followerWindow.move(Rect(followerWindow.bounds.location,Sz(400,300)))
+                    let mutable interrupted = false
+                    follower.SizeChanged.Add(fun _ ->
+                        if not interrupted then
+                            interrupted <- true
+                            followerWindow.showWindow(ShowWindowCommands.SW_SHOWMAXIMIZED))
+                    FollowerPlacement.queue.submit(owner,follower.Handle,
+                        FollowerPlacement.joinFrameRequest follower.Handle sourceWindow.bounds sourceWindow.visibleBounds sourceWindow.placement None)
+                    pumpUntil "A native maximize did not interrupt the normal-size animation" (fun () -> FollowerPlacement.queue.isIdle(owner))
+                    check (interrupted && followerWindow.isMaximized)
+                          "A cancelled normal-size animation overwrote the new native window state"
+            finally FollowerPlacement.queue.release(owner,follower.Handle)
         try
             FollowerPlacement.queue.submit(snapQueueOwner,snapFollower.Handle,
                 FollowerPlacement.request snapFollower.Handle snapped normalPlacement)
@@ -1106,11 +1234,16 @@ let main() =
                                          Bounds=Drawing.Rectangle(180,180,500,360))
                 movedForm.Show()
                 let window = OS().windowFromHwnd movedForm.Handle
+                let sizes = Collections.Generic.List<Drawing.Size>()
+                movedForm.SizeChanged.Add(fun _ -> sizes.Add movedForm.Size)
                 let mover = new DragWindowMover(window)
                 for x in [200;260;320] do mover.request (Pt(x,240)) (Sz(520,380))
                 // The worker's moves are sent to this thread, which owns the form; pump until they land.
                 pumpUntil "The drag mover did not reach the last frame it was asked for" (fun () ->
                     window.visibleBounds.location = Pt(320,240) && window.bounds.size = Sz(520,380))
+                if WindowFrameAnimation.enabled() then
+                    check (sizes |> Seq.exists(fun size -> size<>Drawing.Size(500,360) && size<>Drawing.Size(520,380)))
+                          "A normal-sized window dragged out jumped straight to its own size"
                 let mutable settled = false
                 mover.settle(fun () -> Volatile.Write(&settled,true))
                 pumpUntil "The drag mover did not settle" (fun () -> Volatile.Read(&settled))
@@ -1118,6 +1251,43 @@ let main() =
                 (mover :> IDisposable).Dispose()
                 Application.DoEvents()
                 check (window.visibleBounds.location = Pt(320,240)) "A settled drag mover moved the window again"
+            // A worker can finish after the timer reads the window frame but before it draws the
+            // tab. That tick must not stop the timer before it has drawn the final window frame.
+            do
+                use form = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                    Bounds=Drawing.Rectangle(-20000,-20000,500,360))
+                let window = OS().windowFromHwnd form.Handle
+                window.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+                use entered = new ManualResetEventSlim(false)
+                use resume = new ManualResetEventSlim(false)
+                use mover = new DragWindowMover(window,moveWindow=(fun _ -> entered.Set();resume.Wait()))
+                let frames = Collections.Generic.List<Rect>()
+                let mutable finalFrame = None
+                let sprite = {
+                    frame = fun _ visible ->
+                        frames.Add visible
+                        if frames.Count=1 then
+                            check (entered.Wait(5000)) "The floating refresh worker did not start"
+                        elif frames.Count=2 then
+                            window.move(window.bounds.move(100,50))
+                            finalFrame <- Some window.visibleBounds
+                            resume.Set()
+                            check (SpinWait.SpinUntil((fun () -> not mover.isMoving),5000))
+                                  "The floating refresh worker did not finish during the draw"
+                        box 0,visible.location,(fun () -> Img(Sz(60,24)))
+                    release = ignore }
+                use tab = new FloatingTab(OS(),sprite,(fun _ -> Pt()))
+                let state = DragFloatingState({
+                    targets=Map2();window=window;normalSize=None;mover=mover;tab=Some tab
+                    onDragIn=ignore })
+                try
+                    state.follow(Pt(200,240))
+                    pumpUntil "The floating tab stopped before drawing the worker's final frame" (fun () ->
+                        finalFrame |> Option.exists(fun final -> frames |> Seq.exists((=)final)))
+                    check (not mover.isMoving) "The final floating frame was drawn before its worker settled"
+                finally
+                    resume.Set()
+                    (state :> IDragState).dispose()
             // A slow move can last beyond the former 500 ms timeout. The UI does not wait for it,
             // but neither a new group nor the desktop may place the window until it has returned.
             do

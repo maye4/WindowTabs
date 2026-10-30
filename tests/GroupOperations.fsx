@@ -98,14 +98,23 @@ let main() =
         check (completed.IsEmpty) "An unfinished native call published completion"
         check (queue.isWindowBusyWith(owner,first,((=)1))) "In-flight request kind was lost"
         check (not(queue.isWindowBusyWith(owner,first,((=)99)))) "An unrelated request kind was marked busy"
+        check (queue.isWindowLatestWith(owner,first,((=)1))) "A current placement lost its target"
         queue.submit(owner,first,2)
+        check (queue.isWindowLatestWith(owner,first,((=)2)) && not(queue.isWindowLatestWith(owner,first,((=)1))))
+              "A superseded placement hid the newest target"
+        queue.cancel(owner,first,whenValue=((=)2))
+        check (not(queue.isWindowLatestWith(owner,first,fun _ -> true)))
+              "Cancelling pending work revived its superseded target"
         queue.submit(owner,first,3)
         queue.submit(owner,removed,99)
         queue.release(owner,removed)
         check (queue.retainedCount=1) "Cancelled queued HWND remained retained behind a slow call"
         queue.claim(other,first)
+        check (not(queue.isWindowLatestWith(other,first,fun _ -> true)))
+              "A transferred window inherited its previous owner's target"
         check (completed.ToArray()=[|owner|]) "Transferred work did not release the previous owner's wait"
         queue.submit(other,first,4)
+        check (queue.isWindowLatestWith(other,first,((=)4))) "A transferred window lost its new owner's target"
         queue.release(owner,first)
         resume.Set()
         pumpUntil(fun () -> queue.isIdle(other) && queue.retainedCount=1 && completed.Count=2)

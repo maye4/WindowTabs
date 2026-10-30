@@ -67,6 +67,17 @@ Floating tab drags coalesce native moves on a worker. Entering another strip or
 releasing capture waits by callback, not by blocking the drag STA, until the
 in-flight move has returned. New pointer frames invalidate queued handoffs, and
 release preserves the newest pending strip entry before committing the drop.
+Normal-sized drag joins and departures ease their frame changes over 180 ms on those workers,
+respecting Windows' animation-effects preference. Position-only joins animate too; pointer-only
+floating moves remain immediate. Only the newest valid placement request can suppress a duplicate
+join target, not a superseded native call still returning. Frames use elapsed time, so a slow layout
+skips overdue frames instead of extending the transition. Pointer updates retarget a floating transition
+without restarting its clock; a handoff cancels it before placing the window elsewhere. Intermediate
+placement frames are not saved as the group's frame, even if the joining tab becomes foreground.
+Ordinary follower reconciliation remains immediate; native maximize/restore is left to Windows.
+The floating tab refreshes from the actual window frame on its owning STA until the move settles,
+including one final refresh after the worker stops, so its chrome stays attached even if the pointer
+stops during a resize.
 When a maximized follower returns to normal, restore it without activation, apply
 the source's actual bounds (its saved restore rectangle may predate snapping), and
 retain its native stacking position. The same stacking protection applies when

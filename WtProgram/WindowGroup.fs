@@ -230,6 +230,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// Bounds to restore windows to, their placement, and the visible frame the tabs sit on.
     let placement = Cell.create(None:Option<Rect * OSWindowPlacement * Rect>)
     let placementOwner = obj()
+    let animatedJoins = Collections.Generic.HashSet<IntPtr>()
     let windowsCell = Cell.create(Set2())
     let _ts = ref None 
     let inMoveSize = Cell.create(false)
@@ -390,10 +391,16 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                 if not this.isEmpty then this.setTsParent(this.topWindow)
             if reconcilePlacementState && FollowerPlacement.queue.isIdle(placementOwner) then
                 reconcilePlacementState <- false
+                let saveAnimatedTop = zorderCell.value.tryHead.exists(animatedJoins.Contains)
+                animatedJoins.Clear()
                 // A queued or slow native placement may start its animation long after submission.
                 // Give its last frame time to settle too, within the original hard deadline.
                 if stripHoldLimit>0L then stripHoldDue <- transitionClock.ElapsedMilliseconds + stripHoldMillis
-                this.withUpdate(fun () -> this.updateIsVisible())
+                this.withUpdate(fun () ->
+                    if saveAnimatedTop && not inMoveSize.value then
+                        this.saveTopWindowPlacement()
+                        this.adjustChildWindows()
+                    this.updateIsVisible())
                 if not this.isEmpty then this.setTsParent(this.topWindow)
             if pendingMinimizeStates.Count=0 then minimizeStateTimer.Stop()
 
@@ -584,7 +591,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             if newZorder.tryHead<>zorderCell.value.tryHead then
                 newZorder.tryHead.iter(fun hwnd ->
                     FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
-                        match request with SetMinimized _ -> false | _ -> true)))
+                        match request with SetMinimized _ | AlignWindow(_,_,_,_,true) -> false | _ -> true)))
             prevTop.set(zorderCell.value.tryHead)
             zorderCell.set(newZorder)
 
@@ -812,7 +819,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             appearanceSnapshot <- logicalAppearance.scaled
             this.ts.setTabAppearance(appearanceSnapshot)
             geometryChangedEvent.Trigger()
-        if  window.isMinimized.not &&
+        if  not(FollowerPlacement.isAnimating placementOwner window.hwnd) &&
+            window.isMinimized.not &&
             this.os.isOnScreen(window.bounds)
             then
             let monitorBounds =
@@ -870,7 +878,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             reconcilePlacementState <- true
             this.finishPlacementReconciliation()
            
-    member private this.adjustWindowPlacement(hwnd) =
+    member private this.placeWindow(hwnd:IntPtr, animate) =
+        if DragTrace.enabled && DragTabWindow.current()<>IntPtr.Zero then
+            DragTrace.write(sprintf "RESIZE-REQUEST hwnd=%d animate=%b saved=%b moving=%b joining=%b"
+                                (hwnd.ToInt64()) animate placement.value.IsSome inMoveSize.value (animatedJoins.Contains(hwnd)))
         let changingMinimizeState =
             match requestedMinimizeStates.TryGetValue(hwnd) with
             | true,expected -> this.os.windowFromHwnd(hwnd).isMinimized<>expected && FollowerPlacement.isChangingMinimizeState placementOwner hwnd
@@ -883,13 +894,25 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             if not window.isMinimized && (wp.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED) <> window.isMaximized then
                 this.holdStripOverAnimation()
             let below = zorderCell.value.tryHead |> Option.filter((<>) hwnd)
+            let animate = animate && wp.showCmd=ShowWindowCommands.SW_SHOWNORMAL &&
+                          not window.isMaximized && not window.isMinimized
+            if DragTrace.enabled && DragTabWindow.current()<>IntPtr.Zero then
+                DragTrace.write(sprintf "RESIZE-SELECT hwnd=%d animate=%b cmd=%d hidden=%b top=%d"
+                                    (hwnd.ToInt64()) animate wp.showCmd (MoveHidden.holds hwnd) (this.topWindow.ToInt64()))
             let request =
                 if MoveHidden.holds hwnd then FollowerPlacement.alignHiddenFrameRequest hwnd bounds visible wp below
+                elif animate then FollowerPlacement.joinFrameRequest hwnd bounds visible wp below
                 else FollowerPlacement.alignFrameRequest hwnd bounds visible wp below
-            FollowerPlacement.queue.submit(placementOwner,hwnd,request)
+            // A late location event from the source can ask for the same frame during the join.
+            // Replacing it with an immediate reconciliation would cut the transition short.
+            if animate || not(FollowerPlacement.isAnimatingTo placementOwner hwnd bounds wp visible) then
+                if animate then animatedJoins.Add(hwnd) |> ignore
+                FollowerPlacement.queue.submit(placementOwner,hwnd,request)
             // Maximize/snap can hide or cover the owned strip after its early events.
             reconcilePlacementState <- true
             this.finishPlacementReconciliation()
+
+    member private this.adjustWindowPlacement(hwnd) = this.placeWindow(hwnd, false)
 
     member this.isPlacementIdle = FollowerPlacement.queue.isIdle(placementOwner) && not reconcileMinimizeState && not reconcilePlacementState
                      
@@ -974,6 +997,8 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     DragTrace.write(sprintf "PRESS-SHOW-RAW %d" (hwnd.ToInt64())))
 
     member this.onEnterMoveSize() =
+        FollowerPlacement.queue.cancel(placementOwner,this.topWindow,whenValue=(fun (_,request) ->
+            match request with AlignWindow(_,_,_,_,true) -> true | _ -> false))
         if not inMoveSize.value then
             soloSizeBeforeMove <-
                 if this.windowCount = 1 then
@@ -1136,7 +1161,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             // end the move is gated on that belief. The window itself says whether it is moving.
             if this.isTop(hwnd) && inMoveSize.value && not (this.os.windowFromHwnd(hwnd).isInMoveSize) then
                 this.onExitMoveSize()
-            if this.isTop(hwnd) && inMoveSize.value.not then
+            // A joining tab can become foreground before its queued transition ends. Its intermediate
+            // frames are not a new group size and must not resize every other member or cancel it.
+            if this.isTop(hwnd) && inMoveSize.value.not && not(FollowerPlacement.isAnimating placementOwner hwnd) then
                 //you can miss EVENT_SYSTEM_MOVESIZESTART events
                 //when a window is created and is immediatly in move size, we subscribe
                 //to the event too late (Chrome tab dragging is prime example)
@@ -1220,7 +1247,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             if foreground=hwnd then
                 opener <- lastActiveTab |> Option.filter(fun owner -> owner<>hwnd && this.windows.contains(owner) && isOpen owner) |> Option.map(fun owner -> hwnd,owner)
             lastActiveTab <- TabNavigation.rememberActive this.lorder.list isOpen lastActiveTab foreground
-            StartupTrace.measure "group.add.placement" (fun () -> this.adjustWindowPlacement(hwnd))
+            StartupTrace.measure "group.add.placement" (fun () -> this.placeWindow(hwnd, DragTabWindow.current()<>IntPtr.Zero))
             if hasSavedTabLayout then WindowTabLayout.save hwnd this.tabLayout
             StartupTrace.measure "group.add.notify" (fun () -> addedEvent.Trigger(hwnd))
             // A visible window joining a minimized group restores it, as restoring any tab does,
@@ -1245,6 +1272,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             if DragTabWindow.current()<>IntPtr.Zero && isOpen hwnd && not(isMinimized hwnd) &&
                (placement.value |> Option.exists(fun(_,wp,_) -> wp.showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED)) then
                 this.holdStripOverAnimation()
+            animatedJoins.Remove(hwnd) |> ignore
             FollowerPlacement.queue.release(placementOwner,hwnd)
             //CASE 777 - chrome windows can close when you merge a single chrome tab
             //into another chrome group, need to exit the move/size and restore windows on screen in this case

@@ -266,7 +266,34 @@ type DragWindowMover(window:Window, ?moveWindow:Pt * Sz -> unit) =
     let mutable running = false
     let mutable disposed = false
     let mutable settled : (unit -> unit) option = None
+    let customMove = moveWindow.IsSome
     let moveWindow = defaultArg moveWindow (fun (visibleAt,size) -> window.followDragTo visibleAt size)
+    let apply (visibleAt,size) =
+        let start = window.bounds
+        if start.size<>size && DragTrace.enabled then
+            DragTrace.write(sprintf "RESIZE-FLOAT hwnd=%d tid=%d custom=%b enabled=%b visible=%b minimized=%b maximized=%b fullscreen=%b moving=%b start=%s size=%dx%d"
+                                (window.hwnd.ToInt64()) Threading.Thread.CurrentThread.ManagedThreadId customMove
+                                (WindowFrameAnimation.enabled()) window.isVisible window.isMinimized window.isMaximized window.isFullScreen
+                                window.isInMoveSize (DragTrace.rect start) size.width size.height)
+        if not customMove && window.isVisible && not window.isMinimized && not window.isMaximized &&
+           not window.isFullScreen && start.size<>size && WindowFrameAnimation.enabled() then
+            let mutable latest = visibleAt,size
+            let target () =
+                lock gate (fun () ->
+                    wanted |> Option.iter(fun value -> latest <- value)
+                    wanted <- None)
+                let point,size = latest
+                Rect(point.add(window.dragFrameOffset),size)
+            let current () =
+                lock gate (fun () -> not disposed && settled.IsNone) &&
+                WinUserApi.IsWindow(window.hwnd) && window.isVisible && not window.isMinimized && not window.isMaximized && not window.isInMoveSize
+            WindowFrameAnimation.run start target window.move current
+            if DragTrace.enabled then
+                let cancelled = lock gate (fun () -> disposed || settled.IsSome)
+                DragTrace.write(sprintf "RESIZE-FLOAT-END hwnd=%d tid=%d handoff=%b visible=%b minimized=%b maximized=%b moving=%b actual=%s"
+                                    (window.hwnd.ToInt64()) Threading.Thread.CurrentThread.ManagedThreadId cancelled
+                                    window.isVisible window.isMinimized window.isMaximized window.isInMoveSize (DragTrace.rect window.bounds))
+        else moveWindow(visibleAt,size)
     let rec run () =
         let next,after = lock gate (fun () ->
             let next = wanted
@@ -279,10 +306,12 @@ type DragWindowMover(window:Window, ?moveWindow:Pt * Sz -> unit) =
             else next,None)
         match next with
         | Some(visibleAt,size) ->
-            (try if WinUserApi.IsWindow window.hwnd then moveWindow(visibleAt,size)
+            (try if WinUserApi.IsWindow window.hwnd then apply(visibleAt,size)
              with error -> Diagnostics.Trace.TraceWarning("Drag move failed: {0}",error.Message))
             run()
         | None -> after |> Option.iter(fun action -> action())
+    member this.isMoving = lock gate (fun () -> running)
+
     /// Ask for the window to show at this frame; returns at once.
     member this.request (visibleAt:Pt) (size:Sz) =
         lock gate (fun () ->
@@ -319,18 +348,26 @@ type DragFloatingStateInfo = {
 
 type DragFloatingState(info:DragFloatingStateInfo) =
     let os = OS()
+    let timer = new System.Windows.Forms.Timer(Interval=16)
+    let mutable pointer = Pt()
+    let drawTab() =
+        if WinUserApi.IsWindow(info.window.hwnd) then
+            info.tab |> Option.iter(fun tab -> tab.follow pointer info.window.visibleBounds)
+    do timer.Tick.Add(fun _ ->
+        // Sample before drawing: a worker finishing during the draw still needs one final refresh.
+        let moving = info.mover.isMoving
+        drawTab()
+        if not moving then timer.Stop())
     member this.follow(ptScreen) =
-        // Worked out here, where the drag's DPI is, and handed to the mover. The tab sits on the frame
-        // asked for rather than the one the window has reached, so it follows the pointer even while
-        // the app is still laying itself out.
+        // Only the owning STA draws the tab. It follows actual frames during the resize, including
+        // when the pointer stops, rather than detaching from the window at the final requested size.
         let window = info.window
         let size = window.dragSize ptScreen (info.normalSize |> Option.orElse (Some window.placement.rcNormalPosition.size))
         let visibleAt = window.dragVisibleAt ptScreen size
+        pointer <- ptScreen
         info.mover.request visibleAt size
-        // What is seen of that frame is smaller than the window by its invisible borders.
-        let bounds,visible = window.bounds,window.visibleBounds
-        let seen = Sz(size.width - (bounds.width - visible.width), size.height - (bounds.height - visible.height))
-        info.tab |> Option.iter(fun tab -> tab.follow ptScreen (Rect(visibleAt,seen)))
+        drawTab()
+        if info.tab.IsSome then timer.Start()
     interface IDragState with
         member this.mouseMove(ptScreen) =
             // The dragged window stays shown all the way to a target strip: hiding it when
@@ -343,7 +380,7 @@ type DragFloatingState(info:DragFloatingStateInfo) =
             | None -> this.follow(ptScreen)
         // The tab is not hidden here: entering a strip hands it over to the captured state, which
         // keeps holding it under the pointer until the drag ends.
-        member this.dispose() = ()
+        member this.dispose() = timer.Dispose()
 
 type DragActionInfo = {
     targets : Map2<IntPtr, IDragDropTarget>

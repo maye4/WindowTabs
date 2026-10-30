@@ -121,6 +121,52 @@ module MoveHidden =
                     WinUserApi.ShowWindow(hwnd,cmd) |> ignore
                 WinUserApi.RemoveProp(hwnd,key) |> ignore
 
+/// Normal-to-normal frame changes have no native transition. Use elapsed time, not a fixed number
+/// of layouts: a slow application skips overdue frames instead of stretching the gesture out.
+module WindowFrameAnimation =
+    let duration = 180.0
+
+    let enabled() =
+        let mutable animate = true
+        WinUserApi.SystemParametersInfo(SystemParametersInfoParameters.SPI_GETCLIENTAREAANIMATION,0,&animate,0) |> ignore
+        animate
+
+    let frame (start:Rect) (target:Rect) elapsed =
+        let t = max 0.0 (min 1.0 (elapsed / duration))
+        let eased = 1.0 - (1.0-t)*(1.0-t)*(1.0-t)
+        let between a b = a + int(Math.Round(float(b-a) * eased))
+        Rect(Pt(between start.x target.x, between start.y target.y),
+             Sz(between start.width target.width, between start.height target.height))
+
+    /// A new owner cancels even the final frame; a pointer move can retarget without restarting time.
+    let run (start:Rect) (target:unit -> Rect) (move:Rect -> unit) (current:unit -> bool) =
+        let trace = if DragTrace.enabled then Some(Text.StringBuilder()) else None
+        let clock = Diagnostics.Stopwatch.StartNew()
+        let mutable previous = start
+        let mutable finished = false
+        let mutable frames = 0
+        try
+            while not finished && current() do
+                let began = clock.Elapsed.TotalMilliseconds
+                // The first frame must differ from the start even on a newly started stopwatch.
+                let next = frame start (target()) (max 1.0 began)
+                if next<>previous && current() then
+                    let before = clock.ElapsedMilliseconds
+                    move next
+                    frames <- frames+1
+                    previous <- next
+                    trace |> Option.iter(fun text ->
+                        text.Append(sprintf " [%d..%dms %s]" before clock.ElapsedMilliseconds (DragTrace.rect next)) |> ignore)
+                finished <- began>=duration
+                let wait = 16 - int(clock.Elapsed.TotalMilliseconds-began)
+                if not finished && wait>0 && current() then Threading.Thread.Sleep(wait)
+        finally
+            // Buffer frame timings: disk I/O between moves would change the animation being measured.
+            trace |> Option.iter(fun text ->
+                DragTrace.write(sprintf "RESIZE-RUN tid=%d elapsed=%dms frames=%d finished=%b start=%s last=%s%s"
+                                    Threading.Thread.CurrentThread.ManagedThreadId clock.ElapsedMilliseconds frames finished
+                                    (DragTrace.rect start) (DragTrace.rect previous) (text.ToString())))
+
 type IWindow =
     abstract member hwnd : IntPtr
 
@@ -780,12 +826,8 @@ and
         // Measured again once restored: a maximized frame's invisible borders are not a restored one's,
         // so the move below can still shift the window a few pixels, but never resizes it again.
         let rect = frame()
-        // One move, however far it is. A change of size used to be stepped over several frames, but
-        // repainting a large window costs about 20 ms a frame, so the steps were few, uneven and
-        // visibly separate: the window appeared to jump two or three times. The move itself is the
-        // same cost paid once, and reads as the window arriving rather than stuttering there.
-        //
-        // A move that changes nothing at all is skipped: it would only make the app lay itself out.
+        // Immediate positioning for native restore and callers outside the floating worker. That
+        // worker owns normal-sized frame transitions; unchanged frames still need no layout.
         if this.bounds <> rect then this.move(rect)
         // Showing a window that is already shown costs a ShowWindow per pointer move.
         if not this.isVisible then this.showNoActivate()

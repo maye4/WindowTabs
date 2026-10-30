@@ -9,6 +9,13 @@ fades it off the row over the same time.
 
 ## animation
 
+Normal-sized windows ease from their current frame into the group's frame over 180 ms, and back to
+their own frame when dragged out. The animation covers position changes as well as size changes:
+Windows only supplies a native animation for maximize/restore, not normal-to-normal frame changes.
+The native worker uses elapsed time and skips overdue frames; pointer updates retarget the same
+transition without restarting it. An ownership change cancels the remaining frames before the next
+group places the window. Windows' animation-effects setting is respected. Ordinary group moves and
+resizes still align immediately, as do pointer-only moves while floating outside a group.
 
 # a new tab joining a full-screen group
 
