@@ -176,9 +176,11 @@ type TabShadowWindow(os:OS, owner:IntPtr) =
     let mutable cached : (int * int * byte[] * TabDirection * Bitmap) option = None
     do window.setParent(os.windowFromHwnd(owner))
 
-    member private this.location =
+    member private this.locationFor direction =
         let pt = (os.windowFromHwnd(owner)).bounds.location
         Pt(pt.x - padding, pt.y - (if direction = TabUp then padding else 0))
+
+    member private this.location = this.locationFor direction
 
     member this.sync() =
         let parent = os.windowFromHwnd(owner)
@@ -196,12 +198,14 @@ type TabShadowWindow(os:OS, owner:IntPtr) =
         enabled <- false
         window.hide()
 
-    member this.move() =
+    member this.moveForDirection(newDirection:TabDirection) =
         let parent = os.windowFromHwnd(owner)
         if parent.isVisible && enabled then
-            window.updateLocation(this.location)
+            window.updateLocation(this.locationFor newDirection)
             if not window.isVisible then window.showNoActivate()
         else window.hide()
+
+    member this.move() = this.moveForDirection(direction)
 
     member this.update(image:Img, alpha:byte, newDirection:TabDirection) =
         let nextPadding = TabShadow.padding()

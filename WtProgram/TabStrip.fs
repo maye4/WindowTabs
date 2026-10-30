@@ -523,7 +523,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             StartupTrace.measure "strip.paint.shadow" (fun () ->
               shadowWindow |> Option.iter (fun shadow ->
                 if reveal<1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
-                elif skip then shadow.move()
+                elif skip then shadow.moveForDirection(this.direction)
                 else shadow.update(image, 255uy, this.direction)))
             // Only a paint that came hot on the heels of another arms the deferred rebuild: a lone paint
             // has already drawn the shadow it needs.

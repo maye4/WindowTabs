@@ -450,11 +450,11 @@ let main() =
                 pumpUntil(fun () -> onGroup(fun group -> group.isPlacementIdle))
                 if count=5 then
                     samples "5tabs-selection-info-responsive" 30 (fun group index ->
-                        invoke "setTabInfo" group [|box handles.[index%5]|] |> ignore)
+                        invoke "setTabInfo" group [|box handles.[index%5]; box (None:bool option)|] |> ignore)
                     onHelper(fun () -> forms.Head.IconDelay <- 50)
                     try
                         samples "5tabs-selection-info-one-50ms-icon-handler" 3 (fun group _ ->
-                            invoke "setTabInfo" group [|box handles.Head|] |> ignore)
+                            invoke "setTabInfo" group [|box handles.Head; box (None:bool option)|] |> ignore)
                     finally onHelper(fun () -> forms.Head.IconDelay <- 0)
                     // Closing hides the active tab before discovery removes it, and Windows then
                     // activates the previously used tab. The successor is selected right away.
@@ -654,7 +654,7 @@ let main() =
                 let values = onGroup(fun group ->
                     [for _ in 1..30 do
                         let clock = Stopwatch.StartNew()
-                        invoke "setTabInfo" group [|box foreignHwnd|] |> ignore
+                        invoke "setTabInfo" group [|box foreignHwnd; box (None:bool option)|] |> ignore
                         yield clock.Elapsed.TotalMilliseconds] |> List.sort)
                 printfn "PERF foreign-busy-selection-cached median=%.3fms p95=%.3fms" values.[15] values.[28]
                 check (values.[15]<40.0) "Cached selection still waited for an 80ms foreign icon handler"

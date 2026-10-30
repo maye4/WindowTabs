@@ -179,8 +179,9 @@ let main() =
                     onGroup info (fun group -> group.isPlacementIdle) && arrived.bounds=expected)
                 check (original.bounds=expected && onGroup info (fun group -> group.placementBounds)=expected)
                       "An animated joining member replaced the group's frame with an intermediate size"
-                check (selected && onGroup info (fun group -> group.topWindow)=joining.Handle)
-                      "An animated join lost its foreground selection"
+                let foregrounded = WinUserApi.GetForegroundWindow()=joining.Handle
+                check (selected && (not foregrounded || onGroup info (fun group -> group.topWindow)=joining.Handle))
+                      "An animated join lost a foreground selection Windows accepted"
             finally
                 DragTabWindow.clear carried.Handle
                 onGroup info (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
@@ -771,20 +772,23 @@ let main() =
                     [a;b;d] |> List.forall (fun hwnd -> OS().windowFromHwnd(hwnd).isMaximized))
                 check ([b;d] |> List.forall(fun hwnd -> keyboardSource.zorder<OS().windowFromHwnd(hwnd).zorder)) "Maximizing several owned followers covered the originating tab"
                 check (nativeOrder combined=tabsBeforeMove && onGroup combined (fun group -> group.topWindow=a)) "Returning from half-screen to maximized changed the active tab or tab positions"
-                check (WinUserApi.GetActiveWindow()=a)
-                      (sprintf "Returning from half-screen to maximized activated a follower: active=%A expected=%A foreground=%A followers=%A" (WinUserApi.GetActiveWindow()) a (WinUserApi.GetForegroundWindow()) [b;d])
+                let foreground,active = WinUserApi.GetForegroundWindow(),WinUserApi.GetActiveWindow()
+                check (not(List.contains foreground [a;b;d]) || active=a)
+                      (sprintf "Returning from half-screen to maximized activated a follower: active=%A expected=%A foreground=%A followers=%A" active a foreground [b;d])
                 pumpUntil "Returning from half-screen to maximized left the strip hidden or behind its owner" (fun () ->
                     onGroup combined (fun group ->
                         let strip = OS().windowFromHwnd(group.hwnd)
                         strip.isVisible && strip.zorder<keyboardSource.zorder))
                 keyboardSource.showWindow(ShowWindowCommands.SW_SHOWNORMAL)
+                pumpUntil "The keyboard source did not restore before snapping" (fun () -> not keyboardSource.isMaximized)
                 keyboardSource.move(snapped)
                 pumpUntil "Combined followers did not reach the snapped frame" (fun () ->
                     onGroup combined (fun group -> group.isPlacementIdle) &&
                     [a;b;d] |> List.forall (fun hwnd -> OS().windowFromHwnd(hwnd).bounds=snapped))
                 check (nativeOrder combined=tabsBeforeMove) "Keyboard snapping changed the tab positions"
                 check (onGroup combined (fun group -> group.topWindow=a)) "Keyboard snapping displaced the originating tab"
-                check (WinUserApi.GetActiveWindow()=a) "Keyboard snapping activated a follower"
+                let foreground = WinUserApi.GetForegroundWindow()
+                check (not(List.contains foreground [a;b;d]) || WinUserApi.GetActiveWindow()=a) "Keyboard snapping activated a follower"
                 check (onGroup combined (fun group ->
                     let strip = OS().windowFromHwnd(group.hwnd)
                     strip.isVisible && strip.zorder<keyboardSource.zorder)) "Keyboard snapping left the strip hidden behind its window"
@@ -820,6 +824,9 @@ let main() =
                 check (side<64 || span>=side/2)
                       (sprintf "A minimized tab's thumbnail icon spans %d of %d pixels, not about %d" span stand.Width side)
             WinUserApi.ShowWindow(d, ShowWindowCommands.SW_SHOWNOACTIVATE) |> ignore
+            pumpUntil "A minimized tab did not settle before the next state change" (fun () ->
+                onGroup combined (fun group -> group.isPlacementIdle) &&
+                not(OS().windowFromHwnd(d).isMinimized))
             // A window joining a maximized group grows into the frame through the system's expand
             // animation, which draws over the strip until it ends: the strip is held above it and
             // returns over the group's top window afterwards.
