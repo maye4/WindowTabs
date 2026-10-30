@@ -830,6 +830,10 @@ let main() =
             // A window joining a maximized group grows into the frame through the system's expand
             // animation, which draws over the strip until it ends: the strip is held above it and
             // returns over the group's top window afterwards.
+            keyboardSource.showWindow(ShowWindowCommands.SW_SHOWNORMAL)
+            pumpUntil "The group did not restore before maximizing for a join" (fun () ->
+                onGroup combined (fun group -> group.isPlacementIdle) &&
+                not keyboardSource.isMaximized)
             keyboardSource.showWindow(ShowWindowCommands.SW_SHOWMAXIMIZED)
             pumpUntil "A maximized group did not settle before a join" (fun () ->
                 onGroup combined (fun group -> group.isPlacementIdle) &&

@@ -603,7 +603,8 @@ let main() =
                 strip.setPlacement(placement start larger false)
                 check (frames strip=count && not shadow.isVisible) "Hidden movement painted or showed a shadow"
                 strip.visible <- true
-                check (strip.bounds.location=start && shadow.isVisible) "Show did not use the latest hidden placement"
+                check (strip.bounds.location=start) "Show did not use the latest hidden placement"
+                check shadow.isVisible "Show did not restore its shadow"
                 os.windowFromHwnd(strip.hwnd).hide()
                 strip.visible <- true
                 check (os.windowFromHwnd(strip.hwnd).isVisible && shadow.isVisible) "Equal visibility did not recover an externally hidden strip"

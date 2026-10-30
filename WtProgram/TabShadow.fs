@@ -198,13 +198,17 @@ type TabShadowWindow(os:OS, owner:IntPtr) =
         enabled <- false
         window.hide()
 
-    member this.moveForDirection(newDirection:TabDirection) =
+    member private this.moveForDirection(newDirection:TabDirection, showIfCached) =
         let parent = os.windowFromHwnd(owner)
-        if parent.isVisible && enabled then
+        let show = enabled || (showIfCached && cached.IsSome)
+        if parent.isVisible && show then
+            enabled <- show
             window.updateLocation(this.locationFor newDirection)
             if not window.isVisible then window.showNoActivate()
         else window.hide()
 
+    member this.showForDirection(newDirection:TabDirection) = this.moveForDirection(newDirection, true)
+    member this.moveForDirection(newDirection:TabDirection) = this.moveForDirection(newDirection, false)
     member this.move() = this.moveForDirection(direction)
 
     member this.update(image:Img, alpha:byte, newDirection:TabDirection) =
