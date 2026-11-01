@@ -198,39 +198,14 @@ module LastNormalSize =
     let offered() = dragOffered.Value
     let clearOffer() = dragOffered := None
 
-/// A maximized window restores to the rectangle it carried before it maximized, and Windows restores
-/// it there itself before the group learns of the move: on a title-bar drag, once the pointer passes
-/// the system's drag box. When that rectangle fills the work area — a window created full-screen, or
-/// one that took a maximized group's frame — the restore puts a full-screen-sized window back on the
-/// monitor. It is replaced here with the window's own last size, or half the work area when it has
-/// none: the size a tab dragged out of the group restores to.
+/// A maximized window restores to the rectangle it carried before it maximized, and only Windows
+/// un-maximizes it, in its own move loop before the group learns of the move: on a title-bar drag,
+/// once the pointer passes the system's drag box. When that rectangle fills the work area — a window
+/// created full-screen, or one that took a maximized group's frame — the restore puts a
+/// full-screen-sized window back on the monitor. It is replaced here with the window's own last size,
+/// or half the work area when it has none: the size a tab dragged out of the group restores to.
 module MaximizedRestore =
-    type Plan = {
-        hwnd : IntPtr
-        pid : int
-        tid : int
-        generation : int64
-        grab : Pt
-        originalSize : Sz
-        normalPlacement : OSWindowPlacement
-        normalSize : Sz
-        visible : Rect
-        frameOffset : Pt
-        workArea : Rect
-        workspaceOffset : Pt
-    }
-
-    /// A stale move loop can round or adjust the old maximized frame by a few pixels.
-    let private nearSize (a:Sz) (b:Sz) =
-        let widthTolerance = max 2 (min a.width b.width / 200)
-        let heightTolerance = max 2 (min a.height b.height / 200)
-        abs(a.width-b.width) <= widthTolerance && abs(a.height-b.height) <= heightTolerance
-
-    let private isGenuinelySmaller (normal:Sz) (original:Sz) =
-        normal.width < original.width && normal.height < original.height
-
-    /// The placement the window must be un-maximized to, whether that un-maximize is Windows' or the
-    /// group's own. Nothing is written here.
+    /// The placement Windows un-maximizes the window to. Nothing is written here.
     let placement (window:Window) =
         let wp = window.placement
         match Mon.fromHwnd window.hwnd with
@@ -248,367 +223,6 @@ module MaximizedRestore =
         let wp = placement window
         if wp <> window.placement then window.setPlacement wp
         wp
-
-    /// The frame a caption drag restores to: the window's own size, held under the pointer where it
-    /// was gripped — the same fraction along the maximized caption, the same height down the title
-    /// bar — rather than going back where it was before it maximized while the pointer is elsewhere.
-    /// The frame is kept on the work area: a grip near an end of a maximized caption would otherwise
-    /// put most of the window off the monitor.
-    let dragFrame (grab:Pt) (visible:Rect) (frameOffset:Pt) (workArea:Rect) (pt:Pt) (size:Sz) =
-        let fraction = float (grab.x - visible.x) / float (max 1 visible.width)
-        let grip = max 0 (grab.y - visible.y)
-        let visibleAt = Pt(pt.x - int(Math.Round(fraction * float size.width)), pt.y - grip)
-        let frame = Rect(visibleAt.add frameOffset, size)
-        let left = max workArea.left (min frame.x (workArea.right - frame.width))
-        let top = max workArea.top (min frame.y (workArea.bottom - frame.height))
-        Rect(Pt(left, top), frame.size)
-
-    let capture (window:Window) generation grab pt =
-        if window.isMaximized then
-            let wp = placement window
-            let visible = window.visibleBounds
-            let monitor = Mon.fromHwnd window.hwnd
-            let workArea = monitor |> Option.map(fun mon -> mon.workRect) |> Option.defaultValue visible
-            let originalSize = window.bounds.size
-            let normalSize = wp.rcNormalPosition.size
-            if isGenuinelySmaller normalSize originalSize then
-                Some {
-                    hwnd = window.hwnd
-                    pid = window.pid.pid
-                    tid = window.tid
-                    generation = generation
-                    grab = grab
-                    originalSize = originalSize
-                    normalPlacement = wp
-                    normalSize = normalSize
-                    visible = visible
-                    frameOffset = window.dragFrameOffset
-                    workArea = workArea
-                    workspaceOffset =
-                        match monitor with
-                        | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
-                        | None -> Pt()
-                }
-            else None
-        else None
-
-    let matches (plan:Plan) hwnd pid tid =
-        plan.hwnd=hwnd && plan.pid=pid && plan.tid=tid
-
-    let frameAt (plan:Plan) pt =
-        dragFrame plan.grab plan.visible plan.frameOffset plan.workArea pt plan.normalSize
-
-    let placementAt (plan:Plan) pt =
-        let frame = frameAt plan pt
-        { plan.normalPlacement with
-            showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
-            flags = 0
-            rcNormalPosition = Rect(frame.location.sub plan.workspaceOffset, frame.size) }
-
-    let finalPlacementAt (plan:Plan) pt =
-        // Fixed from the release point on the group STA, with that point's monitor and
-        // workspace offset, so a drag across monitors is not clamped to the original one.
-        match Mon.fromPoint pt with
-        | Some mon ->
-            let frame = dragFrame plan.grab plan.visible plan.frameOffset mon.workRect pt plan.normalSize
-            let workspaceOffset = mon.workRect.location.sub(mon.displayRect.location)
-            { plan.normalPlacement with
-                showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
-                flags = 0
-                rcNormalPosition = Rect(frame.location.sub workspaceOffset, frame.size) }
-        | None ->
-            let frame = frameAt plan pt
-            { plan.normalPlacement with
-                showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
-                flags = 0
-                rcNormalPosition = Rect(frame.location.sub plan.workspaceOffset, frame.size) }
-
-    /// The generic Window API treats a failed thread query as "not moving". Recovery cannot:
-    /// only a successful query returning this HWND proves move state either way.
-    let tryNativeMoving (plan:Plan) =
-        try
-            let mutable info = GUITHREADINFO()
-            info.cbSize <- System.Runtime.InteropServices.Marshal.SizeOf(typeof<GUITHREADINFO>)
-            if WinUserApi.GetGUIThreadInfo(plan.tid,&info) then
-                Some(info.hwndMoveSize=plan.hwnd)
-            else None
-        with _ -> None
-
-    let isTerminalStale (plan:Plan) (window:Window) =
-        not window.isMinimized &&
-        not window.isMaximized &&
-        isGenuinelySmaller plan.normalSize plan.originalSize &&
-        nearSize window.bounds.size plan.originalSize
-
-    type TerminalState = {
-        sameWindow : bool
-        buttonDown : bool
-        isMinimized : bool
-        isMaximized : bool
-        nativeMoving : bool option
-        actualSize : Sz
-    }
-
-    let shouldRepairTerminal (plan:Plan) (state:TerminalState) =
-        state.sameWindow &&
-        not state.buttonDown &&
-        not state.isMinimized &&
-        not state.isMaximized &&
-        state.nativeMoving=Some false &&
-        isGenuinelySmaller plan.normalSize plan.originalSize &&
-        nearSize state.actualSize plan.originalSize
-
-    let terminalStateOf (plan:Plan) (window:Window) : TerminalState =
-        { sameWindow = true
-          buttonDown = Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)
-          isMinimized = window.isMinimized
-          isMaximized = window.isMaximized
-          nativeMoving = tryNativeMoving plan
-          actualSize = window.bounds.size }
-
-    let hasIntendedNormalSize (plan:Plan) (window:Window) =
-        not window.isMinimized &&
-        not window.isMaximized &&
-        nearSize window.bounds.size plan.normalSize
-
-    /// The move loop still owns the frame it started with when a normal window returns to the
-    /// maximized outer size. The other conditions make this true only during this press's restore.
-    let shouldRecover (plan:Plan) restored buttonDown isMinimized isMaximized isInMoveSize (actualSize:Sz) =
-        restored &&
-        buttonDown &&
-        not isMinimized &&
-        not isMaximized &&
-        isInMoveSize &&
-        isGenuinelySmaller plan.normalSize plan.originalSize &&
-        nearSize actualSize plan.originalSize
-
-    let runRecovery current cancel loopStopped reposition restart =
-        if not(current()) then false
-        elif not(cancel()) then false
-        elif not(loopStopped()) || not(current()) then false
-        elif not(reposition()) || not(current()) then false
-        else restart()
-
-    let currentWindow (plan:Plan) =
-        try
-            let mutable pid = 0
-            let tid =
-                if WinUserApi.IsWindow plan.hwnd then WinUserApi.GetWindowThreadProcessId(plan.hwnd,&pid)
-                else 0
-            if matches plan plan.hwnd pid tid then Some(OS().windowFromHwnd(plan.hwnd))
-            else None
-        with _ -> None
-
-    let restorePlan (plan:Plan) pt =
-        match currentWindow plan with
-        | None -> false
-        | Some _ ->
-            let placed = placementAt plan pt
-            let mutable value = WINDOWPLACEMENT()
-            value.length <- System.Runtime.InteropServices.Marshal.SizeOf(value)
-            value.flags <- placed.flags
-            value.showCmd <- placed.showCmd
-            value.ptMinPosition <- placed.ptMinPosition.POINT
-            value.ptMaxPosition <- placed.ptMaxPosition.POINT
-            value.rcNormalPosition <- placed.rcNormalPosition.RECT
-            let restored = WinUserApi.SetWindowPlacement(plan.hwnd,ref value)
-            DragTrace.write(sprintf "CAPTION-PLACE hwnd=%d rcNormal=%s restored=%b" (plan.hwnd.ToInt64()) (DragTrace.rect placed.rcNormalPosition) restored)
-            restored
-
-    /// The last deterministic guard before a stale frame can become the group's frame. Every
-    /// condition is read immediately before the one write; the worker does not trust its queue time.
-    let repairStalePlan (plan:Plan) pt (valid:unit -> bool) =
-        match currentWindow plan with
-        | Some window when shouldRepairTerminal plan (terminalStateOf plan window) ->
-            let placed = finalPlacementAt plan pt
-            let mutable value = WINDOWPLACEMENT()
-            value.length <- System.Runtime.InteropServices.Marshal.SizeOf(value)
-            value.flags <- placed.flags
-            value.showCmd <- placed.showCmd
-            value.ptMinPosition <- placed.ptMinPosition.POINT
-            value.ptMaxPosition <- placed.ptMaxPosition.POINT
-            value.rcNormalPosition <- placed.rcNormalPosition.RECT
-            let stillValid =
-                valid() &&
-                (currentWindow plan |> Option.exists(fun current ->
-                    shouldRepairTerminal plan (terminalStateOf plan current)))
-            if not stillValid then
-                DragTrace.write(sprintf "RECOVERY-FINAL-ABORT hwnd=%d valid=false" (plan.hwnd.ToInt64()))
-                false
-            else
-                DragTrace.write(sprintf "RECOVERY-FINAL-REPAIR hwnd=%d target=%s"
-                                    (plan.hwnd.ToInt64()) (DragTrace.rect placed.rcNormalPosition))
-                let written = WinUserApi.SetWindowPlacement(plan.hwnd,ref value)
-                let repaired =
-                    written &&
-                    (currentWindow plan |> Option.exists(fun current ->
-                        not current.isMinimized &&
-                        not current.isMaximized &&
-                        nearSize current.bounds.size placed.rcNormalPosition.size))
-                DragTrace.write(sprintf "RECOVERY-FINAL-REPAIRED hwnd=%d written=%b verified=%b"
-                                    (plan.hwnd.ToInt64()) written repaired)
-                repaired
-        | Some window ->
-            DragTrace.write(sprintf "RECOVERY-FINAL-SKIP hwnd=%d normal=%b minimized=%b maximized=%b moving=%b size=%s"
-                                (plan.hwnd.ToInt64()) (not window.isMinimized && not window.isMaximized)
-                                window.isMinimized window.isMaximized window.isInMoveSize
-                                (DragTrace.rect window.bounds))
-            false
-        | None -> false
-
-    /// A successful SetWindowPlacement call is not enough for the recovery restart: the page must
-    /// visibly be at the planned normal frame before a new move loop reads its rectangle.
-    let isPlannedFrame (plan:Plan) pt =
-        match currentWindow plan with
-        | Some window ->
-            let expected = frameAt plan pt
-            let actual = window.bounds
-            not window.isMinimized &&
-            not window.isMaximized &&
-            nearSize actual.size expected.size &&
-            abs(actual.x-expected.x)<=8 &&
-            abs(actual.y-expected.y)<=8
-        | None -> false
-
-    let moveCommand = IntPtr(SystemMenuCommandValues.SC_MOVE ||| 0x0002)
-    let packedPoint (pt:Pt) = IntPtr(((pt.y &&& 0xFFFF) <<< 16) ||| (pt.x &&& 0xFFFF))
-
-    /// Keeps a queued restore and its recovery worker identifiable after a newer press.
-    type Token(plan:Plan) =
-        let gate = obj()
-        let mutable invalidated = false
-        let mutable released = false
-        let mutable initialRestoreResult : bool option = None
-        let mutable recoveryWorkerRunning = false
-        member _.plan = plan
-        /// A new press, membership change or window identity change invalidates both native work
-        /// and this gesture's terminal repair.
-        member _.cancel() = lock gate (fun () -> invalidated <- true; released <- true)
-        /// Release stops queued native work but leaves the captured plan able to make one final
-        /// stale-frame correction before the group saves or aligns anything.
-        member _.release() = lock gate (fun () -> released <- true)
-        member _.isCancelled = lock gate (fun () -> invalidated)
-        member _.isReleased = lock gate (fun () -> released)
-        member _.isActive = lock gate (fun () -> not invalidated && not released)
-        member _.canFinalize = lock gate (fun () -> not invalidated)
-        member _.initialRestore = lock gate (fun () -> initialRestoreResult)
-        member _.completeInitialRestore(result:bool) =
-            lock gate (fun () -> initialRestoreResult <- Some result)
-        member _.recoveryInFlight = lock gate (fun () -> recoveryWorkerRunning)
-        member _.beginRecoveryWorker() = lock gate (fun () -> recoveryWorkerRunning <- true)
-        member _.finishRecoveryWorker() = lock gate (fun () -> recoveryWorkerRunning <- false)
-
-module CaptionRecovery =
-    type Phase =
-        | Restoring
-        | Watching
-        | Cancelling
-        | Restarting
-        | Restarted
-        | Released
-        | Finalizing
-        | Abandoned
-        | Cleanup
-
-    type Outcome =
-        | CancelFailed
-        | LoopStillActive
-        | PositionFailed
-        | Ready of Pt
-
-    type State(token:MaximizedRestore.Token, deadline:int64) =
-        member val token = token
-        member val phase = Phase.Restoring with get,set
-        member val deadline = deadline with get,set
-        member val releasePoint : Pt option = None with get,set
-        member val finalizationStarted = false with get,set
-
-    type FinalWindowState = {
-        memberWindow : bool
-        top : bool
-        normal : bool
-        minimized : bool
-        maximized : bool
-        moving : bool
-        stale : bool
-    }
-
-    type EndActions = {
-        saveFrame : bool
-        restoreHiddenDirectly : bool
-        alignFollowers : bool
-    }
-
-    /// Hidden followers have a placement path that also releases their hidden mark. The direct
-    /// show/reposition fallback is for commands that must not adopt the frame, or have no placement.
-    let endActions saveRequested valid hasPlacement hasHidden topMinimized topMaximized : EndActions =
-        let saveFrame = saveRequested && valid
-        let alignFollowers = saveFrame && hasPlacement && not topMinimized
-        { saveFrame = saveFrame
-          restoreHiddenDirectly =
-            hasHidden && (not saveFrame || not hasPlacement || topMinimized || topMaximized)
-          alignFollowers = alignFollowers }
-
-    /// The transition is also the once-per-press guard: only the watching state can begin recovery.
-    let beginRecovery (state:State) =
-        if state.phase=Phase.Watching then
-            state.phase <- Phase.Cancelling
-            true
-        else false
-
-    /// One terminal worker per gesture. Repeated move-end and location events only observe this
-    /// phase; they cannot submit a second correction or a second follower alignment.
-    let beginFinalization (state:State) pt deadline =
-        if not state.token.isCancelled && not state.finalizationStarted then
-            state.token.release()
-            state.finalizationStarted <- true
-            state.releasePoint <- Some pt
-            state.phase <- Phase.Finalizing
-            state.deadline <- deadline
-            true
-        else false
-
-    /// The terminal worker produced no side effects by itself. Only this state permits the group to
-    /// clear Finalizing and run the ordinary save/alignment exactly once.
-    let canCommitFinalization (token:MaximizedRestore.Token) stable (state:FinalWindowState) =
-        not token.isCancelled &&
-        not token.recoveryInFlight &&
-        stable &&
-        token.initialRestore.IsSome &&
-        state.memberWindow &&
-        state.top &&
-        (state.normal || state.minimized || state.maximized) &&
-        not state.moving &&
-        not state.stale
-
-    let shouldActivateAfterFinalization foregroundInGroup topInGroup topMinimized gestureSaved =
-        gestureSaved && foregroundInGroup && topInGroup && not topMinimized
-
-    let idleSample valid (nativeMoving:bool option) =
-        if valid then nativeMoving |> Option.map(fun moving -> not moving) else None
-
-    /// A delayed MOVESIZESTART callback is not proof of a new gesture; the native move mode is.
-    let isGenuineMoveStart nativeStart nativeMoving =
-        nativeStart && nativeMoving
-
-    /// At least `requiredMillis` consecutive valid idle samples. `None` means the gesture or window
-    /// became invalid. The deadline bounds cancellation even if the target thread never answers.
-    let awaitStableIdle requiredMillis deadline (now:unit -> int64) (sample:unit -> bool option) sleep =
-        let mutable stableSince = None
-        let mutable ready = false
-        let mutable valid = true
-        while not ready && valid && now()<deadline do
-            let at = now()
-            match sample() with
-            | None -> valid <- false
-            | Some false -> stableSince <- None
-            | Some true ->
-                match stableSince with
-                | Some since when at-since>=requiredMillis -> ready <- true
-                | None -> stableSince <- Some at
-                | _ -> ()
-            if not ready && valid && now()<deadline then sleep()
-        ready
 
 type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:TabAppearanceInfo) as this =
     let Cell = CellScope(true)
@@ -661,14 +275,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// rectangle too, and that is not a drag.
     let mutable moveStartedFrom : Rect option = None
     let mutable moveStartedAt : Pt option = None
-    /// A caption restore that succeeded can leave the application's move loop holding the old
-    /// maximized rectangle. This state is owned by the group STA and never read by workers.
-    let mutable captionRecovery : CaptionRecovery.State option = None
-    let mutable captionRestoreGeneration = 0L
-    /// A terminal repair that failed to prove a safe frame. Late synthetic END/LOCATION events
-    /// must not save the stale rectangle after the recovery state itself is gone.
-    let mutable rejectedCaptionFrame : (IntPtr * int64) option = None
-    let captionRecoveryTimer = new System.Windows.Forms.Timer(Interval=16)
     let foregroundCell = Cell.create(_os.foreground.hwnd)
     let prevForegroundCell = ref None
     let mutable lastActiveTab : IntPtr option = None
@@ -838,7 +444,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     this.main(hwnd,if minimized then WinEvent.EVENT_SYSTEM_MINIMIZESTART else WinEvent.EVENT_SYSTEM_MINIMIZEEND)
             this.finishPlacementReconciliation())
         stripHoldTimer.Tick.Add(fun _ -> this.releaseStripHold())
-        captionRecoveryTimer.Tick.Add(fun _ -> this.captionRecoveryTick())
 
         winEventHandler.set(Some(
             _os.setSingleWinEvent WinEvent.EVENT_SYSTEM_FOREGROUND <| fun(hwnd) -> 
@@ -984,8 +589,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         if not pressHolding then zorderCell.value.tail.iter(this.adjustWindowPlacement)
 
     member private this.adjustChildWindows = fun() ->
-        if not(this.captionFinalizationHoldsSave()) then this.updatePlacements()
-        else DragTrace.write(sprintf "RECOVERY-ALIGN-SUPPRESSED top=%d" (this.topWindow.ToInt64()))
+        this.updatePlacements()
         
     member private this.makeTopWindowForeground() =
         match zorderCell.value.where(isMinimized >> not).tryHead with
@@ -993,28 +597,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             let window = this.os.windowFromHwnd(top)
             window.setForeground(false)
         | None -> ()
-
-    member private this.moveHiddenMembers() =
-        let hidden = Collections.Generic.HashSet<IntPtr>()
-        this.windows.items.iter(fun hwnd -> hidden.Add hwnd |> ignore)
-        pressHidden |> Seq.iter(fun hwnd -> hidden.Add hwnd |> ignore)
-        hidden |> Seq.filter(fun hwnd -> WinUserApi.IsWindow hwnd && MoveHidden.holds hwnd) |> Seq.toList
-
-    /// Raw reveal keeps whatever frame/state the follower actually has. It is the cleanup path,
-    /// not a successful alignment: stale placement must not be copied to a follower on another monitor.
-    member private this.revealMoveHiddenMember(hwnd:IntPtr) =
-        if MoveHidden.holds hwnd then
-            let window = this.os.windowFromHwnd(hwnd)
-            if not window.isVisible then
-                if window.isMinimized then window.showWindow(ShowWindowCommands.SW_SHOWMINNOACTIVE)
-                else window.showCurrentStateNoActivate()
-            if window.isVisible then MoveHidden.release hwnd |> ignore
-            DragTrace.write(sprintf "RECOVERY-SHOW-RAW %d minimized=%b visible=%b marked=%b"
-                                (hwnd.ToInt64()) window.isMinimized window.isVisible (MoveHidden.holds hwnd))
-
-    member private this.revealMoveHiddenMembers(hidden:IntPtr list) =
-        for hwnd in hidden do this.revealMoveHiddenMember hwnd
-        pressHidden.Clear()
 
     member private this.hideChildWindows() =
         zorderCell.value.tail.iter(fun hwnd ->
@@ -1025,8 +607,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                 // it goes off the screen now, like the press's own hide.
                 FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
                     match request with AlignWindow _ -> true | _ -> false))
-                window.hideForMove()
-                if MoveHidden.holds hwnd then pressHidden.Add hwnd |> ignore)
+                window.hideForMove())
 
     member private this.inZorder(windows:List2<IntPtr>) =
         // One desktop snapshot keeps the order consistent and avoids enumerating
@@ -1037,16 +618,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     member private this.setZorder(newZorder:List2<_>) =
         if zorderCell.value.list <> newZorder.list then
             if newZorder.tryHead<>zorderCell.value.tryHead then
-                rejectedCaptionFrame <- None
-                captionRecovery
-                |> Option.filter(fun state ->
-                    zorderCell.value.tryHead=Some state.token.plan.hwnd &&
-                    newZorder.tryHead<>Some state.token.plan.hwnd)
-                |> Option.iter(fun state ->
-                    state.token.cancel()
-                    DragTrace.write(sprintf "RECOVERY-INVALIDATED hwnd=%d reason=top-change"
-                                        (state.token.plan.hwnd.ToInt64()))
-                    state.phase <- CaptionRecovery.Cleanup)
                 newZorder.tryHead.iter(fun hwnd ->
                     FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
                         match request with SetMinimized _ | AlignWindow(_,_,_,_,true) -> false | _ -> true)))
@@ -1065,20 +636,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             // Placement can raise a follower before its stacking correction. Only an
             // actual foreground change may select another tab while that work is pending.
             if not reconcilePlacementState || selected then
-                let order : List2<IntPtr> = this.inZorder(this.windows.items)
+                let order = this.inZorder(this.windows.items)
                 this.setZorder(if reconcilePlacementState then order.where((<>) focused).prepend focused else order)
 
-    member private this.setWindows(newWindows:Set2<IntPtr>) =
-        rejectedCaptionFrame
-        |> Option.filter(fun(hwnd,_) -> not(newWindows.contains hwnd))
-        |> Option.iter(fun _ -> rejectedCaptionFrame <- None)
-        captionRecovery
-        |> Option.filter(fun state -> not(newWindows.contains state.token.plan.hwnd))
-        |> Option.iter(fun state ->
-            state.token.cancel()
-            state.phase <- CaptionRecovery.Cleanup
-            DragTrace.write(sprintf "RECOVERY-INVALIDATED hwnd=%d reason=membership"
-                                (state.token.plan.hwnd.ToInt64())))
+    member private this.setWindows(newWindows) =
         windowsCell.set(newWindows)
         // Tabs that join or leave during a transition change the order at once; the others keep theirs.
         if reconcileMinimizeState || reconcilePlacementState || inMoveSize.value then
@@ -1285,40 +846,37 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         MaximizedRestore.store window
 
     member private this.saveTopWindowPlacement() =
-        if this.captionFinalizationHoldsSave() then
-            DragTrace.write(sprintf "RECOVERY-SAVE-SUPPRESSED top=%d" (this.topWindow.ToInt64()))
-        else
-            let window = this.os.windowFromHwnd(zorderCell.value.head)
-            let dpi = Dpi.forMonitor window.hwnd
-            if dpi <> Dpi.value() then
-                Dpi.set dpi
-                appearanceSnapshot <- logicalAppearance.scaled
-                this.ts.setTabAppearance(appearanceSnapshot)
-                geometryChangedEvent.Trigger()
-            if  not(FollowerPlacement.isAnimating placementOwner window.hwnd) &&
-                window.isMinimized.not &&
-                this.os.isOnScreen(window.bounds)
-                then
-                let monitorBounds =
-                    if window.isMaximized then
-                        //windows are placed slightly off screen when maximized, get the bounds of the monitor instead
-                        Mon.fromHwnd(window.hwnd).map(fun mon -> mon.workRect.move(-1,-1))
-                    else None
-                let bounds = monitorBounds.def(window.bounds)
-                let wp = this.maximizedRestorePlacement window
-                let visible = monitorBounds.def(window.visibleBounds)
-                placement.set(Some(bounds, wp, visible))
-                // The size the user last chose for this window itself, captured once: only a solo
-                // window's frame is that choice, and a later capture would sometimes be the shared
-                // frame of a group the window is already joining. rcNormalPosition is captured
-                // rather than bounds so the value round-trips exactly through setPlacement. A frame
-                // other than the one a drop offered means the app grew it after the drop, which is
-                // not a choice either.
-                if this.windowCount = 1
-                   && (LastNormalSize.offered() |> Option.forall ((=) window.placement.rcNormalPosition.size)) then
-                    LastNormalSize.sizeOf window
-                    |> Option.iter(fun size -> LastNormalSize.captureIfAbsent window.hwnd size)
-                if enableSuperBar then this.prepareMinimizeAnchor window.hwnd
+        let window = this.os.windowFromHwnd(zorderCell.value.head)
+        let dpi = Dpi.forMonitor window.hwnd
+        if dpi <> Dpi.value() then
+            Dpi.set dpi
+            appearanceSnapshot <- logicalAppearance.scaled
+            this.ts.setTabAppearance(appearanceSnapshot)
+            geometryChangedEvent.Trigger()
+        if  not(FollowerPlacement.isAnimating placementOwner window.hwnd) &&
+            window.isMinimized.not &&
+            this.os.isOnScreen(window.bounds)
+            then
+            let monitorBounds =
+                if window.isMaximized then
+                    //windows are placed slightly off screen when maximized, get the bounds of the monitor instead
+                    Mon.fromHwnd(window.hwnd).map(fun mon -> mon.workRect.move(-1,-1))
+                else None
+            let bounds = monitorBounds.def(window.bounds)
+            let wp = this.maximizedRestorePlacement window
+            let visible = monitorBounds.def(window.visibleBounds)
+            placement.set(Some(bounds, wp, visible))
+            // The size the user last chose for this window itself, captured once: only a solo
+            // window's frame is that choice, and a later capture would sometimes be the shared
+            // frame of a group the window is already joining. rcNormalPosition is captured
+            // rather than bounds so the value round-trips exactly through setPlacement. A frame
+            // other than the one a drop offered means the app grew it after the drop, which is
+            // not a choice either.
+            if this.windowCount = 1
+               && (LastNormalSize.offered() |> Option.forall ((=) window.placement.rcNormalPosition.size)) then
+                LastNormalSize.sizeOf window
+                |> Option.iter(fun size -> LastNormalSize.captureIfAbsent window.hwnd size)
+            if enableSuperBar then this.prepareMinimizeAnchor window.hwnd
 
     /// The size to restore if this tab is dropped outside a group, read as the drag starts:
     /// a solo group still shows the window at the size the user chose for it, before another
@@ -1338,12 +896,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     /// Only a size change across the same solo native move/size loop replaces the choice.
     /// A late end event or a title-bar move must not promote a group/drop frame to it.
     member private this.captureSoloSize(before) =
-        let captionOwnsTop =
-            captionRecovery
-            |> Option.exists(fun state -> state.token.plan.hwnd=this.topWindow)
-        if not captionOwnsTop &&
-           not(this.captionFrameRejected(this.topWindow)) &&
-           this.windowCount = 1 then
+        if this.windowCount = 1 then
             match before, zorderCell.value.tryHead with
             | Some(hwnd,oldSize), Some top when hwnd=top ->
                 LastNormalSize.sizeOf (this.os.windowFromHwnd top)
@@ -1436,425 +989,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         | _ -> ()
         Cell.endUpdate()
 
-    member private this.captionWindow(plan:MaximizedRestore.Plan) =
-        MaximizedRestore.currentWindow plan
-
-    member private this.captionFrameHeld() =
-        captionRecovery |> Option.exists(fun state -> not state.token.isCancelled)
-
-    member private this.captionFrameRejected(hwnd:IntPtr) =
-        rejectedCaptionFrame |> Option.exists(fun(owner,_) -> owner=hwnd)
-
-    member private this.clearCaptionRecovery() =
-        captionRecovery |> Option.iter(fun state -> state.token.cancel())
-        captionRecovery <- None
-        captionRecoveryTimer.Stop()
-
-    member private this.captionFinalizationHoldsSave() =
-        this.captionFrameHeld() || this.captionFrameRejected(this.topWindow)
-
-    member private this.endCaptionRecovery(saveFrame:bool) =
-        let recoveryState = captionRecovery
-        let valid = recoveryState |> Option.exists(fun state -> not state.token.isCancelled)
-        let top = this.topWindow
-        let settledWindow =
-            recoveryState
-            |> Option.bind(fun state -> this.captionWindow(state.token.plan))
-        let topMinimized = settledWindow |> Option.exists(fun window -> window.isMinimized)
-        let topMaximized = settledWindow |> Option.exists(fun window -> window.isMaximized)
-        let foreground = this.os.foreground.hwnd
-        let foregroundInGroup = this.windows.contains foreground
-        let topInGroup = this.windows.contains top
-        this.clearCaptionRecovery()
-        soloSizeBeforeMove <- None
-        moveStartedFrom <- None
-        moveStartedAt <- None
-        inMoveSize.set(false)
-        pressHolding <- false
-        if saveFrame && valid then
-            this.saveTopWindowPlacement()
-        let hidden = this.moveHiddenMembers()
-        let hasHidden = not hidden.IsEmpty
-        let actions =
-            CaptionRecovery.endActions saveFrame valid placement.value.IsSome hasHidden topMinimized topMaximized
-        if actions.restoreHiddenDirectly then
-            DragTrace.write(sprintf "RECOVERY-SHOW top=%d hidden=%d" (top.ToInt64()) (List.length hidden))
-            this.revealMoveHiddenMembers(hidden)
-        if actions.alignFollowers then
-            // adjustChildWindows handles marked hidden followers through alignHiddenFrameRequest.
-            // Calling restorePressHidden first would submit a second placement for each one.
-            if List.contains top hidden then this.revealMoveHiddenMember top
-            pressHidden.Clear()
-            this.adjustChildWindows()
-        if CaptionRecovery.shouldActivateAfterFinalization foregroundInGroup topInGroup topMinimized (saveFrame && valid) then
-            this.makeTopWindowForeground()
-        isMaximizedExport.update()
-        this.updateIsVisible()
-
-    /// Ends an invalidated or timed-out gesture without letting its stale frame become the group's
-    /// frame; one live native loop may still keep the followers hidden until it ends.
-    member private this.finishCaptionRecovery(?force:bool, ?saveFrame:bool) =
-        let force = defaultArg force false
-        let state = captionRecovery
-        let saveFrame =
-            defaultArg saveFrame
-                (state |> Option.exists(fun state -> not state.token.isCancelled))
-        let stillMoving =
-            state |> Option.exists(fun state ->
-                match this.captionWindow(state.token.plan) with
-                | None -> false
-                | Some _ ->
-                    match MaximizedRestore.tryNativeMoving state.token.plan with
-                    | Some moving -> moving
-                    | None -> true)
-        if stillMoving && not force then
-            state |> Option.iter(fun state ->
-                state.phase <- CaptionRecovery.Cleanup
-                DragTrace.write(sprintf "RECOVERY-CLEANUP hwnd=%d" (state.token.plan.hwnd.ToInt64())))
-            inMoveSize.set(true)
-            this.hideChildWindows()
-        else this.endCaptionRecovery(saveFrame)
-
-    /// A new press, membership change or new top window invalidates native recovery and terminal
-    /// repair together. This is deliberately separate from release.
-    member private this.invalidateCaptionRecovery(reason:string) =
-        captionRecovery
-        |> Option.iter(fun state ->
-            state.token.cancel()
-            DragTrace.write(sprintf "RECOVERY-INVALIDATED hwnd=%d reason=%s"
-                                (state.token.plan.hwnd.ToInt64()) reason)
-            this.finishCaptionRecovery(saveFrame=false))
-
-    member private this.observeCaptionRestart(state:CaptionRecovery.State) =
-        if state.phase=CaptionRecovery.Restarting || state.phase=CaptionRecovery.Restarted then
-            match this.captionWindow(state.token.plan) with
-            | Some window when MaximizedRestore.isTerminalStale state.token.plan window ->
-                DragTrace.write(sprintf "RECOVERY-RESTART-STALE hwnd=%d bounds=%s"
-                                    (window.hwnd.ToInt64()) (DragTrace.rect window.bounds))
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- transitionClock.ElapsedMilliseconds + 10000L
-                inMoveSize.set(true)
-                this.hideChildWindows()
-            | Some window when state.phase=CaptionRecovery.Restarting &&
-                               MaximizedRestore.tryNativeMoving state.token.plan=Some true &&
-                               MaximizedRestore.hasIntendedNormalSize state.token.plan window ->
-                state.phase <- CaptionRecovery.Restarted
-                state.deadline <- transitionClock.ElapsedMilliseconds + 10000L
-                inMoveSize.set(true)
-                DragTrace.write(sprintf "RECOVERY-RESTARTED hwnd=%d" (state.token.plan.hwnd.ToInt64()))
-            | _ -> ()
-
-    member private this.captionRecoveryReady(token:MaximizedRestore.Token, outcome:CaptionRecovery.Outcome) =
-        match captionRecovery with
-        | Some state when obj.ReferenceEquals(state.token,token) &&
-                          state.phase=CaptionRecovery.Cancelling &&
-                          token.isActive ->
-            let buttonDown = Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)
-            let pt = Cursor.Position.Pt
-            match this.captionWindow(state.token.plan),outcome with
-            | Some window,CaptionRecovery.Ready placedAt
-                when buttonDown &&
-                     this.windows.contains(window.hwnd) &&
-                     this.isTop(window.hwnd) &&
-                     not window.isMinimized &&
-                     not window.isMaximized &&
-                     MaximizedRestore.tryNativeMoving state.token.plan=Some false &&
-                     MaximizedRestore.isPlannedFrame state.token.plan placedAt ->
-                state.phase <- CaptionRecovery.Restarting
-                state.deadline <- transitionClock.ElapsedMilliseconds + 1000L
-                let bounds = window.bounds
-                moveStartedFrom <- Some bounds
-                moveStartedAt <- Some pt
-                inMoveSize.set(true)
-                let posted =
-                    WinUserApi.PostMessage(window.hwnd,WindowMessages.WM_SYSCOMMAND,
-                                           MaximizedRestore.moveCommand,MaximizedRestore.packedPoint pt)
-                DragTrace.write(sprintf "RECOVERY-START hwnd=%d pt=%d,%d posted=%b" (window.hwnd.ToInt64()) pt.x pt.y posted)
-                if not posted then
-                    state.phase <- CaptionRecovery.Abandoned
-                    state.deadline <- transitionClock.ElapsedMilliseconds + 10000L
-            | Some window,CaptionRecovery.PositionFailed ->
-                DragTrace.write(sprintf "RECOVERY-POSITION-FAILED hwnd=%d" (window.hwnd.ToInt64()))
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- transitionClock.ElapsedMilliseconds + (if buttonDown then 10000L else 500L)
-            | Some window,_ ->
-                // Do not start a second loop or fight the frame when the first loop did not stop.
-                DragTrace.write(sprintf "RECOVERY-ABORT hwnd=%d outcome=%A" (window.hwnd.ToInt64()) outcome)
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- transitionClock.ElapsedMilliseconds + (if buttonDown then 10000L else 500L)
-            | None,_ ->
-                this.finishCaptionRecovery(saveFrame=false)
-        | _ -> ()
-
-    member private this.checkCaptionRecovery() =
-        match captionRecovery with
-        | Some state when state.phase=CaptionRecovery.Watching ->
-            let buttonDown = Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)
-            match this.captionWindow(state.token.plan) with
-            | Some window when buttonDown && this.isTop(window.hwnd) ->
-                if MaximizedRestore.shouldRecover state.token.plan true buttonDown window.isMinimized
-                       window.isMaximized (MaximizedRestore.tryNativeMoving state.token.plan=Some true)
-                       window.bounds.size &&
-                   CaptionRecovery.beginRecovery state then
-                    state.deadline <- transitionClock.ElapsedMilliseconds + 1000L
-                    pressHolding <- true
-                    this.hideChildWindows()
-                    DragTrace.write(sprintf "RECOVERY-DETECTED hwnd=%d bounds=%s normal=%s" (window.hwnd.ToInt64())
-                                        (DragTrace.rect window.bounds)
-                                        (MaximizedRestore.placementAt state.token.plan (Cursor.Position.Pt) |> fun wp -> DragTrace.rect wp.rcNormalPosition))
-                    this.beginCaptionRecovery(state)
-            | _ -> ()
-        | _ -> ()
-
-    member private this.beginCaptionRecovery(state:CaptionRecovery.State) =
-        let token = state.token
-        let plan = token.plan
-        token.beginRecoveryWorker()
-        ThreadHelper.queueBackground(fun () ->
-            let outcome =
-                try
-                    let mutable cancelled = false
-                    let mutable stopped = false
-                    let mutable positioned = false
-                    let mutable placedAt = Pt()
-                    let window() = MaximizedRestore.currentWindow plan
-                    let current() =
-                        token.isActive &&
-                        Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) &&
-                        window().IsSome
-                    let cancel() =
-                        if not(current()) || (MaximizedRestore.tryNativeMoving plan).IsNone then false
-                        else
-                            match window() with
-                            | Some window ->
-                                let mutable result = IntPtr.Zero
-                                let sent = WinUserApi.SendMessageTimeout(window.hwnd,WindowMessages.WM_CANCELMODE,
-                                                                           IntPtr.Zero,IntPtr.Zero,
-                                                                           SendMessageTimeoutFlags.SMTO_ABORTIFHUNG,250,&result)
-                                cancelled <- sent<>IntPtr.Zero
-                                DragTrace.write(sprintf "RECOVERY-CANCEL hwnd=%d sent=%b" (window.hwnd.ToInt64()) cancelled)
-                                cancelled
-                            | None -> false
-                    let loopStopped() =
-                        let clock = Diagnostics.Stopwatch.StartNew()
-                        stopped <-
-                            CaptionRecovery.awaitStableIdle 40L (clock.ElapsedMilliseconds+500L)
-                                (fun () -> clock.ElapsedMilliseconds)
-                                (fun () ->
-                                    CaptionRecovery.idleSample (current()) (MaximizedRestore.tryNativeMoving plan))
-                                (fun () -> System.Threading.Thread.Sleep(10))
-                        DragTrace.write(sprintf "RECOVERY-LOOP-STOPPED hwnd=%d stableIdle=%b"
-                                            (plan.hwnd.ToInt64()) stopped)
-                        stopped
-                    let reposition() =
-                        if not(current()) || MaximizedRestore.tryNativeMoving plan<>Some false then false
-                        else
-                            let pt = Cursor.Position.Pt
-                            placedAt <- pt
-                            positioned <-
-                                (MaximizedRestore.currentWindow plan
-                                 |> Option.exists(fun window -> not window.isMinimized && not window.isMaximized)) &&
-                                MaximizedRestore.restorePlan plan pt &&
-                                MaximizedRestore.isPlannedFrame plan pt
-                            DragTrace.write(sprintf "RECOVERY-REPOSITION hwnd=%d placed=%b" (plan.hwnd.ToInt64()) positioned)
-                            positioned
-                    let ready() = true
-                    let completed = MaximizedRestore.runRecovery current cancel loopStopped reposition ready
-                    if completed && positioned then CaptionRecovery.Ready placedAt
-                    elif completed then CaptionRecovery.PositionFailed
-                    elif not cancelled then CaptionRecovery.CancelFailed
-                    elif not stopped then CaptionRecovery.LoopStillActive
-                    else CaptionRecovery.PositionFailed
-                with error ->
-                    DragTrace.write(sprintf "RECOVERY-WORKER-FAILED hwnd=%d error=%s" (plan.hwnd.ToInt64()) error.Message)
-                    CaptionRecovery.CancelFailed
-            token.finishRecoveryWorker()
-            invoker.asyncInvoke(fun () ->
-                if not isDestroyed.value then this.captionRecoveryReady(token,outcome)))
-
-    /// Release fixes the final drop point and starts the one terminal worker. The worker waits for
-    /// stable native idle, then rechecks and repairs the stale frame immediately before writing it.
-    member private this.beginCaptionFinalization(state:CaptionRecovery.State, releasePoint:Pt) =
-        if CaptionRecovery.beginFinalization state releasePoint (transitionClock.ElapsedMilliseconds+2000L) then
-            let token = state.token
-            let plan = token.plan
-            pressHolding <- true
-            inMoveSize.set(true)
-            this.hideChildWindows()
-            DragTrace.write(sprintf "RECOVERY-FINALIZE hwnd=%d release=%d,%d"
-                                (plan.hwnd.ToInt64()) releasePoint.x releasePoint.y)
-            ThreadHelper.queueBackground(fun () ->
-                let mutable stable = false
-                try
-                    let clock = Diagnostics.Stopwatch.StartNew()
-                    stable <-
-                        CaptionRecovery.awaitStableIdle 40L (clock.ElapsedMilliseconds+500L)
-                            (fun () -> clock.ElapsedMilliseconds)
-                            (fun () ->
-                                if not token.canFinalize then None
-                                elif token.initialRestore.IsNone then Some false
-                                elif token.recoveryInFlight then Some false
-                                else
-                                    CaptionRecovery.idleSample
-                                        (MaximizedRestore.currentWindow plan).IsSome
-                                        (MaximizedRestore.tryNativeMoving plan))
-                            (fun () -> System.Threading.Thread.Sleep(10))
-                    DragTrace.write(sprintf "RECOVERY-FINAL-IDLE hwnd=%d stable=%b initial=%A"
-                                        (plan.hwnd.ToInt64()) stable token.initialRestore)
-                    if stable && token.canFinalize && token.initialRestore=Some true then
-                        match MaximizedRestore.currentWindow plan with
-                        | Some window when MaximizedRestore.isTerminalStale plan window ->
-                            MaximizedRestore.repairStalePlan plan releasePoint (fun () -> token.canFinalize) |> ignore
-                        | Some window ->
-                            DragTrace.write(sprintf "RECOVERY-FINAL-NORMAL hwnd=%d bounds=%s"
-                                                (window.hwnd.ToInt64()) (DragTrace.rect window.bounds))
-                        | None -> ()
-                with error ->
-                    DragTrace.write(sprintf "RECOVERY-FINAL-WORKER-FAILED hwnd=%d error=%s"
-                                        (plan.hwnd.ToInt64()) error.Message)
-                invoker.asyncInvoke(fun () ->
-                    if not isDestroyed.value then this.captionFinalizationFinished(token,stable)))
-
-    member private this.captionFinalizationFinished(token:MaximizedRestore.Token, stable:bool) =
-        match captionRecovery with
-        | Some state when obj.ReferenceEquals(state.token,token) &&
-                          state.finalizationStarted &&
-                          not token.isCancelled ->
-            match this.captionWindow(token.plan) with
-            | Some window ->
-                let finalState : CaptionRecovery.FinalWindowState =
-                    { CaptionRecovery.memberWindow = this.windows.contains(window.hwnd)
-                      top = zorderCell.value.tryHead=Some window.hwnd
-                      normal = not window.isMinimized && not window.isMaximized
-                      minimized = window.isMinimized
-                      maximized = window.isMaximized
-                      moving =
-                        match MaximizedRestore.tryNativeMoving token.plan with
-                        | Some moving -> moving
-                        | None -> true
-                      stale = MaximizedRestore.isTerminalStale token.plan window }
-                if CaptionRecovery.canCommitFinalization token stable finalState then
-                    DragTrace.write(sprintf "RECOVERY-FINAL-DONE hwnd=%d bounds=%s"
-                                        (window.hwnd.ToInt64()) (DragTrace.rect window.bounds))
-                    this.endCaptionRecovery(true)
-                else
-                    if finalState.stale then
-                        rejectedCaptionFrame <- Some(token.plan.hwnd,token.plan.generation)
-                    DragTrace.write(sprintf "RECOVERY-FINAL-REJECT hwnd=%d initial=%A member=%b top=%b normal=%b moving=%b stale=%b"
-                                        (window.hwnd.ToInt64()) token.initialRestore finalState.memberWindow
-                                        finalState.top finalState.normal finalState.moving finalState.stale)
-                    this.finishCaptionRecovery(saveFrame=false)
-            | None -> this.finishCaptionRecovery(saveFrame=false)
-        | _ -> ()
-
-    member private this.captionRecoveryTick() =
-        match captionRecovery with
-        | None -> captionRecoveryTimer.Stop()
-        | Some state ->
-            let now = transitionClock.ElapsedMilliseconds
-            let buttonDown = Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)
-            let nativeMoving =
-                match MaximizedRestore.tryNativeMoving state.token.plan with
-                | Some moving -> moving
-                | None -> true
-            if not buttonDown && not state.finalizationStarted && state.token.canFinalize then
-                this.beginCaptionFinalization(state,Cursor.Position.Pt)
-            match this.captionWindow(state.token.plan),state.phase with
-            | None,_ -> this.finishCaptionRecovery(saveFrame=false)
-            | Some _,CaptionRecovery.Finalizing when now>=state.deadline ->
-                DragTrace.write(sprintf "RECOVERY-FINAL-TIMEOUT hwnd=%d" (state.token.plan.hwnd.ToInt64()))
-                rejectedCaptionFrame <- Some(state.token.plan.hwnd,state.token.plan.generation)
-                this.finishCaptionRecovery(saveFrame=false)
-            | Some window,CaptionRecovery.Restoring when now>=state.deadline ->
-                DragTrace.write(sprintf "RECOVERY-RESTORE-TIMEOUT hwnd=%d" (window.hwnd.ToInt64()))
-                if window.isInMoveSize || buttonDown then
-                    state.phase <- CaptionRecovery.Abandoned
-                    state.deadline <- now + (if buttonDown then 10000L else 500L)
-                else state.phase <- CaptionRecovery.Abandoned
-            | Some _,CaptionRecovery.Watching when now>=state.deadline ->
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- now + (if buttonDown then 10000L else 500L)
-            | Some _,CaptionRecovery.Cancelling when now>=state.deadline ->
-                DragTrace.write(sprintf "RECOVERY-CANCEL-TIMEOUT hwnd=%d" (state.token.plan.hwnd.ToInt64()))
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- now + (if buttonDown then 10000L else 500L)
-            | Some window,CaptionRecovery.Restarting ->
-                this.observeCaptionRestart(state)
-                if state.phase=CaptionRecovery.Restarting && now>=state.deadline then
-                    DragTrace.write(sprintf "RECOVERY-START-TIMEOUT hwnd=%d" (window.hwnd.ToInt64()))
-                    state.phase <- CaptionRecovery.Abandoned
-                    state.deadline <- now + (if buttonDown then 10000L else 500L)
-            | Some window,CaptionRecovery.Released ->
-                if not state.finalizationStarted && not nativeMoving then
-                    state.phase <- CaptionRecovery.Abandoned
-            | Some window,CaptionRecovery.Restarted ->
-                this.observeCaptionRestart(state)
-                if not nativeMoving && not state.finalizationStarted then
-                    state.phase <- CaptionRecovery.Abandoned
-            | Some window,CaptionRecovery.Abandoned ->
-                if buttonDown && now>=state.deadline then state.phase <- CaptionRecovery.Cleanup
-            | Some window,CaptionRecovery.Cleanup ->
-                if not nativeMoving then this.finishCaptionRecovery(saveFrame=false)
-            | Some _,CaptionRecovery.Finalizing -> ()
-            | _ -> ()
-
-    /// Starts the explicit shrink once a caption press passes the drag box. The native call runs on
-    /// a worker; this method only captures the plan and group-owned state on the group STA.
-    member this.captionDragStarted(pressed:IntPtr, start:Pt, pt:Pt) =
-        // Even a new press that cannot restore anything invalidates an older worker.
-        if captionRecovery.IsSome then this.clearCaptionRecovery()
-        if this.isTop(pressed) then
-            let window = this.os.windowFromHwnd(pressed)
-            captionRestoreGeneration <- captionRestoreGeneration + 1L
-            match MaximizedRestore.capture window captionRestoreGeneration start pt with
-            | Some plan ->
-                this.clearCaptionRecovery()
-                let token = MaximizedRestore.Token(plan)
-                let state = CaptionRecovery.State(token,transitionClock.ElapsedMilliseconds+1000L)
-                captionRecovery <- Some state
-                captionRecoveryTimer.Start()
-                ThreadHelper.queueBackground(fun () ->
-                    let restored =
-                        try
-                            let stillCurrent() =
-                                token.isActive &&
-                                Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) &&
-                                (MaximizedRestore.currentWindow plan
-                                 |> Option.exists(fun window -> window.isMaximized && not window.isMinimized))
-                            let placed = MaximizedRestore.placementAt plan pt
-                            DragTrace.write(sprintf "CAPTION-RESTORE hwnd=%d rcNormal=%s" (plan.hwnd.ToInt64()) (DragTrace.rect placed.rcNormalPosition))
-                            let restored = stillCurrent() && MaximizedRestore.restorePlan plan pt
-                            if DragTrace.enabled then
-                                let bounds =
-                                    MaximizedRestore.currentWindow plan
-                                    |> Option.map(fun window -> DragTrace.rect window.bounds)
-                                    |> Option.defaultValue "gone"
-                                DragTrace.write(sprintf "CAPTION-RESTORED hwnd=%d bounds=%s restored=%b" (plan.hwnd.ToInt64()) bounds restored)
-                            restored
-                        with error ->
-                            DragTrace.write(sprintf "CAPTION-RESTORE-FAILED hwnd=%d error=%s" (plan.hwnd.ToInt64()) error.Message)
-                            false
-                    token.completeInitialRestore(restored)
-                    invoker.asyncInvoke(fun () ->
-                        if not isDestroyed.value then this.captionRestoreFinished(token,restored)))
-            | None ->
-                DragTrace.write(sprintf "CAPTION-RESTORE-SKIPPED hwnd=%d reason=not-maximized" (pressed.ToInt64()))
-
-    member private this.captionRestoreFinished(token:MaximizedRestore.Token, restored:bool) =
-        match captionRecovery with
-        | Some state when obj.ReferenceEquals(state.token,token) && state.phase=CaptionRecovery.Restoring ->
-            if restored && not token.isCancelled && Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) then
-                state.phase <- CaptionRecovery.Watching
-                state.deadline <- transitionClock.ElapsedMilliseconds + 10000L
-                this.checkCaptionRecovery()
-            elif not restored || token.isCancelled then
-                DragTrace.write(sprintf "CAPTION-RESTORE-FAILED hwnd=%d" (token.plan.hwnd.ToInt64()))
-                state.phase <- CaptionRecovery.Abandoned
-                state.deadline <- transitionClock.ElapsedMilliseconds +
-                                  (if Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) then 10000L else 500L)
-        | _ -> ()
-
-
     /// A press on the group's caption hides the other windows at once, before anything has moved: the
     /// group is alone on the screen from the first pixel of a drag, and a click that never becomes one
     /// shows the same thing for as long as the button is held.
@@ -1862,8 +996,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         // The top window is the group's own state, so it is read here, on the group's thread, and not
         // in the hook that saw the press.
         if this.topWindow = pressed then
-            // A press cannot inherit a restore or recovery from the previous gesture.
-            if captionRecovery.IsSome then this.invalidateCaptionRecovery("new-press")
             pressHolding <- true
             pressHidden.Clear()
             // Hidden whether or not a move is already under way: the system announces the move on the
@@ -1883,28 +1015,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     pressHidden.Add hwnd |> ignore
                     DragTrace.write(sprintf "PRESS-HIDE %d visible=%b" (hwnd.ToInt64()) window.isVisible))
 
-    /// Every new caption press invalidates an older restore worker, including the second press of
-    /// a double-click, which does not call pressHide.
-    member this.captionPressStarted(pressed:IntPtr) =
-        rejectedCaptionFrame <- None
-        if captionRecovery.IsSome then this.invalidateCaptionRecovery("new-press")
-
     /// The press is over. A press that never became a drag brings the other windows back here; one
     /// that did is restored by the end of its move, which comes after the release.
-    member this.pressShow(pt:Pt) =
-        match captionRecovery with
-        | Some state when state.token.canFinalize ->
-            // Release only stops queued native work. The captured plan stays alive for one final
-            // stale-size check before any save or follower placement can accept the frame.
-            this.beginCaptionFinalization(state,pt)
-        | Some _ ->
-            this.finishCaptionRecovery(saveFrame=false)
-        | None ->
-            pressHolding <- false
-            if not inMoveSize.value then
-                DragTrace.write(sprintf "PRESS-SHOW top=%d held=%d" (this.topWindow.ToInt64()) pressHidden.Count)
-                this.restorePressHidden()
-                pressHidden.Clear()
+    member this.pressShow() =
+        pressHolding <- false
+        if not inMoveSize.value then
+            DragTrace.write(sprintf "PRESS-SHOW top=%d held=%d" (this.topWindow.ToInt64()) pressHidden.Count)
+            this.restorePressHidden()
+            pressHidden.Clear()
 
     /// Brings back exactly the windows the press hid, whatever the order is now. A window whose frame
     /// is not known is shown as it is, rather than left off the screen because nothing placed it.
@@ -1918,115 +1036,64 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     window.showCurrentStateNoActivate()
                     DragTrace.write(sprintf "PRESS-SHOW-RAW %d" (hwnd.ToInt64())))
 
-    member this.onEnterMoveSize(?nativeStart:bool) =
-        let nativeStart = defaultArg nativeStart false
-        let top = this.topWindow
-        let nativeMoving = WinUserApi.IsWindow top && this.os.windowFromHwnd(top).isInMoveSize
-        let rejectedFrame = this.captionFrameRejected(top)
-        let genuineStart = CaptionRecovery.isGenuineMoveStart nativeStart nativeMoving
-        if rejectedFrame && captionRecovery.IsNone && genuineStart then
-            rejectedCaptionFrame <- None
-            DragTrace.write(sprintf "RECOVERY-REJECTED-CLEARED top=%d reason=native-move-start" (top.ToInt64()))
-        let rejectedSynthetic =
-            rejectedFrame && captionRecovery.IsNone && not genuineStart
-        if rejectedSynthetic then
-            DragTrace.write(sprintf "START-IGNORED top=%d reason=rejected-frame nativeMoving=%b" (top.ToInt64()) nativeMoving)
-        else
-            captionRecovery
-            |> Option.filter(fun state ->
-                (state.phase=CaptionRecovery.Restarting || state.phase=CaptionRecovery.Restarted) &&
-                state.token.plan.hwnd=this.topWindow)
-            |> Option.iter this.observeCaptionRestart
-            FollowerPlacement.queue.cancel(placementOwner,this.topWindow,whenValue=(fun (_,request) ->
-                match request with AlignWindow(_,_,_,_,true) -> true | _ -> false))
-            if not inMoveSize.value then
-                soloSizeBeforeMove <-
-                    if this.windowCount = 1 then
-                        let hwnd = zorderCell.value.head
-                        LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd) |> Option.map(fun size -> hwnd,size)
-                    else None
-            inMoveSize.set(true)
-            // Armed once per move: a second start (a scale change restarts the loop) must not re-arm, or
-            // the next event would cancel the tail's pending placements for nothing.
-            if moveStartedFrom.IsNone then
-                // The frame the group last placed its top window at is the one before this move, which is
-                // what the first movement has to be compared with when the start event was missed.
-                let recorded =
-                    placement.value
-                    |> Option.map(fun (bounds,_,_) -> bounds)
-                    |> Option.filter(fun bounds -> not bounds.size.isEmptyArea)
-                moveStartedFrom <- Some(defaultArg recorded (this.os.windowFromHwnd(this.topWindow).bounds))
-                moveStartedAt <- Some(Pt(Cursor.Position.X, Cursor.Position.Y))
-            // Without drag-full-window the loop paints only at its end, so nothing moves before the end
-            // and the followers are hidden now instead.
-            if not SystemInformation.DragFullWindows then this.hideChildWindows()
-            let topWindow = this.os.windowFromHwnd(this.topWindow)
-            DragTrace.write(sprintf "START top=%d dpi=%d members=%d bounds=%s maximized=%b" (this.topWindow.ToInt64()) (Dpi.forWindow this.topWindow) this.windowCount (DragTrace.rect topWindow.bounds) topWindow.isMaximized)
-            this.updateIsVisible()
+    member this.onEnterMoveSize() =
+        FollowerPlacement.queue.cancel(placementOwner,this.topWindow,whenValue=(fun (_,request) ->
+            match request with AlignWindow(_,_,_,_,true) -> true | _ -> false))
+        if not inMoveSize.value then
+            soloSizeBeforeMove <-
+                if this.windowCount = 1 then
+                    let hwnd = zorderCell.value.head
+                    LastNormalSize.sizeOf (this.os.windowFromHwnd hwnd) |> Option.map(fun size -> hwnd,size)
+                else None
+        inMoveSize.set(true)
+        // Armed once per move: a second start (a scale change restarts the loop) must not re-arm, or
+        // the next event would cancel the tail's pending placements for nothing.
+        if moveStartedFrom.IsNone then
+            // The frame the group last placed its top window at is the one before this move, which is
+            // what the first movement has to be compared with when the start event was missed.
+            let recorded =
+                placement.value
+                |> Option.map(fun (bounds,_,_) -> bounds)
+                |> Option.filter(fun bounds -> not bounds.size.isEmptyArea)
+            moveStartedFrom <- Some(defaultArg recorded (this.os.windowFromHwnd(this.topWindow).bounds))
+            moveStartedAt <- Some(Pt(Cursor.Position.X, Cursor.Position.Y))
+        // Without drag-full-window the loop paints only at its end, so nothing moves before the end
+        // and the followers are hidden now instead.
+        if not SystemInformation.DragFullWindows then this.hideChildWindows()
+        DragTrace.write(sprintf "START top=%d dpi=%d members=%d" (this.topWindow.ToInt64()) (Dpi.forWindow this.topWindow) this.windowCount)
+        this.updateIsVisible()
 
     member this.onExitMoveSize() =
         let top = this.topWindow
-        let noGesture = captionRecovery.IsNone
-        let rejected = this.captionFrameRejected(top)
-        if noGesture && (not inMoveSize.value || rejected) then
-            DragTrace.write(sprintf "END-IGNORED top=%d moving=%b rejected=%b"
-                                (top.ToInt64()) inMoveSize.value rejected)
-            inMoveSize.set(false)
+        if not inMoveSize.value then
+            DragTrace.write(sprintf "END-IGNORED top=%d moving=false" (top.ToInt64()))
         else
-            let recovering =
-                captionRecovery
-                |> Option.filter(fun state ->
-                    state.token.plan.hwnd=top &&
-                    (state.finalizationStarted ||
-                     state.phase=CaptionRecovery.Restoring ||
-                     state.phase=CaptionRecovery.Watching ||
-                     state.phase=CaptionRecovery.Cancelling ||
-                     state.phase=CaptionRecovery.Restarting ||
-                     state.phase=CaptionRecovery.Restarted ||
-                     state.phase=CaptionRecovery.Released ||
-                     state.phase=CaptionRecovery.Abandoned ||
-                     state.phase=CaptionRecovery.Cleanup))
-            if recovering.IsSome then
-                let state = recovering.Value
-                DragTrace.write(sprintf "RECOVERY-END-SUPPRESSED top=%d phase=%A finalizing=%b"
-                                    (top.ToInt64()) state.phase state.finalizationStarted)
-                if state.token.isCancelled then
-                    this.finishCaptionRecovery(saveFrame=false)
-                else
-                    if not state.finalizationStarted &&
-                       not(Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON)) &&
-                       state.token.canFinalize then
-                        this.beginCaptionFinalization(state,Cursor.Position.Pt)
-                    inMoveSize.set(true)
-                    this.hideChildWindows()
-                    this.updateIsVisible()
+            soloSizeBeforeMove <- None
+            pressHolding <- false
+            pressHidden.Clear()
+            moveStartedFrom <- None
+            moveStartedAt <- None
+            inMoveSize.set(false)
+            // A drag that crosses a monitor changes the dragged window's DPI, and Windows can end its
+            // move loop there and start another: the end reported here is not the end. Aligning the
+            // followers at that moment put them back on the screen for the rest of the drag, which is
+            // the window that appeared after a move from one monitor to the other. They stay off the
+            // screen, and this group still owns the move, until the loop is really over.
+            let stillMoving = WinUserApi.IsWindow top && this.os.windowFromHwnd(top).isInMoveSize
+            DragTrace.write(sprintf "END top=%d stillMoving=%b dpi=%d" (top.ToInt64()) stillMoving (Dpi.forWindow top))
+            if stillMoving then
+                inMoveSize.set(true)
+                this.hideChildWindows()
+                this.updateIsVisible()
             else
-                let stillMoving = WinUserApi.IsWindow top && this.os.windowFromHwnd(top).isInMoveSize
-                soloSizeBeforeMove <- None
-                pressHolding <- false
-                pressHidden.Clear()
-                moveStartedFrom <- None
-                moveStartedAt <- None
-                inMoveSize.set(false)
-                // A drag that crosses a monitor changes the dragged window's DPI, and Windows can end its
-                // move loop there and start another: the end reported here is not the end. Aligning the
-                // followers at that moment put them back on the screen for the rest of the drag, which is
-                // the window that appeared after a move from one monitor to the other. They stay off the
-                // screen, and this group still owns the move, until the loop is really over.
-                DragTrace.write(sprintf "END top=%d stillMoving=%b dpi=%d" (top.ToInt64()) stillMoving (Dpi.forWindow top))
-                if stillMoving then
-                    inMoveSize.set(true)
-                    this.hideChildWindows()
-                    this.updateIsVisible()
-                else
-                    this.saveTopWindowPlacement()
-                    this.adjustChildWindows()
-                    this.makeTopWindowForeground()
-                    // Dragging a fullscreen window out of fullscreen ends the state without a location
-                    // change of the kind that updates this, and the strip's shape and auto-hide are read
-                    // from it.
-                    isMaximizedExport.update()
-                    this.updateIsVisible()
+                this.saveTopWindowPlacement()
+                this.adjustChildWindows()
+                this.makeTopWindowForeground()
+                // Dragging a fullscreen window out of fullscreen ends the state without a location
+                // change of the kind that updates this, and the strip's shape and auto-hide are read
+                // from it.
+                isMaximizedExport.update()
+                this.updateIsVisible()
 
     member this.main(hwnd, evt) =
         let location = evt = WinEvent.EVENT_OBJECT_LOCATIONCHANGE
@@ -2100,7 +1167,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                 this.setTabInfo hwnd
         | WinEvent.EVENT_SYSTEM_MOVESIZESTART ->
             if this.isTop(hwnd) then
-                this.onEnterMoveSize(nativeStart=true)
+                this.onEnterMoveSize()
 
         | WinEvent.EVENT_SYSTEM_MOVESIZEEND ->
             if this.isTop(hwnd) then 
@@ -2114,31 +1181,10 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         //event when they loose focus, we don't want to automatically give them focus in this case
         //so make sure that the window HAD focus before reapplying it
         | WinEvent.EVENT_OBJECT_LOCATIONCHANGE ->
-            captionRecovery
-            |> Option.filter(fun state -> this.isTop(hwnd) && state.token.plan.hwnd=hwnd)
-            |> Option.iter(fun state ->
-                if state.phase=CaptionRecovery.Watching then
-                    this.checkCaptionRecovery()
-                elif state.phase=CaptionRecovery.Restarting ||
-                     state.phase=CaptionRecovery.Restarted then
-                    this.observeCaptionRestart(state))
-            let recoveryHolding =
-                captionRecovery
-                |> Option.exists(fun state ->
-                    state.token.plan.hwnd=hwnd &&
-                    (state.finalizationStarted ||
-                     state.phase=CaptionRecovery.Cancelling ||
-                     state.phase=CaptionRecovery.Restarting ||
-                     state.phase=CaptionRecovery.Restarted ||
-                     state.phase=CaptionRecovery.Released ||
-                     state.phase=CaptionRecovery.Abandoned ||
-                     state.phase=CaptionRecovery.Cleanup))
-            let staleFrameRejected = this.captionFrameRejected(hwnd)
             // The mouse press announced the move; the window has not moved yet. The followers go off
             // the screen at the first frame the window actually moves, which is what a drag is.
-            if this.isTop(hwnd) && inMoveSize.value && not recoveryHolding then
+            if this.isTop(hwnd) && inMoveSize.value then
                 let moved = this.os.windowFromHwnd(hwnd).bounds
-                if DragTrace.enabled then DragTrace.write(sprintf "MOVE-LOC top=%d bounds=%s maximized=%b" (hwnd.ToInt64()) (DragTrace.rect moved) (this.os.windowFromHwnd(hwnd).isMaximized))
                 // Any movement counts: the followers go at the first pixel the pointer travels, so
                 // the window a drag can expose at its very start is exposed for as short a time as
                 // the event order allows.
@@ -2157,15 +1203,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             // it is dragging, every follower stays off the screen and the very handler that could
             // end the move is gated on that belief. The window itself says whether it is moving.
             let exitedHere =
-                this.isTop(hwnd) && inMoveSize.value && not recoveryHolding &&
+                this.isTop(hwnd) && inMoveSize.value &&
                 not (this.os.windowFromHwnd(hwnd).isInMoveSize)
             if exitedHere then
                 this.onExitMoveSize()
             // A joining tab can become foreground before its queued transition ends. Its intermediate
             // frames are not a new group size and must not resize every other member or cancel it.
-            if not exitedHere && not staleFrameRejected &&
-               this.isTop(hwnd) && inMoveSize.value.not && not recoveryHolding &&
-               not(FollowerPlacement.isAnimating placementOwner hwnd) then
+            if not exitedHere &&
+               this.isTop(hwnd) && inMoveSize.value.not && not(FollowerPlacement.isAnimating placementOwner hwnd) then
                 //you can miss EVENT_SYSTEM_MOVESIZESTART events
                 //when a window is created and is immediatly in move size, we subscribe
                 //to the event too late (Chrome tab dragging is prime example)
@@ -2265,12 +1310,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
     member this.removeWindow(hwnd) = this.withUpdate <| fun() ->
         inputOwnership.Remove hwnd |> ignore
         if not isDestroyed.value && this.windows.contains(hwnd) then
-            rejectedCaptionFrame
-            |> Option.filter(fun(owner,_) -> owner=hwnd)
-            |> Option.iter(fun _ -> rejectedCaptionFrame <- None)
-            captionRecovery
-            |> Option.filter(fun state -> state.token.plan.hwnd=hwnd)
-            |> Option.iter(fun _ -> this.invalidateCaptionRecovery("removed"))
             this.reclaimLeftTab(hwnd)
             let foreground = this.os.foreground.hwnd
             let next = TabNavigation.closeTarget this.lorder.list isOpen hwnd foreground lastActiveTab opener (this.leftOnClose hwnd)
@@ -2399,9 +1438,6 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
             stripHoldTimer.Dispose()
             stripHoldDue <- 0L
             stripHoldLimit <- 0L
-            this.clearCaptionRecovery()
-            rejectedCaptionFrame <- None
-            captionRecoveryTimer.Dispose()
             minimizeStateTimer.Dispose()
             pendingMinimizeStates.Clear()
             requestedMinimizeStates.Clear()

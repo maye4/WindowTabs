@@ -132,11 +132,7 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
             let mutable result = IntPtr.Zero
             let lParam = IntPtr((pt.y <<< 16) ||| (pt.x &&& 0xFFFF))
             let answered = WinUserApi.SendMessageTimeout(hwnd,0x0084,IntPtr.Zero,lParam,0x0002,20,&result)
-            let caption = answered<>IntPtr.Zero && result.ToInt32()=2
-            // A timed-out hit test is a press the drag restore never sees.
-            if not caption then
-                DragTrace.write(sprintf "CAPTION-MISS hwnd=%d pt=%d,%d answered=%b hit=%d" (hwnd.ToInt64()) pt.x pt.y (answered<>IntPtr.Zero) (result.ToInt32()))
-            caption)
+            answered<>IntPtr.Zero && result.ToInt32()=2)
         |> Option.map(fun group -> hwnd,group.cast<GroupInfo>())
 
     member this.llHook nCode (wParam:IntPtr) lParam = 
@@ -155,25 +151,17 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
             lastCaptionPress <- pressed |> Option.map(fun(hwnd,_) -> now,pt,hwnd)
             // The second press toggles the window's state, and the other windows animate with it
             // only if they are still on screen: they are not hidden for it.
-            // A maximized window is restored by the group once this press turns into a drag, so the
-            // drag shows the shrink the caption button does rather than the system's fade.
             captionDrag <-
                 pressed |> Option.map(fun(hwnd,info) ->
                     let suffix = if secondClick then "-2ND" else ""
                     DragTrace.write(sprintf "CAPTION-PRESS%s hwnd=%d pt=%d,%d" suffix (hwnd.ToInt64()) pt.x pt.y)
                     pt,hwnd,info,secondClick)
-            if secondClick then
-                pressGroup <- None
-                pressed |> Option.iter(fun(hwnd,info) ->
-                    info.invokeGroup <| fun() ->
-                        if not info.isExited then info.group.captionPressStarted(hwnd))
+            if secondClick then pressGroup <- None
             else
                 pressGroup <- pressed
                 pressed |> Option.iter(fun(hwnd,info) ->
                     info.invokeGroup <| fun() ->
-                        if not info.isExited then
-                            info.group.captionPressStarted(hwnd)
-                            info.group.pressHide(hwnd))
+                        if not info.isExited then info.group.pressHide(hwnd))
         if nCode>=0 && msg=WindowMessages.WM_MOUSEMOVE then
             match captionDrag with
             | Some(start,hwnd,info,secondClick) ->
@@ -184,23 +172,21 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
                     captionDrag <- None
                     lastCaptionPress <- None
                     if secondClick then pressGroup <- Some(hwnd,info)
-                    // Capture the restore on the group STA, then let it start the native call on a
-                    // worker. The hook returns immediately; the group keeps the token that decides
-                    // whether a late move loop needs the one-shot recovery.
-                    info.invokeGroup(fun() ->
-                        if not info.isExited && Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) then
-                            if secondClick then info.group.pressHide(hwnd)
-                            info.group.captionDragStarted(hwnd,start,pt))
+                    // A double-click that turns into a drag hides the other windows on its first
+                    // movement. The move loop un-maximizes the window itself, and the group does not
+                    // place it.
+                    if secondClick then
+                        info.invokeGroup(fun() ->
+                            if not info.isExited && Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) then
+                                info.group.pressHide(hwnd))
             | None -> ()
         if nCode>=0 && msg=WindowMessages.WM_LBUTTONUP then
             captionDrag <- None
-            let hookStruct = unbox<MSLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<MSLLHOOKSTRUCT>))
-            let pt = hookStruct.pt.Pt
             match pressGroup with
             | Some(_,info) ->
                 pressGroup <- None
                 info.invokeGroup <| fun() ->
-                    if not info.isExited then info.group.pressShow(pt)
+                    if not info.isExited then info.group.pressShow()
             | None -> ()
         if nCode>=0 && msgSet.contains(msg) then
             this.foregroundGroup.iter <| fun group ->

@@ -765,6 +765,26 @@ let main() =
             onGroup(fun group -> group.onEnterMoveSize(); group.onExitMoveSize())
             pumpUntil(fun () -> onGroup(fun group -> group.isPlacementIdle))
             check (handles |> List.forall(fun hwnd -> OS().windowFromHwnd(hwnd).bounds.x < -10000)) "Move helpers escaped the off-screen fixture"
+            // A delayed or synthetic end after a location callback has already finished the move must
+            // not save the group frame and realign a follower the user has since moved.
+            let movedFollower = onGroup(fun group -> group.zorder.value.tail.head)
+            let followerForm = forms.[handles |> List.findIndex ((=) movedFollower)]
+            let movedBounds,beforeMoveChanges =
+                onHelper(fun () ->
+                    followerForm.Bounds <- Rectangle(-19500,-19500,500,400)
+                    Rect(Pt(followerForm.Left,followerForm.Top),Sz(followerForm.Width,followerForm.Height)),
+                    followerForm.Changes)
+            onGroup(fun group ->
+                group.onExitMoveSize()
+                group.main(group.topWindow,WinEvent.EVENT_SYSTEM_MOVESIZEEND))
+            onGroup(fun _ -> ())
+            pumpUntil(fun () -> onGroup(fun group -> group.isPlacementIdle))
+            check (OS().windowFromHwnd(movedFollower).bounds=movedBounds)
+                  "An idle move-end realigned a follower to the group frame"
+            check (followerForm.Changes=beforeMoveChanges)
+                  "An idle move-end sent native positioning messages"
+            onGroup(fun group -> invoke "updatePlacements" group [||] |> ignore)
+            pumpUntil(fun () -> onGroup(fun group -> group.isPlacementIdle))
             onGroup(fun group -> group.main(handles.Head,WinEvent.EVENT_SYSTEM_MINIMIZESTART))
             // A dispatcher barrier waits for the explicitly queued stale event.
             onGroup(fun _ -> ())
