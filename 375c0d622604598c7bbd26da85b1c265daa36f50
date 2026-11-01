@@ -1,0 +1,6 @@
+Keep a tab dragged out of a full-screen group at its own size, or half the monitor
+
+Covers tab drags only (Desktop.fs dragDrop, Window.dragSize). A drag by the
+app's own title bar is restored by Windows and is not handled here.
+Helpers: MonitorFit.fillsWorkArea / mediumNormalSize / draggableNormalSize,
+LastNormalSize.
