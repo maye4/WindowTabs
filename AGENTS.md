@@ -12,6 +12,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tests/Run-Tests.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ./tests/Run-Tests.ps1 -Suites Architecture,TabInteraction"
 ```
 
+- After every code fix, automatically run `dotnet build WindowTabs.sln -c Debug`
+  without waiting for a separate request. After a successful build, launch
+  `WtProgram\bin\Debug\WindowTabs.exe` and confirm the new process stays running.
+  This applies to all fixes, not only reviews. From WSL, use Windows `dotnet` through
+  `powershell.exe` and preserve the existing instance's working directory when known.
 - `Run-Tests.ps1` builds a separate Debug copy into `tests/Debug`, compiles each
   `tests/<Suite>.fsx` into its own STA exe through `tests/TestHost.fsproj` and runs them
   serially on a hidden desktop (`-VisibleDesktop` to watch them). Native UI suites need

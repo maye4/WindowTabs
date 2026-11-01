@@ -311,6 +311,54 @@ let main() =
                 check (follower.visibleBounds=source.visibleBounds)
                       (sprintf "Windows with different borders were aligned by their window bounds: %A vs %A" follower.visibleBounds source.visibleBounds)
             finally FollowerPlacement.queue.release(frameOwner,narrow.Handle)
+        // Restoring a maximized follower changes its borders, then the correction moves it again.
+        // A resize handler that raises the follower during a visible move must not leave it over its source.
+        do
+            use wide = new Form(ShowInTaskbar=false,FormBorderStyle=FormBorderStyle.None,StartPosition=FormStartPosition.Manual,
+                                Bounds=Drawing.Rectangle(-20000,-19000,640,420))
+            use narrow = new Form(ShowInTaskbar=false,FormBorderStyle=FormBorderStyle.Sizable,StartPosition=FormStartPosition.Manual,
+                                  Bounds=Drawing.Rectangle(-19000,-18600,500,300))
+            let source,follower = OS().windowFromHwnd(wide.Handle),OS().windowFromHwnd(narrow.Handle)
+            source.setOwner(snapOwnerWindow)
+            follower.setOwner(snapOwnerWindow)
+            source.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            follower.showWindow(ShowWindowCommands.SW_SHOWNOACTIVATE)
+            follower.setPlacement { follower.placement with showCmd=ShowWindowCommands.SW_SHOWMAXIMIZED }
+            check follower.isMaximized "The restored-border fixture did not maximize its follower"
+            follower.hideForMove()
+            check (MoveHidden.holds follower.hwnd && not follower.isVisible) "The restored-border fixture did not hide its follower"
+            sourceWindow.setForeground(false)
+            let foreground,active = WinUserApi.GetForegroundWindow(),WinUserApi.GetActiveWindow()
+            check (foreground=snapSource.Handle && active=snapSource.Handle)
+                  "The restored-border fixture did not restore the active source"
+            let bounds,visible,placement = source.bounds,source.visibleBounds,source.placement
+            let frameOwner = obj()
+            let mutable reordering = false
+            let mutable raised = false
+            narrow.LocationChanged.Add(fun _ ->
+                if not reordering && follower.isVisible && not follower.isMaximized then
+                    reordering <- true
+                    try
+                        follower.insertAfter(WindowHandleTypes.HWND_TOP)
+                        raised <- true
+                    finally reordering <- false)
+            FollowerPlacement.queue.claim(frameOwner,follower.hwnd)
+            try
+                FollowerPlacement.queue.submit(frameOwner,follower.hwnd,
+                    FollowerPlacement.alignHiddenFrameRequest follower.hwnd bounds visible placement (Some source.hwnd))
+                pumpUntil "Hidden restored follower placement did not finish" (fun () -> FollowerPlacement.queue.isIdle(frameOwner))
+                check raised "The restored-border fixture did not raise during a visible normal move"
+                check (follower.isVisible && not follower.isMaximized && not follower.isMinimized)
+                      "A maximized follower did not return restored and visible"
+                check (not(MoveHidden.holds follower.hwnd)) "A restored follower kept its hidden mark"
+                check (follower.visibleBounds=visible)
+                      (sprintf "A restored follower kept its maximized border offset: %A vs %A" follower.visibleBounds visible)
+                check (source.zorder<follower.zorder) "A resize handler left the follower above its source"
+                check (WinUserApi.GetForegroundWindow()=foreground && WinUserApi.GetActiveWindow()=active)
+                      "A hidden follower placement changed the active window"
+            finally
+                FollowerPlacement.queue.release(frameOwner,follower.hwnd)
+                if MoveHidden.holds follower.hwnd then MoveHidden.release follower.hwnd |> ignore
         // A normal-sized drag join eases size and position changes through real native frames,
         // while a regular reconciliation still aligns immediately. It must keep the originating
         // tab active.

@@ -154,6 +154,17 @@ module FollowerPlacement =
         let tid = WinUserApi.GetWindowThreadProcessId(hwnd,&pid)
         pid,tid
 
+    /// The window bounds that put a follower's visible frame on the source's, given the follower's
+    /// own bounds and visible frame. A maximized window's borders are pushed past the monitor on
+    /// every side, the top one included, and are not the borders it has once restored: measured
+    /// from them, a follower restored behind a dragged window stood a border's width above it. It
+    /// takes the source's bounds until it is restored and can be measured.
+    let frameFor (bounds:Rect) (frame:Rect) (own:Rect) (seen:Rect) (maximized:bool) =
+        if maximized || seen.size.isEmptyArea then bounds
+        else
+            let left,top = seen.x-own.x,seen.y-own.y
+            Rect(Pt(frame.x-left,frame.y-top),Sz(frame.width+own.width-seen.width,frame.height+own.height-seen.height))
+
     let private apply hwnd (expected,request) current =
         let valid() = current() && identity hwnd=expected && WinUserApi.IsWindow(hwnd)
         if valid() then
@@ -199,26 +210,24 @@ module FollowerPlacement =
                     DragTrace.write(sprintf "BACK %d minimized visible=%b marked=%b"
                                         (hwnd.ToInt64()) window.isVisible (MoveHidden.holds hwnd))
                 elif valid() && not window.isMinimized then
-                    let own,seen = window.bounds,window.visibleBounds
-                    let target =
+                    let target() =
                         match visible with
-                        | Some frame when not seen.size.isEmptyArea ->
-                            let left,top = seen.x-own.x,seen.y-own.y
-                            Rect(Pt(frame.x-left,frame.y-top),Sz(frame.width+own.width-seen.width,frame.height+own.height-seen.height))
-                        | _ -> bounds
+                        | Some frame -> frameFor bounds frame window.bounds window.visibleBounds window.isMaximized
+                        | None -> bounds
+                    let first = target()
                     // An application that is shown on a monitor of another scale rescales itself by
                     // the ratio between the two (measured: asked 2353x1301 on a 192 dpi monitor from
                     // a window at 144, landed 3137x1735). It is asked for the frame divided by that
                     // ratio instead, so its own scaling lands on the frame and no wrong-sized frame
                     // is ever painted. Only a window whose scale really changes takes this path.
                     let windowDpi = Dpi.forWindow hwnd
-                    let targetDpi = Dpi.forMonitorPoint target.location
+                    let targetDpi = Dpi.forMonitorPoint first.location
                     let asked =
                         if windowDpi<>targetDpi && targetDpi>0 then
                             let ratio = float windowDpi / float targetDpi
-                            Rect(target.location, Sz(int(Math.Round(float target.size.width * ratio)),
-                                                     int(Math.Round(float target.size.height * ratio))))
-                        else target
+                            Rect(first.location, Sz(int(Math.Round(float first.size.width * ratio)),
+                                                   int(Math.Round(float first.size.height * ratio))))
+                        else first
                     // A maximized follower refuses a move, and the group's frame is a normal
                     // rectangle, so it would come back maximized and covering the screen instead of
                     // in the group. A placement sets its state and its rectangle in one call, onto
@@ -226,7 +235,7 @@ module FollowerPlacement =
                     // while the frame is on the screen, converted the way the drag restore does.
                     if window.isMaximized then
                         let workspaceOffset =
-                            match Mon.fromPoint target.location with
+                            match Mon.fromPoint first.location with
                             | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
                             | None -> Pt()
                         window.setPlacement { window.placement with
@@ -238,23 +247,26 @@ module FollowerPlacement =
                     // A show the application refused keeps the mark, so the next start finds the
                     // window and gives it back; only a window that is really on screen is done.
                     if valid() && window.isVisible then MoveHidden.release hwnd |> ignore
-                    // A follower restored without activation can rise above the window it belongs
-                    // under, and nothing later in this request would put it back.
-                    if valid() && window.isVisible && not window.isMinimized then
-                        below |> Option.iter(fun top ->
-                            if valid() && WinUserApi.IsWindow(top) then window.insertAfter(top))
                     // A hidden window learns its monitor's scale when it is shown, not when it is
                     // moved, so an application placed across two scales rescales itself *after*
                     // this show and comes back larger than the frame it was given. The frame is
                     // re-applied once, after that, and only when the window really moved off it.
-                    if valid() && window.isVisible && window.bounds<>target then
+                    // A follower that was maximized is measured again here, now that it has the
+                    // borders it keeps.
+                    let restored = target()
+                    if valid() && window.isVisible && window.bounds<>restored then
                         let refused = window.bounds
-                        window.move(target)
+                        window.move(restored)
                         DragTrace.write(sprintf "CORRECT %d asked=%s refused=%s now=%s dpi=%d"
-                                            (hwnd.ToInt64()) (DragTrace.rect target) (DragTrace.rect refused)
+                                            (hwnd.ToInt64()) (DragTrace.rect restored) (DragTrace.rect refused)
                                             (DragTrace.rect window.bounds) (Dpi.forWindow hwnd))
+                    // A follower restored without activation can rise above the window it belongs
+                    // under. Correct stacking after the last frame change, which can raise it again.
+                    if valid() && window.isVisible && not window.isMinimized then
+                        below |> Option.iter(fun top ->
+                            if valid() && WinUserApi.IsWindow(top) then window.insertAfter(top))
                     DragTrace.write(sprintf "BACK %d want=%s got=%s visible=%b marked=%b minimized=%b dpi=%d"
-                                        (hwnd.ToInt64()) (DragTrace.rect target) (DragTrace.rect window.bounds)
+                                        (hwnd.ToInt64()) (DragTrace.rect restored) (DragTrace.rect window.bounds)
                                         window.isVisible (MoveHidden.holds hwnd) window.isMinimized
                                         (Dpi.forWindow hwnd))
             | AlignWindow(bounds,wp,below,visible,animate) ->

@@ -76,6 +76,15 @@ let main() =
         check (offTop.y = work.top) "A caption drag put the window above the work area"
         let offBottom = MaximizedRestore.dragFrame (Pt(1400,20)) visible (Pt(-8,-8)) work (Pt(1000,work.bottom+100)) size
         check (offBottom.y = work.bottom-size.height) "A caption drag put the window below the work area"
+        // A follower restored from maximized behind a dragged window is placed by the source's frame
+        // while it is maximized, not by the borders maximizing pushed off the monitor, and by its own
+        // borders once it is restored.
+        let source = Rect(Pt(92,272),Sz(816,608))
+        let seenFrame = Rect(Pt(100,272),Sz(800,600))
+        check (FollowerPlacement.frameFor source seenFrame (Rect(Pt(-8,-8),Sz(1936,1048))) (Rect(Pt(0,0),Sz(1920,1032))) true = source)
+              "A maximized follower was placed by its maximized borders"
+        check (FollowerPlacement.frameFor source seenFrame (Rect(Pt(0,0),Sz(820,610))) (Rect(Pt(10,0),Sz(800,600))) false = Rect(Pt(90,272),Sz(820,610)))
+              "A restored follower did not keep its own borders around the source's frame"
     let original = Environment.CurrentDirectory
     let originalDpi = Dpi.value()
     let isolated = Path.Combine(__SOURCE_DIRECTORY__,"Debug","interaction-test-"+Guid.NewGuid().ToString("N"))
