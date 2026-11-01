@@ -91,6 +91,15 @@ module MoveHidden =
     let private gate = obj()
     let private hidden = Collections.Generic.HashSet<IntPtr>()
 
+    /// Hiding a window plays DWM's hide transition, a fade of about a fifth of a second, and the
+    /// drag restores the top window a few milliseconds after the press: the follower would still be
+    /// fading behind it. A window held off the screen for a move has its transitions turned off for
+    /// as long as it is held, so it goes in one frame; they come back with the release.
+    let private transitions (hwnd:IntPtr) (enabled:bool) =
+        let mutable disabled = if enabled then 0 else 1
+        try DwmApi.DwmSetWindowAttribute(hwnd, DWMWINDOWATTRIBUTE.DWMWA_TRANSITIONS_FORCEDISABLED, &disabled, sizeof<int>) |> ignore
+        with :? DllNotFoundException -> ()
+
     /// The window carries the mark, so a handle the system has since reused does not inherit it.
     let holds (hwnd:IntPtr) =
         WinUserApi.IsWindow hwnd && WinUserApi.GetProp(hwnd,key) <> IntPtr.Zero
@@ -99,13 +108,16 @@ module MoveHidden =
     /// for is left visible: nothing would bring it back after a killed run.
     let hold hwnd =
         if WinUserApi.IsWindow hwnd && WinUserApi.SetProp(hwnd,key,IntPtr(1)) then
+            transitions hwnd false
             lock gate (fun () -> hidden.Add hwnd |> ignore)
             true
         else false
 
     let release hwnd =
         if lock gate (fun () -> hidden.Remove hwnd) then
-            if WinUserApi.IsWindow hwnd then WinUserApi.RemoveProp(hwnd,key) |> ignore
+            if WinUserApi.IsWindow hwnd then
+                WinUserApi.RemoveProp(hwnd,key) |> ignore
+                transitions hwnd true
             true
         else false
 
@@ -120,6 +132,7 @@ module MoveHidden =
                         else ShowWindowCommands.SW_SHOWNA
                     WinUserApi.ShowWindow(hwnd,cmd) |> ignore
                 WinUserApi.RemoveProp(hwnd,key) |> ignore
+                transitions hwnd true
 
 /// Normal-to-normal frame changes have no native transition. Use elapsed time, not a fixed number
 /// of layouts: a slow application skips overdue frames instead of stretching the gesture out.

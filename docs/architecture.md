@@ -75,9 +75,24 @@ skips overdue frames instead of extending the transition. Pointer updates retarg
 without restarting its clock; a handoff cancels it before placing the window elsewhere. Intermediate
 placement frames are not saved as the group's frame, even if the joining tab becomes foreground.
 Ordinary follower reconciliation remains immediate; native maximize/restore is left to Windows.
+A caption press hides the group's other windows for the length of the press, so a drag begins
+with the group alone; the second press of a double-click does not hide them, because that press
+toggles the window's state and the other windows must be on screen to animate with it, as they
+do when the restore button is clicked. A press that travels past the system's drag box queues a
+best-effort restore of a maximized top window on the group's thread and returns immediately from the
+pointer hook, so a hung application cannot stall system input. The queued restore runs only while the
+button is still down and the window is still maximized; otherwise the move loop's own un-maximize is
+left alone. The restored frame is held where the pointer gripped the caption — the same fraction
+across it, the same height down it — and is kept on that monitor's work area.
 The floating tab refreshes from the actual window frame on its owning STA until the move settles,
 including one final refresh after the worker stops, so its chrome stays attached even if the pointer
 stops during a resize.
+A maximized top window's restore rectangle is what Windows itself restores on a
+title-bar drag. When it fills the work area, the group replaces it, without
+un-maximizing, with the window's own last size or half the work area when it has
+none, and stores that rectangle as the group's; followers that were maximized
+alongside it are given the same one. A tab dragged out of a group already picks
+that size.
 When a maximized follower returns to normal, restore it without activation, apply
 the source's actual bounds (its saved restore rectangle may predate snapping), and
 retain its native stacking position. The same stacking protection applies when

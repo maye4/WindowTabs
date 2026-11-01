@@ -35,6 +35,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ./tests/Run-Tests.ps1 
 - Review all staged and unstaged changes for defects and regressions, then fix any
   findings. Preserve the existing index; leave review fixes and guidance updates
   unstaged. Do not commit unless asked.
+- In Codex, use subagent models to fix bugs found during review.
 - Do not run automated tests during this routine unless explicitly requested. Add
   regression assertions for fixes where appropriate, but leave them unrun.
 - After fixes, build `WindowTabs.sln -c Debug` and launch
@@ -43,6 +44,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ./tests/Run-Tests.ps1 
   directory explicitly. Preserve an existing instance's working directory if known.
 - Report findings first, then the build and launch result, and note that tests
   were not run.
+
+## Model routing
+
+- In Claude Code, plan, diagnose and review with the main session's model, which
+  `.claude/settings.json` pins to Opus. Once the plan is fixed, delegate every file edit to the
+  `editor` subagent (`.claude/agents/editor.md`, pinned to a smaller model). It applies the plan; it
+  does not re-plan.
+- In Codex, keep planning, diagnosis and review in the main session, then spawn subagents to make
+  every file edit. Give them the exact files, anchors and intended result; they apply the plan, not
+  redesign it.
+- Verify the edits with `git diff` before building, then build and launch as usual.
 
 ## Layout
 

@@ -8,6 +8,8 @@ Changes since v2026.10.17-beta.1.
 
 - Drag tabs between groups with a preview that follows the pointer, slides the
   destination into place and flies the released tab into its slot.
+- Keep a tab dragged out of a full-screen group at its own size, or half the
+  monitor if it has none.
 - Animate normal-sized windows joining or leaving a group, including joins that
   only change the window's position.
 - Keep the dragged window and the destination strip responsive while the window

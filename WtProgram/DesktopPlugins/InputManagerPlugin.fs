@@ -34,6 +34,29 @@ type NumericShortcutCapture() =
             else pressed.Contains(key), None
         else false, None
 
+/// The second press of a system double-click: the same window, within the double-click time and
+/// box. That press is the one that toggles the window's state — maximize or restore — and the group
+/// must keep its other windows on screen for it, so they animate with the change exactly as they do
+/// when the restore button is clicked. Only the first press of the pair hides them, for a drag it
+/// may start; a double-click that turns into a drag still hides them on its first movement.
+module CaptionPress =
+    /// Milliseconds since the hook started: `TickCount` wraps, and the age of a press taken across
+    /// the wrap would read as negative, so a pair that far apart would look like one double-click.
+    let private clock = Diagnostics.Stopwatch.StartNew()
+    let now () = clock.ElapsedMilliseconds
+    let isSecond (previous:(int64 * Pt * IntPtr) option) (at:int64) (pt:Pt) (hwnd:IntPtr) =
+        match previous with
+        | Some(beforeAt,beforePt,beforeHwnd) when beforeHwnd=hwnd ->
+            let box = System.Windows.Forms.SystemInformation.DoubleClickSize
+            at-beforeAt <= int64 System.Windows.Forms.SystemInformation.DoubleClickTime &&
+                2 * abs(pt.x-beforePt.x) <= box.Width && 2 * abs(pt.y-beforePt.y) <= box.Height
+        | _ -> false
+    /// A caption press that has travelled past the system's drag box is a drag, and starts the move
+    /// loop the same way the system's own threshold does.
+    let isDrag (start:Pt) (pt:Pt) =
+        let box = System.Windows.Forms.SystemInformation.DragSize
+        2 * abs(pt.x-start.x) > box.Width || 2 * abs(pt.y-start.y) > box.Height
+
 type InputManagerPlugin(msgSet:Set2<Int32>) as this =
     let hookProcDelegate = HOOKPROC(this.llHook)
     let mutable kbHook = null
@@ -52,6 +75,12 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
     /// The group whose caption took the last press, so the release is answered by that group even if
     /// the pointer has left it. A hold that is never released would keep the group's windows hidden.
     let mutable pressGroup : (IntPtr * GroupInfo) option = None
+    /// The last caption press, for the system's double-click rule: the second press of a pair keeps
+    /// the group's other windows on screen.
+    let mutable lastCaptionPress : (int64 * Pt * IntPtr) option = None
+    /// A caption press that may become a drag: where the pointer went down, the window and group that
+    /// own it, and whether this was the second press of a double-click.
+    let mutable captionDrag : (Pt * IntPtr * GroupInfo * bool) option = None
     let mutable cachedPath = (IntPtr.Zero, "")
     let pathFor hwnd =
         if fst cachedPath <> hwnd then
@@ -114,12 +143,47 @@ type InputManagerPlugin(msgSet:Set2<Int32>) as this =
         // press that took the hide, not to whatever happens to be under the pointer by then.
         if nCode>=0 && msg=WindowMessages.WM_LBUTTONDOWN then
             let hookStruct = unbox<MSLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<MSLLHOOKSTRUCT>))
-            let pressed = this.captionGroup hookStruct.pt.Pt
-            pressGroup <- pressed
-            pressed |> Option.iter(fun(hwnd,info) ->
-                info.invokeGroup <| fun() ->
-                    if not info.isExited then info.group.pressHide(hwnd))
+            let pt = hookStruct.pt.Pt
+            let now = CaptionPress.now()
+            let pressed = this.captionGroup pt
+            let secondClick =
+                pressed |> Option.exists(fun(hwnd,_) -> CaptionPress.isSecond lastCaptionPress now pt hwnd)
+            lastCaptionPress <- pressed |> Option.map(fun(hwnd,_) -> now,pt,hwnd)
+            // The second press toggles the window's state, and the other windows animate with it
+            // only if they are still on screen: they are not hidden for it.
+            // A maximized window is restored by the group once this press turns into a drag, so the
+            // drag shows the shrink the caption button does rather than the system's fade.
+            captionDrag <-
+                pressed |> Option.map(fun(hwnd,info) ->
+                    let suffix = if secondClick then "-2ND" else ""
+                    DragTrace.write(sprintf "CAPTION-PRESS%s hwnd=%d pt=%d,%d" suffix (hwnd.ToInt64()) pt.x pt.y)
+                    pt,hwnd,info,secondClick)
+            if secondClick then pressGroup <- None
+            else
+                pressGroup <- pressed
+                pressed |> Option.iter(fun(hwnd,info) ->
+                    info.invokeGroup <| fun() ->
+                        if not info.isExited then info.group.pressHide(hwnd))
+        if nCode>=0 && msg=WindowMessages.WM_MOUSEMOVE then
+            match captionDrag with
+            | Some(start,hwnd,info,secondClick) ->
+                let hookStruct = unbox<MSLLHOOKSTRUCT>(Marshal.PtrToStructure(lParam, typeof<MSLLHOOKSTRUCT>))
+                let pt = hookStruct.pt.Pt
+                if CaptionPress.isDrag start pt then
+                    DragTrace.write(sprintf "CAPTION-DRAG hwnd=%d start=%d,%d now=%d,%d second=%b" (hwnd.ToInt64()) start.x start.y pt.x pt.y secondClick)
+                    captionDrag <- None
+                    lastCaptionPress <- None
+                    if secondClick then pressGroup <- Some(hwnd,info)
+                    // The group owns hiding and placement. Queue both and return from the pointer
+                    // hook: cross-process placement can wait on a hung window, and the hook must not.
+                    info.invokeGroup(fun() ->
+                        if not info.isExited && Win32Helper.IsKeyPressed(VirtualKeyCodes.VK_LBUTTON) then
+                            if secondClick then info.group.pressHide(hwnd)
+                            let window = OS.windowFromHwnd(hwnd)
+                            if window.isMaximized then MaximizedRestore.restore window start pt)
+            | None -> ()
         if nCode>=0 && msg=WindowMessages.WM_LBUTTONUP then
+            captionDrag <- None
             match pressGroup with
             | Some(_,info) ->
                 pressGroup <- None

@@ -198,6 +198,70 @@ module LastNormalSize =
     let offered() = dragOffered.Value
     let clearOffer() = dragOffered := None
 
+/// A maximized window restores to the rectangle it carried before it maximized, and Windows restores
+/// it there itself before the group learns of the move: on a title-bar drag, once the pointer passes
+/// the system's drag box. When that rectangle fills the work area — a window created full-screen, or
+/// one that took a maximized group's frame — the restore puts a full-screen-sized window back on the
+/// monitor. It is replaced here with the window's own last size, or half the work area when it has
+/// none: the size a tab dragged out of the group restores to.
+module MaximizedRestore =
+    /// The placement the window must be un-maximized to, whether that un-maximize is Windows' or the
+    /// group's own. Nothing is written here.
+    let placement (window:Window) =
+        let wp = window.placement
+        match Mon.fromHwnd window.hwnd with
+        | Some mon when window.isMaximized && MonitorFit.fillsWorkArea mon.workRect wp.rcNormalPosition.size ->
+            let size =
+                match LastNormalSize.ofHwnd window.hwnd with
+                | Some remembered -> MonitorFit.draggableNormalSize mon.workRect remembered
+                | None -> MonitorFit.mediumNormalSize mon.workRect
+            { wp with rcNormalPosition = Rect(wp.rcNormalPosition.location, size) }
+        | _ -> wp
+
+    /// Writes that rectangle onto the window while it is still maximized, so an un-maximize Windows
+    /// performs without asking lands there. Returns the placement, corrected or not.
+    let store (window:Window) =
+        let wp = placement window
+        if wp <> window.placement then window.setPlacement wp
+        wp
+
+    /// The frame a caption drag restores to: the window's own size, held under the pointer where it
+    /// was gripped — the same fraction along the maximized caption, the same height down the title
+    /// bar — rather than going back where it was before it maximized while the pointer is elsewhere.
+    /// The frame is kept on the work area: a grip near an end of a maximized caption would otherwise
+    /// put most of the window off the monitor.
+    let dragFrame (grab:Pt) (visible:Rect) (frameOffset:Pt) (workArea:Rect) (pt:Pt) (size:Sz) =
+        let fraction = float (grab.x - visible.x) / float (max 1 visible.width)
+        let grip = max 0 (grab.y - visible.y)
+        let visibleAt = Pt(pt.x - int(Math.Round(fraction * float size.width)), pt.y - grip)
+        let frame = Rect(visibleAt.add frameOffset, size)
+        let left = max workArea.left (min frame.x (workArea.right - frame.width))
+        let top = max workArea.top (min frame.y (workArea.bottom - frame.height))
+        Rect(Pt(left, top), frame.size)
+
+    /// Un-maximizes the window under the pointer, without activating it. The pointer hook queues this
+    /// on the group thread as the drag box is passed; the move loop then usually finds a window that
+    /// is already restored, so the drag begins with the placement's own shrink animation instead of
+    /// the cross-fade the loop's un-maximize plays.
+    let restore (window:Window) (start:Pt) (pt:Pt) =
+        if window.isMaximized then
+            let wp = placement window
+            let visible = window.visibleBounds
+            let monitor = Mon.fromHwnd window.hwnd
+            let workArea = monitor |> Option.map(fun mon -> mon.workRect) |> Option.defaultValue visible
+            let frame = dragFrame start visible window.dragFrameOffset workArea pt wp.rcNormalPosition.size
+            // rcNormalPosition is in workspace coordinates while the pointer is on the screen: a
+            // monitor whose work area starts below or right of its display area needs the offset.
+            let workspaceOffset =
+                match monitor with
+                | Some mon -> mon.workRect.location.sub(mon.displayRect.location)
+                | None -> Pt()
+            let placed = { wp with showCmd = ShowWindowCommands.SW_SHOWNOACTIVATE
+                                   flags = 0
+                                   rcNormalPosition = Rect(frame.location.sub workspaceOffset, frame.size) }
+            DragTrace.write(sprintf "CAPTION-RESTORE hwnd=%d rcNormal=%s" (window.hwnd.ToInt64()) (DragTrace.rect placed.rcNormalPosition))
+            window.setPlacement placed
+
 type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:TabAppearanceInfo) as this =
     let Cell = CellScope(true)
     let inputOwnership = Collections.Generic.Dictionary<IntPtr,bool>()
@@ -574,11 +638,14 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
 
     member private this.hideChildWindows() =
         zorderCell.value.tail.iter(fun hwnd ->
-            // The queue keeps only the newest request per window, so an alignment still waiting
-            // from before the move would replace this hide and put the window back on screen.
-            FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
-                match request with AlignWindow _ -> true | _ -> false))
-            FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd))
+            let window = this.os.windowFromHwnd(hwnd)
+            if not window.isMinimized && window.isVisible then
+                // A pending alignment would put the window back on screen after this hide, and the
+                // queue would hold the hide itself behind an animation the move is already running:
+                // it goes off the screen now, like the press's own hide.
+                FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
+                    match request with AlignWindow _ -> true | _ -> false))
+                window.hideForMove())
 
     member private this.inZorder(windows:List2<IntPtr>) =
         // One desktop snapshot keeps the order consistent and avoids enumerating
@@ -811,6 +878,11 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
 
     member private this.isTop(hwnd) = zorderCell.value.where(isMinimized >> not).tryHead = Some(hwnd)
 
+    /// Stores the rectangle Windows restores a maximized window to, so a drag the move loop
+    /// un-maximizes lands at the size a tab dragged out of the group does.
+    member private this.maximizedRestorePlacement (window:Window) =
+        MaximizedRestore.store window
+
     member private this.saveTopWindowPlacement() =
         let window = this.os.windowFromHwnd(zorderCell.value.head)
         let dpi = Dpi.forMonitor window.hwnd
@@ -829,7 +901,7 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     Mon.fromHwnd(window.hwnd).map(fun mon -> mon.workRect.move(-1,-1))
                 else None
             let bounds = monitorBounds.def(window.bounds)
-            let wp = window.placement
+            let wp = this.maximizedRestorePlacement window
             let visible = monitorBounds.def(window.visibleBounds)
             placement.set(Some(bounds, wp, visible))
             // The size the user last chose for this window itself, captured once: only a solo
@@ -965,15 +1037,22 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
         if this.topWindow = pressed then
             pressHolding <- true
             pressHidden.Clear()
-            if not inMoveSize.value then
-                zorderCell.value.tail.iter(fun hwnd ->
-                    let window = this.os.windowFromHwnd(hwnd)
-                    if not window.isMinimized && window.isVisible && not (MoveHidden.holds hwnd) then
-                        // Submitted, not hidden here: a window that does not answer would hold this
-                        // thread, and with it every restore queued behind it.
-                        FollowerPlacement.queue.submit(placementOwner,hwnd,FollowerPlacement.hideRequest hwnd)
-                        pressHidden.Add hwnd |> ignore
-                        DragTrace.write(sprintf "PRESS-HIDE %d" (hwnd.ToInt64())))
+            // Hidden whether or not a move is already under way: the system announces the move on the
+            // press itself, and a group whose followers are still on screen when the drag restores the
+            // top window shows them through that animation. A mark a previous drag left says the
+            // window is recoverable, not that the application has kept it off the screen, so it is
+            // hidden again if it is visible.
+            zorderCell.value.tail.iter(fun hwnd ->
+                let window = this.os.windowFromHwnd(hwnd)
+                if not window.isMinimized && window.isVisible then
+                    // A pending alignment would put the window back on screen after this hide. The
+                    // hide itself cannot wait in the placement queue: that queue finishes its
+                    // animation first. A window that does not answer holds this thread instead.
+                    FollowerPlacement.queue.cancel(placementOwner,hwnd,whenValue=(fun (_,request) ->
+                        match request with AlignWindow _ -> true | _ -> false))
+                    window.hideForMove()
+                    pressHidden.Add hwnd |> ignore
+                    DragTrace.write(sprintf "PRESS-HIDE %d visible=%b" (hwnd.ToInt64()) window.isVisible))
 
     /// The press is over. A press that never became a drag brings the other windows back here; one
     /// that did is restored by the end of its move, which comes after the release.

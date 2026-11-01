@@ -186,6 +186,48 @@ let main() =
             finally
                 DragTabWindow.clear carried.Handle
                 onGroup info (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
+        // A maximized window restores to its own last size, and Windows does that restore itself on
+        // a title-bar drag, before the group hears of the move. A restore rectangle that fills the
+        // work area — a window created full-screen, or one that took a maximized group's frame —
+        // must come back at half the work area, or at the size the window last had.
+        do
+            use fullScreen = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                      Bounds=Drawing.Rectangle(60,60,700,500))
+            use sized = new Form(ShowInTaskbar=false,StartPosition=FormStartPosition.Manual,
+                                 Bounds=Drawing.Rectangle(80,80,700,500))
+            fullScreen.Show()
+            sized.Show()
+            let fullWindow = OS().windowFromHwnd(fullScreen.Handle)
+            let sizedWindow = OS().windowFromHwnd(sized.Handle)
+            let fullGroup = desktopApi.createGroup(false) :?> GroupInfo
+            let sizedGroup = desktopApi.createGroup(false) :?> GroupInfo
+            let maximizeOverFullRestore (window:Window) hwnd =
+                let screen = Screen.FromHandle(hwnd).Bounds
+                let full = Rect(Pt(screen.Left,screen.Top),Sz(screen.Width,screen.Height))
+                window.setPlacement { window.placement with
+                                        showCmd = ShowWindowCommands.SW_SHOWMAXIMIZED
+                                        rcNormalPosition = full }
+                check (window.isMaximized && MonitorFit.fillsWorkArea full window.placement.rcNormalPosition.size)
+                      "The full-restore-rectangle fixture did not maximize over the work area"
+            try
+                maximizeOverFullRestore fullWindow fullScreen.Handle
+                onGroup fullGroup (fun group -> group.addWindow(fullScreen.Handle,false))
+                let work = (Mon.fromHwnd fullScreen.Handle).Value.workRect
+                check fullWindow.isMaximized "Replacing a full-screen restore rectangle un-maximized the window"
+                check (fullWindow.placement.rcNormalPosition.size=MonitorFit.mediumNormalSize work)
+                      (sprintf "A full-screen restore rectangle did not become half the work area: %A" fullWindow.placement.rcNormalPosition)
+
+                let chosen = Sz(640,480)
+                LastNormalSize.captureIfAbsent sized.Handle chosen
+                maximizeOverFullRestore sizedWindow sized.Handle
+                onGroup sizedGroup (fun group -> group.addWindow(sized.Handle,false))
+                check sizedWindow.isMaximized "Replacing a full-screen restore rectangle un-maximized the sized window"
+                check (sizedWindow.placement.rcNormalPosition.size=chosen)
+                      (sprintf "A remembered normal size did not replace the full-screen restore rectangle: %A" sizedWindow.placement.rcNormalPosition)
+            finally
+                LastNormalSize.forget sized.Handle
+                onGroup fullGroup (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
+                onGroup sizedGroup (fun group -> for hwnd in group.windows.items.list do group.removeWindow hwnd)
         let nativeOrder info = onGroup info (fun group -> group.lorder.list)
         let publicOrder (info:GroupInfo) = (info :> IGroup).windows.list
         let checkStripOwner info =

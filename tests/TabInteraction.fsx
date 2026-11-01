@@ -31,6 +31,51 @@ let frames strip = frameProperty.GetValue(strip) :?> int64
 let main() =
     // Frame counts below assume a change paints once; the auto-hide animation is tested on its own.
     TabReveal.forced <- Some false
+    // The second press of a double-click toggles the window's state and must not hide the group's
+    // other windows, which animate with it; only the first press hides them for a drag.
+    do
+        let at = 10000L
+        let pt = Pt(100,200)
+        let hwnd = IntPtr(42)
+        let time = int64 SystemInformation.DoubleClickTime
+        let clickBox = SystemInformation.DoubleClickSize
+        let clickX,clickY = clickBox.Width/2,clickBox.Height/2
+        check (CaptionPress.isSecond (Some(at-time,pt,hwnd)) at (Pt(100+clickX,200-clickY)) hwnd)
+              "The second press of a double-click was not recognised"
+        check (not(CaptionPress.isSecond (Some(at-time,pt,hwnd)) at (Pt(101+clickX,200)) hwnd))
+              "A press beyond half the double-click width was taken as a double-click"
+        check (not(CaptionPress.isSecond (Some(at-time,pt,hwnd)) at (Pt(100,201+clickY)) hwnd))
+              "A press beyond half the double-click height was taken as a double-click"
+        check (not(CaptionPress.isSecond (Some(at-time-1L,pt,hwnd)) at pt hwnd))
+              "A press after the double-click time was taken as a double-click"
+        check (not(CaptionPress.isSecond (Some(at,pt,IntPtr(43))) at pt hwnd))
+              "A press on another window was taken as a double-click"
+        let dragBox = SystemInformation.DragSize
+        let dragX,dragY = dragBox.Width/2,dragBox.Height/2
+        check (CaptionPress.isDrag pt (Pt(101+dragX,200)))
+              "A caption press that travelled past the drag box was not taken as a drag"
+        check (CaptionPress.isDrag pt (Pt(100,201+dragY)))
+              "A caption press that travelled past the drag box vertically was not taken as a drag"
+        check (not(CaptionPress.isDrag pt (Pt(100+dragX,200+dragY))))
+              "A caption press inside the drag box was taken as a drag"
+        // A caption drag restores the window under the pointer where it was gripped: the same
+        // fraction along the maximized caption, the same height down the title bar, kept on the work
+        // area when the grip was near one end of it.
+        let size = Sz(800,600)
+        let visible = Rect(Pt(0,0),Sz(2000,1000))
+        let work = Rect(Pt(0,0),Sz(1920,1080))
+        let frame = MaximizedRestore.dragFrame (Pt(1400,20)) visible (Pt(-8,-8)) work (Pt(1000,300)) size
+        check (frame.size=size) "A caption drag did not restore the remembered size"
+        check (frame.x = 1000-560-8) "A caption drag did not keep the gripped caption fraction under the pointer"
+        check (frame.y = 300-20-8) "A caption drag did not keep the gripped caption height under the pointer"
+        let offLeft = MaximizedRestore.dragFrame (Pt(1990,20)) visible (Pt(-8,-8)) work (Pt(500,300)) size
+        check (offLeft.x = work.left) "A caption drag put the window off the left of the work area"
+        let offRight = MaximizedRestore.dragFrame (Pt(10,20)) visible (Pt(-8,-8)) work (Pt(1800,300)) size
+        check (offRight.x = work.right-size.width) "A caption drag put the window off the right of the work area"
+        let offTop = MaximizedRestore.dragFrame (Pt(1400,20)) visible (Pt(-8,-8)) work (Pt(1000,-100)) size
+        check (offTop.y = work.top) "A caption drag put the window above the work area"
+        let offBottom = MaximizedRestore.dragFrame (Pt(1400,20)) visible (Pt(-8,-8)) work (Pt(1000,work.bottom+100)) size
+        check (offBottom.y = work.bottom-size.height) "A caption drag put the window below the work area"
     let original = Environment.CurrentDirectory
     let originalDpi = Dpi.value()
     let isolated = Path.Combine(__SOURCE_DIRECTORY__,"Debug","interaction-test-"+Guid.NewGuid().ToString("N"))
