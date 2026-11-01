@@ -79,11 +79,45 @@ A caption press hides the group's other windows for the length of the press, so 
 with the group alone; the second press of a double-click does not hide them, because that press
 toggles the window's state and the other windows must be on screen to animate with it, as they
 do when the restore button is clicked. A press that travels past the system's drag box queues a
-best-effort restore of a maximized top window on the group's thread and returns immediately from the
-pointer hook, so a hung application cannot stall system input. The queued restore runs only while the
-button is still down and the window is still maximized; otherwise the move loop's own un-maximize is
-left alone. The restored frame is held where the pointer gripped the caption — the same fraction
-across it, the same height down it — and is kept on that monitor's work area.
+best-effort restore of a maximized top window. The group captures the original outer size, intended
+normal frame, HWND/PID/thread identity and a per-press token on its STA, then returns immediately from
+the pointer hook while a worker performs the native call, so a hung application cannot stall input.
+The restore runs only while the button is still down, the window still has the same owner and it is
+still maximized; otherwise the move loop's own un-maximize is left alone. The restored frame is held
+where the pointer gripped the caption — the same fraction across it, the same height down it — and
+is kept on that monitor's work area.
+
+A native move loop may have captured the maximized frame before that restore completes. When the same
+press later reports a normal, unminimized window at its original maximized size while the native loop
+is still moving it, the group suppresses the intermediate move end and takes one recovery attempt.
+A worker sends one bounded `WM_CANCELMODE`, then requires 40 ms of consecutive idle samples, ten
+milliseconds apart and bounded by 500 ms. That idle check is mitigation, not proof that a cross-process
+move mode cannot resume. Native move-state queries fail closed: only a successful
+`GetGUIThreadInfo` can report idle, so a failed query cannot authorize a repair. One live source
+whose query keeps failing stays passive until it can answer; a destroyed or replaced source ends
+cleanup instead of leaving the timer waiting forever. Only after the source is idle does the worker
+apply the planned normal frame under its current pointer and verify the intended size. The group
+rechecks the press token, membership, foreground tab, identity, button and planned frame before
+posting `SC_MOVE | HTCAPTION`; a replacement loop counts as restarted only after the intended normal
+size is observed. If the original maximized size returns, the attempt becomes passive and is never
+repeated for that press.
+
+Release is separate from invalidation. Release stops queued cancel/restart work but retains the
+immutable plan for one `Finalizing` worker; a new press, membership/top change, identity change or
+destruction invalidates both. The worker waits for the same stable idle, the initial restore result
+and completion of any recovery worker, then rechecks button-up, identity, ownership, settled
+normal/maximized/minimized state, idle move mode and the old maximized size immediately before one
+terminal `SetWindowPlacement`. Its release-point frame is fixed on the group STA and uses the target
+monitor's workspace offset. Save, solo-size capture and follower alignment are held for the whole
+valid gesture and run once only after the frame passes that terminal guard. A failed or timed-out
+correction leaves a same-gesture rejected marker so late synthetic `MOVESIZEEND`/`LOCATIONCHANGE`
+events cannot save or propagate the stale rectangle; new input or a genuine new move clears it.
+Cleanup preserves a settled maximize or minimize instead of forcing a normal frame. After a
+maximize it reveals marked followers before ordinary reconciliation; after a minimize it leaves
+their propagation to the native minimize events. A saved normal frame aligns followers, but any
+marked top is raw-revealed first, and a missing group placement falls back to raw reveal. Cleanup
+discovers every owned `MoveHidden` member, including windows omitted from the press list, and keeps
+a member's mark until its show succeeds.
 The floating tab refreshes from the actual window frame on its owning STA until the move settles,
 including one final refresh after the worker stops, so its chrome stays attached even if the pointer
 stops during a resize.

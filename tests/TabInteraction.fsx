@@ -76,6 +76,276 @@ let main() =
         check (offTop.y = work.top) "A caption drag put the window above the work area"
         let offBottom = MaximizedRestore.dragFrame (Pt(1400,20)) visible (Pt(-8,-8)) work (Pt(1000,work.bottom+100)) size
         check (offBottom.y = work.bottom-size.height) "A caption drag put the window below the work area"
+        // A successful restore can still leave the native move loop on the old maximized frame.
+        // Recovery is allowed only for that exact, owned press; a normally large window is not one.
+        let plan : MaximizedRestore.Plan =
+            { hwnd = IntPtr(42)
+              pid = 7
+              tid = 9
+              generation = 1L
+              grab = Pt(1400,20)
+              originalSize = Sz(2000,1000)
+              normalPlacement =
+                { flags = 0
+                  showCmd = ShowWindowCommands.SW_SHOWNORMAL
+                  ptMinPosition = Pt()
+                  ptMaxPosition = Pt()
+                  rcNormalPosition = Rect(Pt(100,100),size) }
+              normalSize = size
+              visible = visible
+              frameOffset = Pt(-8,-8)
+              workArea = work
+              workspaceOffset = Pt() }
+        let failedFrame = Sz(2000,1000)
+        check (MaximizedRestore.shouldRecover plan true true false false true failedFrame)
+              "A restored caption drag at the old maximized size was not recoverable"
+        check (not(MaximizedRestore.shouldRecover plan false true false false true failedFrame))
+              "Recovery started before WindowTabs' restore succeeded"
+        check (not(MaximizedRestore.shouldRecover plan true false false false true failedFrame))
+              "Recovery started after the mouse button was released"
+        check (not(MaximizedRestore.shouldRecover plan true true false true true failedFrame))
+              "A maximized window was treated as a stale move loop"
+        check (not(MaximizedRestore.shouldRecover plan true true true false true failedFrame))
+              "A minimized window was treated as a stale move loop"
+        check (not(MaximizedRestore.shouldRecover plan true true false false false failedFrame))
+              "Recovery started without a native move loop"
+        check (not(MaximizedRestore.shouldRecover plan true true false false true size))
+              "A successful normal-sized drag was treated as a stale move loop"
+        let oversizedNormal =
+            { plan with originalSize=size; normalSize=size }
+        check (not(MaximizedRestore.shouldRecover oversizedNormal true true false false true size))
+              "A normal window larger than its restore rectangle was treated as recoverable"
+        let recovery = Collections.Generic.List<string>()
+        let ordered =
+            MaximizedRestore.runRecovery
+                (fun () -> true)
+                (fun () -> recovery.Add "cancel"; true)
+                (fun () -> recovery.Add "idle"; true)
+                (fun () -> recovery.Add "restore"; true)
+                (fun () -> recovery.Add "post"; true)
+        check (ordered && (recovery |> Seq.toList = ["cancel";"idle";"restore";"post"]))
+              "Caption recovery did not cancel, wait for idle, restore, then post the new move"
+        let failed = Collections.Generic.List<string>()
+        let cancelled =
+            MaximizedRestore.runRecovery
+                (fun () -> true)
+                (fun () -> failed.Add "cancel"; false)
+                (fun () -> failed.Add "idle"; true)
+                (fun () -> failed.Add "restore"; true)
+                (fun () -> failed.Add "post"; true)
+        check (not cancelled && (failed |> Seq.toList = ["cancel"]))
+              "A failed move-loop cancellation still repositioned or restarted the window"
+        let stillMoving = Collections.Generic.List<string>()
+        let notStopped =
+            MaximizedRestore.runRecovery
+                (fun () -> true)
+                (fun () -> stillMoving.Add "cancel"; true)
+                (fun () -> stillMoving.Add "idle"; false)
+                (fun () -> stillMoving.Add "restore"; true)
+                (fun () -> stillMoving.Add "post"; true)
+        check (not notStopped && (stillMoving |> Seq.toList = ["cancel";"idle"]))
+              "Recovery repositioned before the old native move loop stopped"
+        let canceledBeforeIdle = Collections.Generic.List<string>()
+        let mutable currentCalls = 0
+        let currentChanged() =
+            currentCalls <- currentCalls + 1
+            currentCalls=1
+        let canceledMidway =
+            MaximizedRestore.runRecovery
+                currentChanged
+                (fun () -> canceledBeforeIdle.Add "cancel"; true)
+                (fun () -> canceledBeforeIdle.Add "idle"; true)
+                (fun () -> canceledBeforeIdle.Add "restore"; true)
+                (fun () -> canceledBeforeIdle.Add "post"; true)
+        check (not canceledMidway && (canceledBeforeIdle |> Seq.toList = ["cancel";"idle"]))
+              "A press invalidated after cancellation still repositioned its window"
+        let invalidatedDuringPlacement = Collections.Generic.List<string>()
+        let replacement = MaximizedRestore.Token(plan)
+        let canceledDuringPlacement =
+            MaximizedRestore.runRecovery
+                (fun () -> not replacement.isCancelled)
+                (fun () -> invalidatedDuringPlacement.Add "cancel"; true)
+                (fun () -> invalidatedDuringPlacement.Add "idle"; true)
+                (fun () ->
+                    invalidatedDuringPlacement.Add "restore"
+                    replacement.cancel()
+                    true)
+                (fun () -> invalidatedDuringPlacement.Add "post"; true)
+        check (not canceledDuringPlacement &&
+               (invalidatedDuringPlacement |> Seq.toList = ["cancel";"idle";"restore"]))
+              "A press invalidated during repositioning still posted a new move loop"
+        let token = MaximizedRestore.Token(plan)
+        token.cancel()
+        let afterRelease = Collections.Generic.List<string>()
+        let released =
+            MaximizedRestore.runRecovery
+                (fun () -> not token.isCancelled)
+                (fun () -> afterRelease.Add "cancel"; true)
+                (fun () -> afterRelease.Add "idle"; true)
+                (fun () -> afterRelease.Add "restore"; true)
+                (fun () -> afterRelease.Add "post"; true)
+        check (not released && afterRelease.Count=0)
+              "A released caption press let its old restore worker continue"
+        let recoveryState = CaptionRecovery.State(token,0L)
+        recoveryState.phase <- CaptionRecovery.Watching
+        check (CaptionRecovery.beginRecovery recoveryState) "A watching press did not begin its one recovery"
+        check (recoveryState.phase=CaptionRecovery.Cancelling) "Recovery did not enter its cancellation phase"
+        check (not(CaptionRecovery.beginRecovery recoveryState)) "A caption press began a second recovery"
+        // Release and invalidation are distinct: release permits one terminal stale-frame check,
+        // while a new press or ownership change forbids both native recovery and final repair.
+        let finalToken = MaximizedRestore.Token(plan)
+        let finalState = CaptionRecovery.State(finalToken,0L)
+        finalState.phase <- CaptionRecovery.Restarted
+        check (CaptionRecovery.beginFinalization finalState (Pt(900,400)) 2000L)
+              "A released stale gesture did not start terminal finalization"
+        check (not(finalToken.isActive) && finalToken.isReleased && finalToken.canFinalize)
+              "Release stopped native recovery but did not retain terminal repair"
+        check (finalState.phase=CaptionRecovery.Finalizing && finalState.releasePoint=Some(Pt(900,400)))
+              "Terminal finalization did not retain its release point"
+        check (not(CaptionRecovery.beginFinalization finalState (Pt(910,410)) 3000L))
+              "Repeated move-end or location handling started a second terminal worker"
+        let finalWindow : CaptionRecovery.FinalWindowState = {
+            CaptionRecovery.memberWindow = true
+            top = true
+            normal = true
+            minimized = false
+            maximized = false
+            moving = false
+            stale = true }
+        finalToken.completeInitialRestore(true)
+        check (not(CaptionRecovery.canCommitFinalization finalToken true finalWindow))
+              "Finalization saved a frame while its live geometry was still stale"
+        check (CaptionRecovery.canCommitFinalization finalToken true { finalWindow with stale = false })
+              "A repaired normal frame could not finish finalization"
+        check (not(CaptionRecovery.canCommitFinalization finalToken false { finalWindow with stale = false }))
+              "A terminal worker that timed out stable idle still saved the frame"
+        finalToken.beginRecoveryWorker()
+        check (not(CaptionRecovery.canCommitFinalization finalToken true { finalWindow with stale = false }))
+              "Finalization committed while its recovery worker was still in flight"
+        finalToken.finishRecoveryWorker()
+        let repairedActions = CaptionRecovery.endActions true true true true false false
+        check (repairedActions.saveFrame &&
+               repairedActions.alignFollowers &&
+               not repairedActions.restoreHiddenDirectly)
+              "A repaired frame submitted a duplicate hidden-follower placement"
+        let rejectedActions = CaptionRecovery.endActions false true true true false false
+        check (not rejectedActions.saveFrame &&
+               not rejectedActions.alignFollowers &&
+               rejectedActions.restoreHiddenDirectly)
+              "A rejected frame could reach save or ordinary follower alignment"
+        let noPlacementActions = CaptionRecovery.endActions true true false true false false
+        check (noPlacementActions.saveFrame &&
+               not noPlacementActions.alignFollowers &&
+               noPlacementActions.restoreHiddenDirectly)
+              "A saved drag without a group placement left its hidden followers off screen"
+        let maximizedActions = CaptionRecovery.endActions true true true true false true
+        check (maximizedActions.restoreHiddenDirectly && maximizedActions.alignFollowers &&
+               maximizedActions.saveFrame)
+              "A maximized commit did not reveal hidden followers before placement reconciliation"
+        let minimizedActions = CaptionRecovery.endActions true true true true true false
+        check (minimizedActions.restoreHiddenDirectly && not minimizedActions.alignFollowers &&
+               minimizedActions.saveFrame)
+              "A minimized commit did not preserve existing minimize-state ownership"
+        check (CaptionRecovery.shouldActivateAfterFinalization true true false true)
+              "A finalized group foreground did not keep its active tab"
+        check (not(CaptionRecovery.shouldActivateAfterFinalization false true false true))
+              "Finalization stole focus from another application"
+        check (not(CaptionRecovery.shouldActivateAfterFinalization true true false false))
+              "An invalidated gesture reactivated its old group"
+        let pendingToken = MaximizedRestore.Token(plan)
+        check (not(CaptionRecovery.canCommitFinalization pendingToken true { finalWindow with stale = false }))
+              "Finalization committed before the initial native restore reported success"
+        pendingToken.completeInitialRestore(true)
+        pendingToken.cancel()
+        check (not(pendingToken.canFinalize) &&
+               not(CaptionRecovery.canCommitFinalization pendingToken true { finalWindow with stale = false }))
+              "A new press did not invalidate terminal repair"
+        // The native loop may un-maximize correctly before our initial worker runs. That is not an
+        // owned terminal repair, but it is still a valid normal drag and must save/align normally.
+        let nativeNormalToken = MaximizedRestore.Token(plan)
+        nativeNormalToken.completeInitialRestore(false)
+        check (CaptionRecovery.canCommitFinalization nativeNormalToken true { finalWindow with stale = false })
+              "A correct native un-maximize was rejected because our initial restore did not run"
+        check (not(CaptionRecovery.canCommitFinalization nativeNormalToken true finalWindow))
+              "A failed initial restore enabled terminal repair of a stale frame"
+        let maximizedWindow = { finalWindow with normal = false; maximized = true; stale = false }
+        let minimizedWindow = { finalWindow with normal = false; minimized = true; stale = false }
+        check (CaptionRecovery.canCommitFinalization finalToken true maximizedWindow)
+              "A settled maximized drop was rejected"
+        check (CaptionRecovery.canCommitFinalization finalToken true minimizedWindow)
+              "A settled minimize was rejected"
+        check (not(CaptionRecovery.canCommitFinalization finalToken true
+                    { finalWindow with stale = false; moving = true }))
+              "A moving window was committed as settled"
+        check (not(CaptionRecovery.canCommitFinalization finalToken true
+                    { finalWindow with stale = false; memberWindow = false }))
+              "A removed member was committed"
+        check (not(CaptionRecovery.canCommitFinalization finalToken true
+                    { finalWindow with stale = false; top = false }))
+              "A changed top window was committed"
+        // The terminal repairability check is production state, not a test-only geometry guess.
+        let terminalState (size:Sz) : MaximizedRestore.TerminalState =
+            { MaximizedRestore.sameWindow = true
+              buttonDown = false
+              isMinimized = false
+              isMaximized = false
+              nativeMoving = Some false
+              actualSize = size }
+        let staleTerminal = terminalState failedFrame
+        check (MaximizedRestore.shouldRepairTerminal plan staleTerminal)
+              "A normal window left at the original maximized size was not repaired"
+        let validTerminal = terminalState size
+        check (not(MaximizedRestore.shouldRepairTerminal plan validTerminal))
+              "A valid normal-sized window was treated as stale"
+        check (not(MaximizedRestore.shouldRepairTerminal plan
+                    { staleTerminal with isMaximized = true }))
+              "A maximized window was repaired as a stale normal frame"
+        check (not(MaximizedRestore.shouldRepairTerminal plan
+                    { staleTerminal with isMinimized = true }))
+              "A minimized window was repaired as a stale normal frame"
+        check (not(MaximizedRestore.shouldRepairTerminal plan
+                    { staleTerminal with sameWindow = false }))
+              "A reused or changed window identity was repaired"
+        check (not(MaximizedRestore.shouldRepairTerminal plan
+                    { staleTerminal with buttonDown = true }))
+              "Terminal repair ran before the mouse button was released"
+        check (not(MaximizedRestore.shouldRepairTerminal plan
+                    { staleTerminal with nativeMoving = None }))
+              "A failed native move query was treated as an idle stale window"
+        check (CaptionRecovery.idleSample true None = None)
+              "A failed native move query produced an idle sample"
+        let idle (clock:int64 ref) samples =
+            let remaining = ref samples
+            let sample() =
+                match !remaining with
+                | value::rest -> remaining := rest; value
+                | [] -> None
+            let sleep() = clock.Value <- clock.Value + 10L
+            CaptionRecovery.awaitStableIdle 40L 50L (fun () -> clock.Value) sample sleep
+        check (not(idle (ref 0L)
+                    [Some true;Some true;Some false;Some false;Some false;Some false]))
+              "A transient idle sample was accepted as a stopped native loop"
+        check (idle (ref 0L) [Some true;Some true;Some true;Some true;Some true])
+              "Forty milliseconds of consecutive idle samples were not accepted"
+        check (not(idle (ref 0L) [None;Some true;Some true;Some true;Some true]))
+              "A failed native move query was accepted as stable idle"
+        let boundaryClock = ref 0L
+        let samples = ref [Some true;Some true;Some true;Some true]
+        let sample() =
+            match !samples with
+            | value::rest -> samples := rest; value
+            | [] -> None
+        let boundaryIdle =
+            CaptionRecovery.awaitStableIdle 40L 50L
+                (fun () -> boundaryClock.Value) sample
+                (fun () -> boundaryClock.Value <- boundaryClock.Value + 10L)
+        check (not boundaryIdle) "Thirty milliseconds of idle was accepted as forty"
+        check (CaptionRecovery.isGenuineMoveStart true true)
+              "A native MOVESIZESTART while the target was moving did not clear rejection"
+        check (not(CaptionRecovery.isGenuineMoveStart true false))
+              "A delayed MOVESIZESTART while the target was idle cleared rejection"
+        check (not(CaptionRecovery.isGenuineMoveStart false true))
+              "The LOCATION fallback was mistaken for a native MOVESIZESTART"
         // A follower restored from maximized behind a dragged window is placed by the source's frame
         // while it is maximized, not by the borders maximizing pushed off the monitor, and by its own
         // borders once it is restored.
