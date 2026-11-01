@@ -28,7 +28,7 @@ namespace Bemo
         public static bool GetMinMaxAnimation()
         {   ANIMATIONINFO info = new ANIMATIONINFO();
             info.cbSize = (uint) Marshal.SizeOf(typeof(ANIMATIONINFO));
-            WinUserApi.SystemParametersInfo(SystemParametersInfoParameters.SPI_GETANIMATION, 0, ref info, 0);
+            WinUserApi.SystemParametersInfo(SystemParametersInfoParameters.SPI_GETANIMATION, info.cbSize, ref info, 0);
             return info.iMinAnimate != 0;
         }
         public static void SetMinMaxAnimation(bool enabled)

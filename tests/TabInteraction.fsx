@@ -554,6 +554,17 @@ let main() =
                     check (shown()) "A cut-short title did not show in full after a rest"
                     hover 460
                     check (shown()) "Moving between cut-short titles did not show the next one at once"
+                    // A restore hides the strip while Windows animates the window frame; its title
+                    // tip must go with it instead of floating over the transition.
+                    let beginRestore = typeof<TabStrip>.GetMethod("hideForRestore",flags)
+                    beginRestore.Invoke(strip,[||]) |> ignore
+                    check (not (shown())) "A restore left its title tip floating over the window animation"
+                    let restoreTimer = typeof<TabStrip>.GetField("restoreTimer",flags).GetValue(strip) :?> Timer
+                    let restoreSettle = Diagnostics.Stopwatch.StartNew()
+                    while restoreTimer.Enabled && restoreSettle.ElapsedMilliseconds<1000L do
+                        Application.DoEvents()
+                        Threading.Thread.Sleep(2)
+                    check (not restoreTimer.Enabled) "A restore's fade never finished"
                     hover 260
                     rest()
                     check (not (shown())) "A title that fits showed a tip"

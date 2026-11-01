@@ -105,6 +105,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let mutable revealTarget = 1.0
     let revealClock = Diagnostics.Stopwatch()
     let revealTimer = new Timer(Interval=15)
+    /// A strip kept off the screen for a moment after its window restores from maximized, then
+    /// faded in: Windows moves the window at once but animates its frame, and the tabs would
+    /// stand ahead of it.
+    let mutable restoreAlpha = 1.0
+    let restoreHold = 200.0
+    let restoreFade = 100.0
+    let restoreClock = Diagnostics.Stopwatch()
+    let restoreTimer = new Timer(Interval=15)
     /// Tabs a drop preview pushed aside, sliding into their new slot: how far from the slot each was
     /// drawn when it was pushed (along the row, and across it for a tab rising into the row), and
     /// when, on nudgeClock. Presentation state, like reveal: it never fires the cell listener, only
@@ -182,6 +190,13 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         showInsideExport.init()
 
         revealTimer.Tick.Add(fun _ -> this.stepReveal())
+        restoreTimer.Tick.Add(fun _ ->
+            let elapsed = restoreClock.Elapsed.TotalMilliseconds - restoreHold
+            let next = if elapsed >= restoreFade then 1.0 elif elapsed <= 0.0 then 0.0 else TabReveal.ease(elapsed/restoreFade)
+            if next >= 1.0 then restoreTimer.Stop()
+            if next <> restoreAlpha then
+                restoreAlpha <- next
+                if this.visible then this.paint())
         nudgeTimer.Tick.Add(fun _ -> this.stepNudge())
         shadowTimer.Tick.Add(fun _ ->
             shadowTimer.Stop()
@@ -476,6 +491,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             shadowWindow |> Option.iter (fun shadow -> shadow.hide())
             this.window.hide()
 
+    /// Hides the strip while Windows animates a restore from maximized, then fades it in once the frame has arrived.
+    member this.hideForRestore() =
+        // The tip follows the window frame too, and would otherwise hang above it as the strip fades.
+        this.hideTitle()
+        if renderedFrames>0L && this.visible && Win32Helper.GetMinMaxAnimation() then
+            restoreAlpha <- 0.0
+            restoreClock.Restart()
+            restoreTimer.Start()
+            this.paint()
+
     member private this.stepReveal() =
         let span = TabReveal.duration*abs(revealTarget-revealFrom)
         let t = if span<=0.0 then 1.0 else min 1.0 (revealClock.Elapsed.TotalMilliseconds/span)
@@ -515,14 +540,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             renderedOffset <- offset
             renderedFrames <- renderedFrames+1L
             StartupTrace.measure "strip.paint.upload" (fun () ->
-                this.window.update(image, this.location.add(this.renderedShift), 255uy))
+                this.window.update(image, this.location.add(this.renderedShift), byte(Math.Round(255.0 * restoreAlpha))))
             // A burst of paints - a join, a slide, a resize - would rebuild the mask on every frame.
             let recent = paintClock.Elapsed.TotalMilliseconds - lastPaintAt < 40.0
-            let animating = nudges.Count > 0 || fades.Count > 0 || leaving.IsSome
+            let animating = nudges.Count > 0 || fades.Count > 0 || leaving.IsSome || restoreAlpha < 1.0
             let skip = (not shadowRefreshing) && (animating || shadowPending)
             StartupTrace.measure "strip.paint.shadow" (fun () ->
               shadowWindow |> Option.iter (fun shadow ->
-                if reveal<1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
+                if reveal<1.0 || restoreAlpha < 1.0 || this.isEmpty || (this.isVertical && SystemInformation.HighContrast) then shadow.hide()
                 elif skip then shadow.showForDirection(image, this.direction)
                 else shadow.update(image, 255uy, this.direction)))
             // Only a paint that came hot on the heels of another arms the deferred rebuild: a lone paint
@@ -1285,6 +1310,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         dragScrollTimer.Dispose()
         destroyingEvent.Trigger()
         revealTimer.Dispose()
+        restoreTimer.Dispose()
         shadowTimer.Dispose()
         captureWatch.Dispose()
         titleTimer.Dispose()

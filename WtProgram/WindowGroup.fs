@@ -1221,6 +1221,9 @@ type WindowGroup(enableSuperBar:bool, plugins:List2<IPlugin>, initialAppearance:
                     this.onEnterMoveSize()
                 else
                     let isForeground = this.os.foreground.hwnd = hwnd
+                    // Windows animates a restore from maximized but moves the window to its final
+                    // rectangle at once; the strip stays hidden until the frame has arrived.
+                    if isMaximizedExport.value && not window.isMaximized then this.ts.hideForRestore()
                     this.saveTopWindowPlacement()
                     this.adjustChildWindows()
                     if isForeground then
