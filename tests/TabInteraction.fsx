@@ -58,6 +58,26 @@ let main() =
               "A caption press that travelled past the drag box vertically was not taken as a drag"
         check (not(CaptionPress.isDrag pt (Pt(100+dragX,200+dragY))))
               "A caption press inside the drag box was taken as a drag"
+        // A tab press waits for the same box: a hand that shakes a pixel or two while clicking a tab
+        // must not take the tab off its strip.
+        check (not(TabDragDetection.detected (Pt(100,200)) (Pt(100+dragX,200+dragY))))
+              "A tab press inside the drag box was taken as a drag"
+        check (not(TabDragDetection.detected (Pt(100,200)) (Pt(100-dragX,200-dragY))))
+              "A tab press at the opposite inside corner was taken as a drag"
+        check (not(TabDragDetection.detected (Pt(100,200)) (Pt(100+dragX,200))))
+              "A tab press on the horizontal drag box boundary was taken as a drag"
+        check (not(TabDragDetection.detected (Pt(100,200)) (Pt(100,200+dragY))))
+              "A tab press on the vertical drag box boundary was taken as a drag"
+        check (not(TabDragDetection.detected (Pt(100,200)) (Pt(100+dragX-1,200))))
+              "A tab press short of the drag box was taken as a drag"
+        check (TabDragDetection.detected (Pt(100,200)) (Pt(100+dragX+1,200)))
+              "A tab press past the drag box was not taken as a drag"
+        check (TabDragDetection.detected (Pt(100,200)) (Pt(100,200+dragY+1)))
+              "A vertical tab press past the drag box was not taken as a drag"
+        check (TabDragDetection.detected (Pt(100,200)) (Pt(100-dragX-1,200)))
+              "A negative horizontal tab press past the drag box was not taken as a drag"
+        check (TabDragDetection.detected (Pt(100,200)) (Pt(100,200-dragY-1)))
+              "A negative vertical tab press past the drag box was not taken as a drag"
         // A follower restored from maximized behind a dragged window is placed by the source's frame
         // while it is maximized, not by the borders maximizing pushed off the monitor, and by its own
         // borders once it is restored.

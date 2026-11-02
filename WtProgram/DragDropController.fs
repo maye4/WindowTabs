@@ -48,14 +48,23 @@ type DragDetectingStateInfo = {
     }
 
 type DragDetectingState(info:DragDetectingStateInfo) =
-    /// Pointer travel that turns a press into a drag. Kept small so a drag begins as soon as the
-    /// pointer does, but above the pixel or two a hand moves while pressing.
-    let dragStartDistance = 3.0
     interface IDragState with
         member this.mouseMove(ptScreen) =
-            if ptScreen.distance(info.initialPt) > dragStartDistance then
+            // Use the caption press rectangle so diagonal click jitter stays a click.
+            let box = SystemInformation.DragSize
+            if 2 * abs(ptScreen.x-info.initialPt.x) > box.Width ||
+               2 * abs(ptScreen.y-info.initialPt.y) > box.Height then
                 info.onBegin()
         member this.dispose() = ()
+
+/// The travel a tab press may make and still be a click, for the suites: the same state a tab press
+/// enters, answered with the only thing it can do, which is start the drag.
+module TabDragDetection =
+    let detected (start:Pt) (pt:Pt) =
+        let mutable began = false
+        let state = DragDetectingState({ initialPt = start; onBegin = fun() -> began <- true }) :> IDragState
+        state.mouseMove pt
+        began
 
 /// The tab a drag carries, in its own layered window over the one it moves. The strip draws the
 /// picture, and the tab is placed where a strip holding the window's current frame puts it, so it sits

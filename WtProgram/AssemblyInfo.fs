@@ -13,7 +13,7 @@ open System.Runtime.InteropServices
 do ()
 
 // Keep diagnostics and settings migration version comparisons non-empty.
-let private fallbackVersion = "2026.10.30"
+let private fallbackVersion = "2026.11.01"
 
 let informationalVersion =
     try
