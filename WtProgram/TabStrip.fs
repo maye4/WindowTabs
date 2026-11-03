@@ -150,12 +150,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     let titleTimer = new Timer(Interval=500)
     let mutable titleTab : Tab option = None
     let mutable titleTip : TabTitleTip option = None
-    /// The full strip and the collapsed bar while an expand or collapse runs, so a frame only
+    /// The full strip and the collapsed bar while a collapse runs, so a frame only
     /// blends them; dropped whenever what they show changes.
     let mutable revealImages : (Img*Img) option = None
     let dropRevealImages() =
         revealImages |> Option.iter(fun (full,collapsed) -> full.bitmap.Dispose(); collapsed.bitmap.Dispose())
         revealImages <- None
+    /// Recent pointer positions with timestamps, for velocity calculation. Newest first.
+    let mutable pointerHistory : (Pt * int64) list = []
+    let pointerHistoryClock = Diagnostics.Stopwatch.StartNew()
+    let revealRecheck = new Timer(Interval=60)
     let destroyingEvent = Event<unit>()
     let makeFont = TabMetrics.font
     let mutable fontKey = Dpi.value(),0
@@ -190,6 +194,9 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         showInsideExport.init()
 
         revealTimer.Tick.Add(fun _ -> this.stepReveal())
+        revealRecheck.Tick.Add(fun _ ->
+            revealRecheck.Stop()
+            this.refreshHover())
         restoreTimer.Tick.Add(fun _ ->
             let elapsed = restoreClock.Elapsed.TotalMilliseconds - restoreHold
             let next = if elapsed >= restoreFade then 1.0 elif elapsed <= 0.0 then 0.0 else TabReveal.ease(elapsed/restoreFade)
@@ -308,10 +315,32 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         this.withUpdate(fun () ->
             match mouse with
             | MouseMove(pt) ->
+                let screenPt = this.window.ptToScreen(pt)
+                let now = pointerHistoryClock.ElapsedMilliseconds
+                pointerHistory <- (screenPt,now)::pointerHistory |> List.truncate 4
                 this.setPt(Some(pt))
                 if this.window.hasCapture.not && defaultArg trackLeave true then
                     this.window.trackMouseLeave()
                 let hit = this.hit
+                // Only reveal a collapsed strip when the pointer is moving slowly or has stopped: a fast
+                // pass toward another target should not open it. 300 px/sec scaled to this monitor's DPI.
+                let slowEnoughToReveal =
+                    match pointerHistory with
+                    | (pt1,t1)::(pt2,t2)::_ when this.isShrunk && hit.IsSome ->
+                        let dx,dy = float(pt1.x-pt2.x),float(pt1.y-pt2.y)
+                        let dist = sqrt(dx*dx+dy*dy)
+                        let dt = t1-t2
+                        // Two moves within the same millisecond are as fast as it gets, unless the pointer did not move.
+                        let pxPerSec = if dt>0L then dist*1000.0/float dt elif dist>0.0 then infinity else 0.0
+                        pxPerSec <= float(Dpi.scale 300)
+                    // The first move after arriving has nothing to measure against: wait for the next.
+                    | [_] when this.isShrunk && hit.IsSome -> false
+                    | _ -> true
+                // A pointer that stops after a fast arrival sends no further moves; look again shortly.
+                if not slowEnoughToReveal then
+                    revealRecheck.Stop()
+                    revealRecheck.Start()
+                let hit = if slowEnoughToReveal then hit else None
                 hoverCell.set(hit)
                 this.pointTitle(hit |> Option.map fst)
                 let enableHoverActivate = Services.settings.getValue("enableHoverActivate").cast<bool>()
@@ -338,6 +367,8 @@ type TabStrip(monitor:ITabStripMonitor) as this =
                     this.onMouse(action, pt, btn, (hitTab, hitPart))
                 hoverCell.set(this.hit)
             | MouseLeave ->
+                // A later arrival must not be measured against where the pointer was on this visit.
+                pointerHistory <- []
                 titleTab <- None
                 this.hideTitle()
                 this.setPt(None)
@@ -475,8 +506,10 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         if this.visible then
             if target<>revealTarget then
                 revealTarget <- target
-                // The first frame and an empty strip have nothing to move from.
-                if renderedFrames>0L && not this.isEmpty && TabReveal.enabled() then
+                // Opening is immediate: the pointer often overshoots the bar, and a strip that answers
+                // the moment it arrives is what lets the user stop on it. Collapsing still fades. The
+                // first frame and an empty strip have nothing to move from.
+                if target<1.0 && renderedFrames>0L && not this.isEmpty && TabReveal.enabled() then
                     revealFrom <- reveal
                     revealClock.Restart()
                     revealTimer.Start()
@@ -519,12 +552,16 @@ type TabStrip(monitor:ITabStripMonitor) as this =
             StartupTrace.measure "strip.paint.render" (fun () ->
             if reveal>=1.0 then this.renderAt false,0
             elif reveal<=0.0 then
-                let offset =
-                    if this.isVertical then
-                        let anchoredRight = (this.dock=TabDockLeft) <> this.showInside
-                        if anchoredRight then max 0 (this.size.width-Dpi.scale 4) else 0
-                    else this.ts.collapsedOffset
-                this.renderAt true,offset
+                if this.isVertical then
+                    let anchoredRight = (this.dock=TabDockLeft) <> this.showInside
+                    this.renderAt true,(if anchoredRight then max 0 (this.size.width-Dpi.scale 4) else 0)
+                else
+                    let reach = this.ts.collapsedReach
+                    let bar = this.renderAt true
+                    if reach=0 then bar,this.ts.collapsedOffset
+                    else
+                        try TabReveal.padAbove bar reach this.appearance.tabNormalBgColor,this.ts.collapsedOffset-reach
+                        finally bar.bitmap.Dispose()
             else
                 let full,collapsed =
                     match revealImages with
@@ -776,6 +813,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
 
     /// Where the pointer is on screen; native hosts supply one instead of moving the real cursor.
     member internal _.pointer with get() = pointerSource and set(value) = pointerSource <- value
+
+    /// The pointer is where the pad above the collapsed bar would be: collapsing now would put the
+    /// pad under it and open the strip again at once.
+    member this.pointerInCollapsedReach =
+        let reach = this.ts.collapsedReach
+        not this.isVertical && reach>0 &&
+            (let cursor = pointerSource()
+             Rect(Pt(location.x,location.y-reach),Sz(this.size.width,reach)).containsPoint(Pt(cursor.X,cursor.Y)))
 
     member private this.pointerBounds : Rect =
         if this.isVertical && revealTarget>0.0 then
@@ -1310,6 +1355,7 @@ type TabStrip(monitor:ITabStripMonitor) as this =
         dragScrollTimer.Dispose()
         destroyingEvent.Trigger()
         revealTimer.Dispose()
+        revealRecheck.Dispose()
         restoreTimer.Dispose()
         shadowTimer.Dispose()
         captureWatch.Dispose()
@@ -1330,6 +1376,14 @@ type TabStrip(monitor:ITabStripMonitor) as this =
     member private this.hitAt(pt:Pt) =
         if this.isVertical && this.isShrunk && Rect(Pt(),this.size).containsPoint(pt) then
             zorderCell.value.tryHead.map(fun tab -> tab,TabBackground)
+        elif this.isShrunk then
+            // The pad above a collapsed bar translates to rows above the tab sprites. Map it to their
+            // first interior row so the padding keeps the tab under the pointer.
+            let reach = this.ts.collapsedReach
+            let point =
+                if not this.isVertical && reach>0 && pt.y >= -reach && pt.y <= 0 then Pt(pt.x,1)
+                else pt
+            this.ts.tryHit(point)
         else this.ts.tryHit(pt)
 
     member this.tryHit(pt:Pt) : Option<_> =

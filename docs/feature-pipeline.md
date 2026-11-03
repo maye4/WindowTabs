@@ -31,3 +31,29 @@ everything below it. The strip is held at the top of the z-order until 350 ms af
 (at most 1.5 s from the first request), directly under the tab the drag
 carries so the tab in the hand stays above it, and then put back immediately above the group's top
 window. A tab leaving a maximized group is the same, with the shrink animation.
+
+## drop-down menu of windowTabs
+```
+            [monitor1]
+    [resizing sensitive area]
+ ---------------------------
+    [drowp-down sensitive area]
+    [drop-down menu of windowTabs of monitor2]
+            [monitor2]
+```
+
+[drowp-down sensitive area] is too small, and the drop-down menu often close too fast, I oftern go pass it to [resizing sensitive area], missing the drop-down menu.
+
+```
+ ---------------------------
+    [drowp-down trigger strip]
+            |
+            v
+```
+
+```
+            ^
+            |
+ ---------------------------
+    [drowp-down trigger strip]
+```

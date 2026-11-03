@@ -5,6 +5,18 @@ open System.Windows.Forms
 open System.Diagnostics
 open Bemo.Win32.Forms
 
+/// How long an auto-hidden strip waits before collapsing.
+module AutoHideDelay =
+    /// The pointer leaving is often an overshoot: on a screen stacked under another the top edge does
+    /// not stop it, so the strip waits long enough for it to come back.
+    let pointerLeftMs = 200
+    let otherMs = 100
+    /// Milliseconds still to wait, given how long ago the pointer left the strip, if it has.
+    let remaining (sincePointerLeftMs:int64 option) =
+        match sincePointerLeftMs with
+        | Some elapsed -> max otherMs (pointerLeftMs - int (min elapsed (int64 pointerLeftMs)))
+        | None -> otherMs
+
 type TabStripDecorator(group:WindowGroup) as this =
     let os = OS()
     let Cell = CellScope(false, true)
@@ -579,11 +591,18 @@ type TabStripDecorator(group:WindowGroup) as this =
                 if switched then
                     cbRef := Some(ThreadHelper.cancelablePostBack 1000 <| fun() -> cell.value <- false)
             cell
+        /// Runs from the moment the pointer leaves the strip until it comes back.
+        let pointerLeftClock = Stopwatch()
+        let mutable wasMouseOver = false
         Cell.listen <| fun() ->
+            let mouseOver = isMouseOver.value
+            if mouseOver then pointerLeftClock.Reset()
+            elif wasMouseOver then pointerLeftClock.Restart()
+            wasMouseOver <- mouseOver
             let shrink =
                 (autoHideCell.value = "Always" ||
                  ((isMaximized.value || isShownInside.value) && autoHideCell.value = "Maximized")) &&
-                isMouseOver.value.not &&
+                mouseOver.not &&
                 isDraggingCell.value.not &&
                 contextMenuVisibleCell.value.not &&
                 numberBadgesCell.value.not &&
@@ -592,9 +611,13 @@ type TabStripDecorator(group:WindowGroup) as this =
             callbackRef.Value.iter <| fun(d:IDisposable) -> d.Dispose()
             callbackRef := None
             if shrink then
-                callbackRef := Some(ThreadHelper.cancelablePostBack 100 <| fun() ->
-                    if not disposed then this.ts.isShrunk <- true
-                )
+                let sinceLeft = if pointerLeftClock.IsRunning then Some pointerLeftClock.ElapsedMilliseconds else None
+                let rec collapse () =
+                    if not disposed then
+                        if this.ts.pointerInCollapsedReach then
+                            callbackRef := Some(ThreadHelper.cancelablePostBack 50 collapse)
+                        else this.ts.isShrunk <- true
+                callbackRef := Some(ThreadHelper.cancelablePostBack (AutoHideDelay.remaining sinceLeft) collapse)
             else
                 this.ts.isShrunk <- false
 

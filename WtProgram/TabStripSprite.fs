@@ -26,10 +26,11 @@ module TabDimming =
             output
         with _ -> output.Dispose(); reraise()
 
-/// Auto-hidden tabs expand from their collapsed bar and collapse back to it over a few frames.
+/// Auto-hidden tabs open from their collapsed bar at once and fade back to it over a few frames.
 module TabReveal =
-    /// A whole expand or collapse; one reversed part way takes its share of this.
-    let duration = 150.0
+    /// A whole collapse; one reversed part way takes its share of this. Long enough to read as a fade
+    /// rather than a cut after auto-hide's wait.
+    let duration = 250.0
     /// Native hosts that count frames turn it off; None follows Windows' animation effects.
     let mutable forced : bool option = None
     let enabled() =
@@ -41,6 +42,17 @@ module TabReveal =
             animate
     /// Fast at first, settling at the end, the way Windows moves its own panes.
     let ease (t:float) = 1.0-(1.0-t)*(1.0-t)*(1.0-t)
+    /// The collapsed bar with an invisible pad of `reach` pixels above it. Alpha 1 is invisible, but a
+    /// layered window only lets fully transparent pixels through to the window below.
+    let padAbove (bar:Img) reach (color:Color) =
+        let image = Img(Sz(bar.width,bar.height+reach))
+        try
+            use g = Graphics.FromImage(image.bitmap)
+            use pad = new SolidBrush(Color.FromArgb(1,color))
+            g.FillRectangle(pad,Rectangle(0,0,bar.width,reach))
+            g.DrawImageUnscaled(bar.bitmap,0,reach)
+            image
+        with _ -> image.bitmap.Dispose(); reraise()
     /// A frame part way from the collapsed bar (0) to the full strip (1): the strip uncovered from
     /// the window edge outwards, fading in over the bar, solid by half way. Rows keep their place
     /// in the full strip, so the offset maps the pointer as it does for the collapsed bar.
@@ -1154,7 +1166,18 @@ type TabStripSprite<'id> when 'id : equality = {
 
     member this.render = this.renderWith (fun _ -> Pt.empty) (fun _ -> 1.0f)
 
-    member this.collapsedHeight = max 1 (min this.size.height (Dpi.scale 4))
+    /// The bar that shows while the tabs are hidden.
+    member this.collapsedBarHeight = max 1 (min this.size.height (Dpi.scale 4))
+
+    /// The bar and, over a window's title bar, an invisible pad below it: the screen's top edge stops
+    /// the pointer there only when no screen is stacked above, so the bar alone is easy to cross.
+    member this.collapsedHeight =
+        if this.direction=TabDown then max this.collapsedBarHeight (min this.size.height (Dpi.scale 10))
+        else this.collapsedBarHeight
+
+    /// How far above the window edge the collapsed bar still catches the pointer: crossing into a
+    /// screen stacked above is the usual overshoot, and little else happens at its bottom edge.
+    member this.collapsedReach = if this.direction=TabDown then Dpi.scale 20 else 0
 
     member this.collapsedOffset =
         if this.direction=TabUp then this.size.height-this.collapsedHeight else 0
@@ -1184,10 +1207,14 @@ type TabStripSprite<'id> when 'id : equality = {
         let image = Img(Sz(this.size.width,this.collapsedHeight))
         use graphics = image.graphics
         let gapInset = max 1 (Dpi.scale 2)
-        let height = float32 this.collapsedHeight
+        let height = float32 this.collapsedBarHeight
         // Whole pixels stay sharp with antialiasing on: pixel centres sit at half coordinates.
         graphics.SmoothingMode <- Drawing2D.SmoothingMode.AntiAlias
         graphics.PixelOffsetMode <- Drawing2D.PixelOffsetMode.Half
+        // Alpha 1 is invisible, but a layered window only lets fully transparent pixels through.
+        if this.collapsedHeight>this.collapsedBarHeight then
+            use pad = new SolidBrush(Color.FromArgb(1,this.appearance.tabNormalBgColor))
+            graphics.FillRectangle(pad,Rectangle(0,this.collapsedBarHeight,image.size.width,this.collapsedHeight-this.collapsedBarHeight))
         /// A segment of the bar, with round ends where it ends the whole bar.
         let fillSegment (brush:Brush) (x:int) (width:int) roundLeft roundRight =
             let left,right = float32 x,float32(x+width)
@@ -1212,8 +1239,8 @@ type TabStripSprite<'id> when 'id : equality = {
                 match tab.stripeColor with
                 | Some stripeColor ->
                     let state = graphics.Save()
-                    let thickness = min this.collapsedHeight (Dpi.scale 3)
-                    let y = if this.direction=TabUp then this.collapsedHeight-thickness else 0
+                    let thickness = min this.collapsedBarHeight (Dpi.scale 3)
+                    let y = if this.direction=TabUp then this.collapsedBarHeight-thickness else 0
                     graphics.SetClip(Rectangle(location.x+leftInset,y,width,thickness))
                     use stripe = new SolidBrush(stripeColor)
                     fillSegment stripe (location.x+leftInset) width first last

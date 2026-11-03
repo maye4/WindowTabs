@@ -635,6 +635,42 @@ let main() =
                 strip.setPlacement(placement downMoved larger true)
                 check (frames strip=afterRefresh && shadow.location=downMoved.sub(Pt(Dpi.scale 15,0)))
                       "Moving after a deferred direction change used the old shadow offset"
+                strip.isShrunk <- true
+                check (strip.bounds.size.height=Dpi.scale 10+Dpi.scale 20 && strip.bounds.location=downMoved.sub(Pt(0,Dpi.scale 20)))
+                      "Collapsed tabs over a title bar kept only the thin bar as their hover target"
+                let reach = Dpi.scale 20
+                let first = strip.lorder.at 0
+                let second = strip.lorder.at 1
+                let hitTab point = strip.tryHit point |> Option.map fst
+                check ((strip.tryHit(Pt(Dpi.scale 60,1))).IsSome) "The pad above collapsed tabs did not open them"
+                check (hitTab(Pt(Dpi.scale 60,0))=Some first && hitTab(Pt(Dpi.scale 60,reach-1))=Some first)
+                      "The top or bottom of the pad above collapsed tabs did not open their tab"
+                check (hitTab(Pt(Dpi.scale 250,0))=Some second)
+                      "The pad above collapsed tabs did not preserve the tab under the pointer"
+                check ((strip.tryHit(Pt(Dpi.scale 60,reach+2))).IsSome)
+                      "The visible collapsed bar did not open its tab"
+                check (hitTab(Pt(Dpi.scale 60,-1)).IsNone && hitTab(Pt(larger.width,0)).IsNone && hitTab(Pt(-1,0)).IsNone)
+                      "The pad above collapsed tabs opened outside its reach or beyond its tabs"
+                let pointerAt (point:Point) = pointerProperty.SetValue(strip,box(fun () -> point))
+                pointerAt (Point(downMoved.x+Dpi.scale 60,downMoved.y-Dpi.scale 6))
+                check strip.pointerInCollapsedReach "A pointer over the pad above did not hold collapsed tabs open"
+                pointerAt (Point(downMoved.x+Dpi.scale 60,downMoved.y-Dpi.scale 30))
+                check (not strip.pointerInCollapsedReach) "A pointer well above the strip still held its tabs open"
+                pointerProperty.SetValue(strip,box(fun () -> Cursor.Position))
+                // Strip coordinates of the collapsed window: the pad above puts the bar `reach` pixels down.
+                send WindowMessages.WM_MOUSEMOVE (Pt(Dpi.scale 60,reach+2))
+                send WindowMessages.WM_MOUSEMOVE (Pt(Dpi.scale 260,reach+2))
+                check (not strip.isMouseOver.value) "A fast pass over collapsed tabs opened them"
+                let rest = Point(downMoved.x+Dpi.scale 260,downMoved.y+2)
+                pointerProperty.SetValue(strip,box(fun () -> rest))
+                let opened = Diagnostics.Stopwatch.StartNew()
+                while not strip.isMouseOver.value && opened.ElapsedMilliseconds<1000L do
+                    Application.DoEvents()
+                    Threading.Thread.Sleep(5)
+                check strip.isMouseOver.value "Collapsed tabs did not open once a fast pointer stopped on them"
+                send WindowMessages.WM_MOUSELEAVE Pt.empty
+                pointerProperty.SetValue(strip,box(fun () -> Cursor.Position))
+                strip.isShrunk <- false
                 strip.setPlacement(placement moved larger false)
                 strip.isShrunk <- true
                 let count = frames strip
@@ -642,8 +678,8 @@ let main() =
                 strip.setPlacement(placement next larger false)
                 check (frames strip=count && strip.bounds.location.y=next.y+larger.height-Dpi.scale 4) "Collapsed strip lost its movement offset"
                 check (not shadow.isVisible) "Collapsed strip showed a shadow"
-                // Expanding and collapsing run over a few frames that only move outwards or inwards,
-                // and turning back part way starts from where the strip is, not from either end.
+                // Opening is immediate; collapsing runs over a few frames that only move inwards, and
+                // opening part way through a collapse goes straight back to the full strip.
                 TabReveal.forced <- Some true
                 let watch (until:unit -> bool) =
                     let heights = ResizeArray([strip.bounds.size.height])
@@ -656,20 +692,15 @@ let main() =
                 let collapsedHeight = strip.bounds.size.height
                 let beforeExpand = frames strip
                 strip.isShrunk <- false
-                let growing = watch (fun () -> strip.bounds.size.height=larger.height && shadow.isVisible)
-                check (strip.bounds.size.height=larger.height && shadow.isVisible) "Expanded tabs did not end at full height with their shadow"
-                check (frames strip-beforeExpand>=3L && growing |> List.exists(fun h -> h>collapsedHeight && h<larger.height))
-                      "Expanding auto-hidden tabs jumped instead of animating"
-                check (growing |> List.pairwise |> List.forall(fun (a,b) -> b>=a)) "Expanding tabs shrank on the way"
-                check (strip.bounds.location.y=next.y) "Expanded tabs are not back at the strip's own position"
+                check (strip.bounds.size.height=larger.height && strip.bounds.location.y=next.y && frames strip=beforeExpand+1L)
+                      "Auto-hidden tabs did not open at once"
                 strip.isShrunk <- true
                 let shrinking = watch (fun () -> strip.bounds.size.height<larger.height)
                 let partWay = List.last shrinking
                 check (partWay>collapsedHeight && strip.bounds.location.y=next.y+larger.height-partWay)
                       "Collapsing jumped to the bar, or moved away from the window edge"
                 strip.isShrunk <- false
-                let back = watch (fun () -> strip.bounds.size.height=larger.height)
-                check (List.min back>=partWay && strip.bounds.size.height=larger.height) "Turning back part way restarted from the bar"
+                check (strip.bounds.size.height=larger.height) "Opening part way through a collapse did not go straight back"
                 strip.isShrunk <- true
                 watch (fun () -> strip.bounds.size.height=collapsedHeight) |> ignore
                 check (strip.bounds.size.height=collapsedHeight && not shadow.isVisible) "Collapsing did not end at the bar without a shadow"
@@ -822,9 +853,7 @@ let main() =
                         pointerProperty.SetValue(strip,box(fun () -> revealPoint))
                         send WindowMessages.WM_MOUSELEAVE Pt.empty
                         check strip.isMouseOver.value "Moving into the revealing column cleared hover before it reached the pointer"
-                        let expanding = watchWidth (fun () -> strip.bounds.width=columnSize.width && (SystemInformation.HighContrast || shadow.isVisible))
-                        check (strip.bounds.width=columnSize.width && frames strip-beforeSideExpand>=3L) "Side expansion jumped or failed to finish"
-                        check (expanding |> List.pairwise |> List.forall(fun (a,b) -> b>=a)) "Side expansion ran backwards"
+                        check (strip.bounds.width=columnSize.width && frames strip>beforeSideExpand) "Side column did not open at once"
                         strip.isShrunk <- true
                         watchWidth (fun () -> strip.bounds.width<columnSize.width) |> ignore
                         let partialWidth = strip.bounds.width

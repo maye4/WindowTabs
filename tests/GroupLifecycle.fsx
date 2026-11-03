@@ -720,6 +720,9 @@ let main() =
             api.setValue("autoHideMode",box "Always")
             onGroup source (fun group -> group.foreground <- IntPtr.Zero)
             pumpUntil "Automatic hiding did not collapse the group" (fun () -> onGroup source (fun group -> group.ts.isShrunk))
+            check (AutoHideDelay.remaining (Some 0L) = 200 && AutoHideDelay.remaining (Some 150L) = 100 &&
+                   AutoHideDelay.remaining (Some 5000L) = 100 && AutoHideDelay.remaining None = 100)
+                  "Auto-hidden tabs did not wait for an overshooting pointer to come back"
             onGroup source (fun group -> group.foreground <- a)
             check (onGroup source (fun group -> group.ts.isShrunk)) "Entering the group opened auto-hidden tabs"
             onGroup source (fun group -> group.foreground <- b)

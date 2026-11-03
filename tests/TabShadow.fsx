@@ -405,12 +405,13 @@ let main () =
             for direction in [TabUp;TabDown] do
                 let strip = { ts with appearance=appearance.scaled; size=Dpi.scaleSize(Sz(420,28)); direction=direction }
                 use bar = strip.renderCollapsed.bitmap
-                check (bar.Height=Dpi.scale 4 && bar.Width=strip.size.width) "Minimal bar does not scale with DPI"
+                check (bar.Height=strip.collapsedHeight && strip.collapsedBarHeight=Dpi.scale 4 && bar.Width=strip.size.width) "Minimal bar does not scale with DPI"
                 let expectedOffset = if direction=TabUp then strip.size.height-bar.Height else 0
                 check (strip.collapsedOffset=expectedOffset) "Minimal bar is not at the window edge"
-                check (bar.GetPixel(Dpi.scale 80,bar.Height/2).A=255uy) "Minimal bar lacks a solid hover target"
+                check (bar.GetPixel(Dpi.scale 80,strip.collapsedBarHeight/2).A=255uy) "Minimal bar lacks a solid hover target"
+                if direction=TabDown then check (bar.GetPixel(Dpi.scale 80,bar.Height-1).A=1uy) "The pad below the minimal bar is not an invisible hover target"
                 let sameColor (a:Color) (b:Color) = a.ToArgb()=b.ToArgb()
-                let pixel (bar:Bitmap) x = bar.GetPixel(x,bar.Height/2)
+                let pixel (bar:Bitmap) x = bar.GetPixel(x,strip.collapsedBarHeight/2)
                 let segment (strip:TabStripSprite<int>) id =
                     strip.sprite.children.list |> List.pick(fun (location,sprite) ->
                         let tab = sprite :?> TabSprite<int>
@@ -421,7 +422,7 @@ let main () =
                 use flashingBar = flashing.renderCollapsed.bitmap
                 let x,width = segment flashing 2
                 check (sameColor (pixel flashingBar (x+width/2)) appearance.tabFlashBgColor) "A flashing tab does not show in the minimal bar"
-                check ((strip.tryHit(Pt(Dpi.scale 80,strip.collapsedOffset+bar.Height/2))).IsSome) "Minimal bar cannot reveal its tabs"
+                check ((strip.tryHit(Pt(Dpi.scale 80,strip.collapsedOffset+strip.collapsedBarHeight/2))).IsSome) "Minimal bar cannot reveal its tabs"
                 let tabLocation,tabSprite = strip.sprite.children.list |> List.find(fun (_,sprite) -> sprite.children.list |> List.exists(fun (_,child) -> child :? CloseButtonSprite))
                 let closeLocation,_ = tabSprite.children.list |> List.find(fun (_,child) -> child :? CloseButtonSprite)
                 let point = tabLocation.add(closeLocation).add(Pt(1,1))
