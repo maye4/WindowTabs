@@ -111,6 +111,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "& ./tests/Run-Tests.ps1 
   version, runs the suites, the smoke test and a Full desktop E2E on that exe, then
   creates a Release draft with it. Publishing the draft remains a separate
   action; a suffix such as `-beta.1` marks it as a prerelease.
+- For every new versioned local Release build on this workstation, copy only
+  `WtProgram\bin\Release\WindowTabs.exe` to
+  `D:\Software Green\WindowTabs-<version>\WindowTabs.exe`. Date versions use the
+  local `yyyy.MM.dd` date. Verify the embedded app/informational version and
+  source/destination SHA256 hashes, and keep older version folders and their
+  settings. This copy is a local Windows step: hosted CI cannot access `D:`, and a
+  local build does not authorize a tag, push or published release.
 
 ## Style
 

@@ -74,7 +74,8 @@ let main() =
             [{ id=5151; seen=DateTime.UtcNow; members=rememberedTitles |> List.map(fun title -> { app=app; title=title }); paths=Map.empty }]
         check ((runtimeSettings.rememberedGroups |> List.map(fun group -> group.id)) = [5151]) "Remembered groups were not kept in the settings"
         use lifetime = new LifetimeScope(fun error -> raise error)
-        let program = Program.Program(lifetime,settings=runtimeSettings)
+        let buttonDown = ref false
+        let program = Program.Program(lifetime,settings=runtimeSettings,isLeftButtonDown=(fun () -> buttonDown.Value))
         let scansBefore,_,_ = RuntimeMetrics.snapshot()
         let input = {new IStartupInputPlugin with
                         member _.init() =
@@ -84,6 +85,19 @@ let main() =
         use first = new Form(ShowInTaskbar=false)
         use second = new Form(ShowInTaskbar=false)
         let handles = [first.Handle;second.Handle]
+        // Windows that open after rules group the others: one while the left button is held, as a
+        // tab torn out of a browser's own strip is, and one opened as usual.
+        use torn = new Form(ShowInTaskbar=false)
+        use joined = new Form(ShowInTaskbar=false)
+        use rememberedTorn = new Form(ShowInTaskbar=false,Text="Remembered B")
+        use settlingTorn = new Form(ShowInTaskbar=false,Text="Loading during drag")
+        use autoExisting = new Form(ShowInTaskbar=false)
+        use autoTorn = new Form(ShowInTaskbar=false)
+        use autoJoined = new Form(ShowInTaskbar=false)
+        let dragHandles =
+            [torn.Handle;joined.Handle;rememberedTorn.Handle;settlingTorn.Handle
+             autoExisting.Handle;autoTorn.Handle;autoJoined.Handle]
+        let lateDiscovering = Collections.Generic.HashSet<IntPtr>()
         // Windows grouped before a restart carry their group on the window and are found together
         // again, though nothing else (auto grouping is off) would group them.
         use keptA = new Form(ShowInTaskbar=false)
@@ -104,10 +118,10 @@ let main() =
         let mutable discovering = true
         let filter = FilterService() :> IFilterService
         Services.registerLocal<IFilterService>({new IFilterService with
-            member _.isAppWindow hwnd = List.contains hwnd handles || List.contains hwnd restoredHandles || List.contains hwnd reopenedHandles
-            member _.isAppWindowStyle hwnd = List.contains hwnd handles || List.contains hwnd restoredHandles || List.contains hwnd reopenedHandles
+            member _.isAppWindow hwnd = List.contains hwnd handles || List.contains hwnd dragHandles || List.contains hwnd restoredHandles || List.contains hwnd reopenedHandles
+            member _.isAppWindowStyle hwnd = List.contains hwnd handles || List.contains hwnd dragHandles || List.contains hwnd restoredHandles || List.contains hwnd reopenedHandles
             member _.isTabbableWindow hwnd =
-                (discovering && List.contains hwnd handles || restoring && List.contains hwnd restoredHandles ||
+                (discovering && (List.contains hwnd handles || lateDiscovering.Contains hwnd) || restoring && List.contains hwnd restoredHandles ||
                  restoring && List.contains hwnd reopenedHandles) &&
                 filter.getIsTabbingEnabledForProcess path
             member _.isTabbingEnabledForAllProcessesByDefault with get()=false and set _=()
@@ -140,6 +154,25 @@ let main() =
         late.Text <- "Remembered C"
         pumpUntil "A window whose title settled late did not join its remembered group" (fun () -> tokenOf late.Handle=Some 5151)
         check (tokenOf stranger.Handle<>Some 5151) "A window with no remembered title joined a remembered group"
+        // A torn-off window is not restored into a remembered group, either when its title matches
+        // immediately or when the title settles after Windows has created it.
+        lateDiscovering.Add rememberedTorn.Handle |> ignore
+        buttonDown.Value <- true
+        rememberedTorn.Show()
+        program.receive(Program.ProgramInput.ShellEvent(rememberedTorn.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+        buttonDown.Value <- false
+        pumpUntil "A window opened during a drag was not tabbed" (fun () -> (groupOf rememberedTorn.Handle).IsSome)
+        check (tokenOf rememberedTorn.Handle<>Some 5151) "A window opened during a drag was restored to its remembered group"
+        lateDiscovering.Add settlingTorn.Handle |> ignore
+        buttonDown.Value <- true
+        settlingTorn.Show()
+        program.receive(Program.ProgramInput.ShellEvent(settlingTorn.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+        buttonDown.Value <- false
+        pumpUntil "A window opened during a drag was not tabbed" (fun () -> (groupOf settlingTorn.Handle).IsSome)
+        settlingTorn.Text <- "Remembered C"
+        let settlingDelay = Diagnostics.Stopwatch.StartNew()
+        while settlingDelay.ElapsedMilliseconds<1500L do Application.DoEvents(); Threading.Thread.Sleep(20)
+        check (tokenOf settlingTorn.Handle<>Some 5151) "A window opened during a drag settled into its remembered group"
         // A restored group is recorded when it changes, not on a timer: a new title is saved.
         reopenedA.Text <- "Renamed A"
         pumpUntil "A title change in a remembered group was not recorded" (fun () ->
@@ -180,6 +213,7 @@ let main() =
                && [reopenedA.Handle;reopenedB.Handle;lateHandle] |> List.forall(fun hwnd -> WindowGroupToken.read hwnd<>Some 5151))
               (sprintf "An ungrouped group came back: together %b, remembered %A" (together()) (runtimeSettings.rememberedGroups |> List.map(fun group -> group.id)))
         check (runtimeSettings.groupIcons.TryFind "hand:5151"=None) "An ungrouped group's taskbar picture was kept"
+        lateDiscovering.Clear()
         restoring <- false
         program.refresh()
         pumpUntil "Restored fixture windows did not leave their groups" (fun () ->
@@ -228,10 +262,62 @@ let main() =
             waitForTarget firstTarget
             click (tr Strings.AppRules.addGroup)
             let secondTarget = (api.getValue("appGroupingTargets") :?> AppGroupingTarget list) |> List.last |> fun group -> group.id
+            // Regrouping an existing window while the button is held must not make it look newly born.
+            buttonDown.Value <- true
             selectApp secondTarget
             waitForTarget secondTarget
+            buttonDown.Value <- false
             check (not disabledDuringRegroup && filter.getIsTabbingEnabledForProcess path) "Rule editing transiently disabled the application's tabs"
             check (handles |> List.forall WinUserApi.IsWindow) "Rule editing destroyed an application HWND"
+            // A window born during a drag keeps out of its rule's group; Windows' own tab drag
+            // decides where it goes. One opened without the button held joins the group.
+            let ruleGroupOf hwnd =
+                groupOf hwnd |> Option.filter(fun group -> handles |> List.exists(fun other -> group.windows.contains((=)other)))
+            lateDiscovering.Add torn.Handle |> ignore
+            buttonDown.Value <- true
+            torn.Show()
+            program.receive(Program.ProgramInput.ShellEvent(torn.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+            buttonDown.Value <- false
+            pumpUntil "A window opened during a drag was not tabbed" (fun () -> (groupOf torn.Handle).IsSome)
+            check (((groupOf torn.Handle).Value :?> GroupInfo).ruleGroupId.IsNone)
+                  "A window opened during a drag became an app-rule target"
+            lateDiscovering.Add joined.Handle |> ignore
+            joined.Show()
+            program.receive(Program.ProgramInput.ShellEvent(joined.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+            pumpUntil "A window opened without a drag did not join its rule's group" (fun () -> (ruleGroupOf joined.Handle).IsSome)
+            let settle = Diagnostics.Stopwatch.StartNew()
+            while settle.ElapsedMilliseconds<1500L do Application.DoEvents(); Threading.Thread.Sleep(20)
+            check ((ruleGroupOf torn.Handle).IsNone) "A window opened during a drag joined its rule's group"
+            // With auto-grouping on, a torn-off singleton must stay separate after the merge pass,
+            // and later ordinary windows must join the established automatic group.
+            api.setValue("appGroupingRules",box([]:AppGroupingRule list))
+            api.setValue("autoGroupingPaths",box(Set2(List2([path]))))
+            lateDiscovering.Add autoExisting.Handle |> ignore
+            autoExisting.Show()
+            program.receive(Program.ProgramInput.ShellEvent(autoExisting.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+            pumpUntil "An ordinary window did not start an automatic group" (fun () -> (groupOf autoExisting.Handle).IsSome)
+            lateDiscovering.Add autoTorn.Handle |> ignore
+            buttonDown.Value <- true
+            autoTorn.Show()
+            program.receive(Program.ProgramInput.ShellEvent(autoTorn.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+            buttonDown.Value <- false
+            pumpUntil "A window opened during a drag did not start a separate group" (fun () -> (groupOf autoTorn.Handle).IsSome)
+            program.refresh()
+            let mergeDelay = Diagnostics.Stopwatch.StartNew()
+            while mergeDelay.ElapsedMilliseconds<1500L do Application.DoEvents(); Threading.Thread.Sleep(20)
+            check (match groupOf autoExisting.Handle,groupOf autoTorn.Handle with
+                   | Some existing,Some torn -> not(obj.ReferenceEquals(existing,torn))
+                   | _ -> false)
+                  "Automatic merging joined a window opened during a drag"
+            lateDiscovering.Add autoJoined.Handle |> ignore
+            autoJoined.Show()
+            program.receive(Program.ProgramInput.ShellEvent(autoJoined.Handle,ShellEvent.HSHELL_WINDOWCREATED))
+            program.refresh()
+            pumpUntil "An ordinary window did not join the established automatic group" (fun () ->
+                match groupOf autoExisting.Handle,groupOf autoJoined.Handle,groupOf autoTorn.Handle with
+                | Some existing,Some joined,Some torn ->
+                    obj.ReferenceEquals(existing,joined) && not(obj.ReferenceEquals(existing,torn))
+                | _ -> false)
             form.Close()
         finally
             discovering <- false

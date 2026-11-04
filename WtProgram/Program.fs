@@ -28,7 +28,7 @@ type ProgramInput =
     | WinEvent of (IntPtr * WinEvent)
     | ShellEvent of (IntPtr * ShellEvent)
 
-type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
+type Program(lifetime:LifetimeScope, ?settings:Settings, ?isLeftButtonDown:unit->bool) as this =
     let version = AssemblyInfo.informationalVersion
     let isStandAlone = System.Diagnostics.Debugger.IsAttached 
 
@@ -78,14 +78,6 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
                 else s.appearance.geometry
             { s with version = version; appearance = {s.appearance with geometry=appearance} }
 
-    let registerShellHooks =
-        lifetime.Own(os.registerShellHooks <| fun (hwnd, shellEvent) ->
-            match shellEvent with
-            | ShellEvent.HSHELL_WINDOWCREATED -> this.receive(ShellEvent(hwnd, shellEvent))
-            | ShellEvent.HSHELL_WINDOWDESTROYED -> this.receive(ShellEvent(hwnd, shellEvent))
-            | _ -> ())
-
-
     // Default shortcuts live in SettingsCatalog; this maps each hotkey to its action.
     let hotKeyInfo = Map2(List2([
         ("prevTab", fun () -> Services.desktop.foregroundGroup.iter(fun g -> g.switchWindow(false, false)))
@@ -109,6 +101,14 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     /// Windows this run has grouped. Only the first grouping of a window restores its saved
     /// group; later regrouping (rule edits, auto grouping turned on) must apply the new choice.
     let groupedThisRun = HashSet<IntPtr>()
+    /// Windows created while the left mouse button was held down: excluded from auto-grouping
+    /// and app grouping rules, as they are likely torn-off tabs or drag-drop targets.
+    let bornDuringDrag = HashSet<IntPtr>()
+    /// Tests stand in for the mouse; the app asks Windows.
+    let isLeftButtonDown =
+        defaultArg isLeftButtonDown (fun () ->
+            let primaryButton = if SystemInformation.MouseButtonsSwapped then 0x02 else 0x01
+            (WinUserApi.GetAsyncKeyState(primaryButton) &&& 0x8000s) <> 0s)
     /// Groups made by hand, kept after their windows close.
     let mutable remembered = settingsManager.rememberedGroups
     /// The open windows of each group made by hand when App rules was last told.
@@ -126,6 +126,12 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     let mergeSoon = lifetime.Own(new CoalescedAction(1000, fun () -> this.mergeAutoGroups()))
     let desktopRetry = lifetime.Own(new CoalescedAction(100, fun () ->
                                         for hwnd in List.ofSeq awaitingDesktop.Keys do refreshQueue.RequestWindow hwnd))
+    let registerShellHooks =
+        lifetime.Own(os.registerShellHooks <| fun (hwnd, shellEvent) ->
+            match shellEvent with
+            | ShellEvent.HSHELL_WINDOWCREATED -> this.receive(ShellEvent(hwnd, shellEvent))
+            | ShellEvent.HSHELL_WINDOWDESTROYED -> this.receive(ShellEvent(hwnd, shellEvent))
+            | _ -> ())
 
     do
         lifetime.Own(VirtualDesktop.groupingReady.Subscribe(fun hwnd ->
@@ -197,14 +203,19 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
             try Process.Start(os.windowFromHwnd(hwnd).pid.processPath) |> ignore
             with :? ComponentModel.Win32Exception -> ()
 
+    member private this.isDragBornGroup(group:IGroup) =
+        group.windows.any(fun hwnd -> bornDuringDrag.Contains hwnd)
+
     member this.tryAutoGroup(window:Window) =
-        if (this :> IProgram).getAutoGroupingEnabled(window.pid.processPath) then
+        if bornDuringDrag.Contains(window.hwnd) then
+            None
+        elif (this :> IProgram).getAutoGroupingEnabled(window.pid.processPath) then
             let hwndZorders = this.hwndZorders()
             let groups = this.desktop.groups
             let groups = groups.where(fun g ->
                 g.windows.count > 0 && not(g.windows.contains((=)window.hwnd)) &&
                 (g :?> GroupInfo).ruleGroupId.IsNone && not (g :?> GroupInfo).isRetiring &&
-                not (g :?> GroupInfo).awaitsGroupingDesktop)
+                not (g :?> GroupInfo).awaitsGroupingDesktop && not(this.isDragBornGroup g))
             let groups = groups.sortBy(fun g -> g.windows.map(fun hwnd -> hwndZorders.tryFind(hwnd).def(Int32.MaxValue)).minBy(id))
             let processPath hwnd = os.windowFromHwnd(hwnd).pid.processPath
             Some(AutoGroup.pick (fun (g:IGroup) -> g.windows) processPath VirtualDesktop.groupingDesktopId groups window.hwnd)
@@ -246,16 +257,18 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     /// The group a window seen for the first time this run belongs back in: the one it was in
     /// before WindowTabs restarted, else the one a window with its program and title was last in.
     member this.savedPlacement(window:Window) =
-        match this.restoredToken window.hwnd with
-        | Some token -> Some token
-        | None when groupedThisRun.Contains window.hwnd || remembered.IsEmpty -> None
-        | None ->
-            this.rememberedMember window.hwnd
-            |> Option.bind(RememberedGroups.find remembered)
-            |> Option.filter(fun token ->
-                match this.liveGroupWithToken token with
-                | Some group -> this.sameDesktop group window.hwnd
-                | None -> true)
+        if bornDuringDrag.Contains window.hwnd then None
+        else
+            match this.restoredToken window.hwnd with
+            | Some token -> Some token
+            | None when groupedThisRun.Contains window.hwnd || remembered.IsEmpty -> None
+            | None ->
+                this.rememberedMember window.hwnd
+                |> Option.bind(RememberedGroups.find remembered)
+                |> Option.filter(fun token ->
+                    match this.liveGroupWithToken token with
+                    | Some group -> this.sameDesktop group window.hwnd
+                    | None -> true)
 
     member this.tryRestoredGroup(window:Window) =
         this.savedPlacement window |> Option.map(fun token ->
@@ -316,28 +329,31 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     member private this.recheckSettling() =
         let now = DateTime.UtcNow
         for KeyValue(hwnd,(since,placed)) in List.ofSeq settling do
-            let current =
-                this.desktop.groups.list |> List.tryPick(fun group ->
-                    match group with
-                    | :? GroupInfo as info when group.windows.contains((=)hwnd) -> Some info
-                    | _ -> None)
-            let moved = current |> Option.forall(fun info -> not(obj.ReferenceEquals(info,placed)))
-            if not(WinUserApi.IsWindow hwnd) || now-since > TimeSpan.FromSeconds(10.0) || moved || placed.isRetiring then
+            if bornDuringDrag.Contains hwnd then
                 settling.Remove hwnd |> ignore
-            elif not this.desktop.isDragging then
-                match this.rememberedMember hwnd |> Option.bind(RememberedGroups.find remembered) with
-                | Some token when token<>placed.group.groupToken ->
+            else
+                let current =
+                    this.desktop.groups.list |> List.tryPick(fun group ->
+                        match group with
+                        | :? GroupInfo as info when group.windows.contains((=)hwnd) -> Some info
+                        | _ -> None)
+                let moved = current |> Option.forall(fun info -> not(obj.ReferenceEquals(info,placed)))
+                if not(WinUserApi.IsWindow hwnd) || now-since > TimeSpan.FromSeconds(10.0) || moved || placed.isRetiring then
                     settling.Remove hwnd |> ignore
-                    match this.liveGroupWithToken token |> Option.filter(fun target -> this.sameDesktop target hwnd) with
-                    | Some target -> target.addAfterDetaching(placed,hwnd)
-                    | None when (placed :> IGroup).windows.count=1 ->
-                        placed.group.groupToken <- token
-                        WindowGroupToken.save hwnd token
-                    | None ->
-                        let target = Services.desktop.createGroup(Services.settings.getValue("combineIconsInTaskbar").cast<bool>()) :?> GroupInfo
-                        target.group.groupToken <- token
-                        target.addAfterDetaching(placed,hwnd)
-                | _ -> ()
+                elif not this.desktop.isDragging then
+                    match this.rememberedMember hwnd |> Option.bind(RememberedGroups.find remembered) with
+                    | Some token when token<>placed.group.groupToken ->
+                        settling.Remove hwnd |> ignore
+                        match this.liveGroupWithToken token |> Option.filter(fun target -> this.sameDesktop target hwnd) with
+                        | Some target -> target.addAfterDetaching(placed,hwnd)
+                        | None when (placed :> IGroup).windows.count=1 ->
+                            placed.group.groupToken <- token
+                            WindowGroupToken.save hwnd token
+                        | None ->
+                            let target = Services.desktop.createGroup(Services.settings.getValue("combineIconsInTaskbar").cast<bool>()) :?> GroupInfo
+                            target.group.groupToken <- token
+                            target.addAfterDetaching(placed,hwnd)
+                    | _ -> ()
 
     member private this.settleTick() =
         this.recheckSettling()
@@ -355,17 +371,20 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
         | _ -> ()
 
     member this.tryGroupingRule(window:Window) =
-        match AppGroupingRules.resolve settingsManager.settings.appGroupingRules window.pid.processPath "" with
-        | NoGroupingRule -> None
-        | GroupingTarget target ->
-            let groups = this.desktop.groups.list |> List.choose(fun group ->
-                match group with
-                | :? GroupInfo as info when not info.isExited && not info.isRetiring &&
-                                           not info.awaitsGroupingDesktop && not ((info :> IGroup).windows.contains((=)window.hwnd)) -> Some info
-                | _ -> None)
-            let found = AppGroupingRules.pick (fun (group:GroupInfo) -> (group :> IGroup).windows.list)
-                            (fun group -> group.ruleGroupId) VirtualDesktop.groupingDesktopId groups target window.hwnd
-            Some(found |> Option.map(fun group -> group :> IGroup))
+        if bornDuringDrag.Contains(window.hwnd) then
+            None
+        else
+            match AppGroupingRules.resolve settingsManager.settings.appGroupingRules window.pid.processPath "" with
+            | NoGroupingRule -> None
+            | GroupingTarget target ->
+                let groups = this.desktop.groups.list |> List.choose(fun group ->
+                    match group with
+                    | :? GroupInfo as info when not info.isExited && not info.isRetiring &&
+                                               not info.awaitsGroupingDesktop && not ((info :> IGroup).windows.contains((=)window.hwnd)) -> Some info
+                    | _ -> None)
+                let found = AppGroupingRules.pick (fun (group:GroupInfo) -> (group :> IGroup).windows.list)
+                                (fun group -> group.ruleGroupId) VirtualDesktop.groupingDesktopId groups target window.hwnd
+                Some(found |> Option.map(fun group -> group :> IGroup))
 
     member this.updateAppWindows() = RuntimeMetrics.measure(fun () ->
         if this.desktop.isDragging.not then
@@ -418,7 +437,8 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     member this.ensureWindowIsGrouped(window) =
         if this.isTabbableWindow(window) then
             match this.desktop.groups.tryFind(fun group -> group.windows.contains((=)window.hwnd)) with
-            | None -> if not (this.awaitsDesktop window) then this.addWindowToGroup(window)
+            | None ->
+                if not (this.awaitsDesktop window) then this.addWindowToGroup(window)
             | Some group ->
                 let info = group :?> GroupInfo
                 if info.awaitsGroupingDesktop then
@@ -461,6 +481,7 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
                 | :? GroupInfo as group when
                     not group.isExited && not group.isRetiring && not group.awaitsGroupingDesktop &&
                     group.ruleGroupId.IsNone && not (this.isHandMade group) && (group :> IGroup).windows.count>0 &&
+                    not(this.isDragBornGroup group) &&
                     (appOf group).IsSome &&
                     (this :> IProgram).getAutoGroupingEnabled(this.appKey (group :> IGroup).windows.head) -> Some group
                 | _ -> None)
@@ -486,6 +507,7 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
     member this.awaitsDesktop(window:Window) =
         let hwnd = window.hwnd
         let waiting =
+            not(bornDuringDrag.Contains hwnd) &&
             (this.savedPlacement window).IsNone &&
             ((this :> IProgram).getAutoGroupingEnabled(window.pid.processPath) ||
              AppGroupingRules.resolve settingsManager.settings.appGroupingRules window.pid.processPath "" <> NoGroupingRule) &&
@@ -520,7 +542,8 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
 
     member this.addWindowToGroup(window:Window) =
         let hwnd = window.hwnd
-        let group,isNewGroup = 
+        let isDragBorn = bornDuringDrag.Contains hwnd
+        let group,isNewGroup =
             match this.findGroupForWindow(window) with
             | Some(group) -> (group, false)
             | None -> (Services.desktop.createGroup(Services.settings.getValue("combineIconsInTaskbar").cast<bool>()), true)
@@ -531,12 +554,12 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
         // A tab dragged out onto the desktop starts a group by hand.
         if isNewGroup && isDropped then (group :?> GroupInfo).group.isManual <- true
         // A restored group is where the window was put, so it does not wait to join another.
-        if isNewGroup && not isDropped && restored.IsNone then
+        if isNewGroup && not isDropped && not isDragBorn && restored.IsNone then
             (group :?> GroupInfo).awaitsGroupingDesktop <-
                 (VirtualDesktop.groupingDesktopId hwnd).IsNone &&
                 ((this :> IProgram).getAutoGroupingEnabled(window.pid.processPath) ||
                  AppGroupingRules.resolve settingsManager.settings.appGroupingRules window.pid.processPath "" <> NoGroupingRule)
-        if isNewGroup && not isDropped then
+        if isNewGroup && not isDropped && not isDragBorn then
             match AppGroupingRules.resolve settingsManager.settings.appGroupingRules window.pid.processPath "" with
             | GroupingTarget target -> (group :?> GroupInfo).ruleGroupId <- Some target
             | _ -> ()
@@ -544,7 +567,8 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
         isDroppedAndAwaitingGrouping.map(fun s -> s.remove hwnd)
         let withDelay = not isDropped && isNewGroup && delayTabExeNames.contains(window.pid.exeName)
         group.addWindow(hwnd, withDelay)
-        if restored.IsNone && not isDropped && RememberedGroups.hasApp remembered (AppIdentity.key (this.appKey hwnd)) then
+        if restored.IsNone && not isDropped && not isDragBorn &&
+           RememberedGroups.hasApp remembered (AppIdentity.key (this.appKey hwnd)) then
             settling.[hwnd] <- (DateTime.UtcNow,group :?> GroupInfo)
             if initialDiscoveryComplete then settleTimer.Start()
 
@@ -553,6 +577,10 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
         | WinEvent(hwnd, evt) -> refreshQueue.RequestWindow(hwnd)
         | ShellEvent(hwnd, evt) ->
             match evt with
+            | ShellEvent.HSHELL_WINDOWCREATED when initialDiscoveryComplete &&
+                                                    not(groupedThisRun.Contains hwnd) &&
+                                                    isLeftButtonDown() ->
+                bornDuringDrag.Add hwnd |> ignore
             // The shell also says so when a window only loses its taskbar button, as one does when a
             // group with combined icons takes it; forgetting that window let ungrouped windows be
             // put back together by their saved group.
@@ -566,6 +594,7 @@ type Program(lifetime:LifetimeScope, ?settings:Settings) as this =
                 windowColors.remove hwnd
                 VirtualDesktop.forget hwnd
                 awaitingDesktop.Remove hwnd |> ignore
+                bornDuringDrag.Remove hwnd |> ignore
             | _ ->()
             refreshQueue.RequestWindow(hwnd)
 

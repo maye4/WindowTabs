@@ -32,28 +32,9 @@ everything below it. The strip is held at the top of the z-order until 350 ms af
 carries so the tab in the hand stays above it, and then put back immediately above the group's top
 window. A tab leaving a maximized group is the same, with the shrink animation.
 
-## drop-down menu of windowTabs
-```
-            [monitor1]
-    [resizing sensitive area]
- ---------------------------
-    [drowp-down sensitive area]
-    [drop-down menu of windowTabs of monitor2]
-            [monitor2]
-```
+## Bug: drag a edge tab out
+current behavior:
+drag a edge browser tab out of edge -> a new edge window A -> windowTabs auto add this window to the existing group -> the whole group dragged to the window A position
 
-[drowp-down sensitive area] is too small, and the drop-down menu often close too fast, I oftern go pass it to [resizing sensitive area], missing the drop-down menu.
-
-```
- ---------------------------
-    [drowp-down trigger strip]
-            |
-            v
-```
-
-```
-            ^
-            |
- ---------------------------
-    [drowp-down trigger strip]
-```
+wanted behavior:
+drag a edge browser tab out of edge -> a new edge window A -> windowTabs should not auto add this window to the existing grou, even auto group is on, because when a suer drag a edge tab our of edge, he certainly want a new window -> the previous group should stay where it is, not dragged to the window A position
